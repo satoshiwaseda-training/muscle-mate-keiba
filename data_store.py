@@ -10,6 +10,7 @@ PREDICTIONS_FILE = DATA_DIR / "predictions.json"
 RESULTS_FILE = DATA_DIR / "results.json"
 WEIGHTS_FILE = DATA_DIR / "weights.json"
 HORSE_PROFILES_FILE = DATA_DIR / "horse_profiles.json"
+JRA_GROUND_TRUTH_FILE = DATA_DIR / "jra_ground_truth.json"
 
 # 科学的黄金比: 生体40% / 環境30% / 人間20% / 背景10%
 DEFAULT_WEIGHTS = {
@@ -159,6 +160,47 @@ def upsert_best_weight_record(
 
     data[horse_id] = profile
     _save_json(HORSE_PROFILES_FILE, data)
+
+
+# --- JRA Ground Truth (最優先データソース) ---
+
+def save_jra_ground_truth(race_id: str, data: dict):
+    """JRA公式馬場情報をGround Truthとして保存。外部スクレイプより優先される。"""
+    store = _load_json(JRA_GROUND_TRUTH_FILE, {})
+    from datetime import datetime as _dt
+    data["saved_at"] = _dt.now().isoformat()
+    store[race_id] = data
+    _save_json(JRA_GROUND_TRUTH_FILE, store)
+
+
+def get_jra_ground_truth(race_id: str) -> dict:
+    """JRA公式データを取得。存在しない場合は空dict。"""
+    store = _load_json(JRA_GROUND_TRUTH_FILE, {})
+    return store.get(race_id, {})
+
+
+def merge_track_data(jra_data: dict, scraped_data: dict) -> dict:
+    """
+    JRA公式データを最優先(Ground Truth)として、外部スクレイプデータとマージ。
+    JRA側に値がある場合は常にJRAを使用する。
+
+    Priority: JRA公式 > netkeiba/OpenMeteo等
+    """
+    merged = dict(scraped_data)  # 外部データをベースに
+
+    # JRAの値で上書き（空でない場合のみ）
+    for key in ["cushion_value", "water_content_goal", "water_content_4c",
+                "track_bias_text", "going", "inner_rail_moved", "turf_replaced"]:
+        val = jra_data.get(key)
+        if val not in (None, "", False):
+            merged[key] = val
+            merged[f"{key}_source"] = "JRA公式"
+
+    # 取消馬は常に反映（安全のため）
+    if jra_data.get("scratched"):
+        merged["scratched"] = jra_data["scratched"]
+
+    return merged
 
 
 # --- Stats helpers ---

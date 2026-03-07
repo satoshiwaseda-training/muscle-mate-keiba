@@ -25,6 +25,9 @@ from data_store import (
     get_result,
     compute_stats,
     upsert_best_weight_record,
+    save_jra_ground_truth,
+    get_jra_ground_truth,
+    merge_track_data,
 )
 
 # ─────────────────────────────────────────────
@@ -76,6 +79,8 @@ if "weather_data" not in st.session_state:
     st.session_state.weather_data = {}
 if "paddock_reports" not in st.session_state:
     st.session_state.paddock_reports = {}
+if "jra_track_data" not in st.session_state:
+    st.session_state.jra_track_data = {}
 
 # ─────────────────────────────────────────────
 # Sidebar
@@ -219,21 +224,81 @@ with tab1:
                     f"({weather_data.get('source','')})"
                 )
 
+        # ── JRA公式馬場情報 (Ground Truth) ───────────────
+        st.markdown("---")
+        jra_col1, jra_col2 = st.columns([1, 3])
+        with jra_col1:
+            if st.button("JRA公式馬場情報を取得\n(Ground Truth)", use_container_width=True, type="primary"):
+                _rdate = selected_race.get("race_date")
+                from datetime import date as _date
+                _fetch_date = _date.fromisoformat(_rdate) if _rdate else selected_date
+                with st.spinner("JRA公式サイトから馬場情報・取消情報を取得中..."):
+                    jra_track = scraper.fetch_jra_track_conditions(
+                        selected_race.get("venue", ""), _fetch_date
+                    )
+                    jra_changes = scraper.fetch_jra_race_changes(selected_race["race_id"])
+                    # マージ
+                    jra_merged = {**jra_track, **{k: v for k, v in jra_changes.items() if v}}
+                    st.session_state.jra_track_data = jra_merged
+                    save_jra_ground_truth(selected_race["race_id"], jra_merged)
+                st.rerun()
+        with jra_col2:
+            jra_data = st.session_state.jra_track_data
+            if jra_data:
+                items = []
+                if jra_data.get("cushion_value"):
+                    cv = jra_data["cushion_value"]
+                    try:
+                        cv_f = float(cv)
+                        hardness = "硬め" if cv_f <= 8.0 else "標準" if cv_f <= 10.0 else "軟め"
+                        items.append(f"**クッション値: {cv}** ({hardness})")
+                    except Exception:
+                        items.append(f"**クッション値: {cv}**")
+                if jra_data.get("water_content_goal"):
+                    items.append(f"含水率(ゴール前): {jra_data['water_content_goal']}")
+                if jra_data.get("water_content_4c"):
+                    items.append(f"含水率(4C): {jra_data['water_content_4c']}")
+                if jra_data.get("going"):
+                    items.append(f"馬場状態: **{jra_data['going']}**")
+                if jra_data.get("inner_rail_moved"):
+                    items.append("⚠ 内柵移動あり")
+                if jra_data.get("turf_replaced"):
+                    items.append("⚠ 芝張り替えあり")
+                if jra_data.get("scratched"):
+                    items.append(f"🚫 取消: {', '.join(jra_data['scratched'])}")
+                if items:
+                    st.info("【JRA公式 Ground Truth】 " + "　|　".join(items))
+                    if jra_data.get("track_bias_text"):
+                        st.caption(f"馬場傾向: {jra_data['track_bias_text']}")
+            else:
+                st.caption("JRA公式馬場情報未取得（レース当日に取得するとAI精度が向上します）")
+
         # ── 環境情報 ──────────────────────────────────────
-        st.caption("環境・馬場情報（自動取得後に手動調整可）")
+        st.caption("環境・馬場情報（JRA公式取得後は自動反映・手動調整可）")
+        jra_data = st.session_state.jra_track_data
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            track_condition = st.selectbox("馬場状態", ["良", "稍重", "重", "不良"], index=0)
+            going_opts = ["良", "稍重", "重", "不良"]
+            jra_going = jra_data.get("going", "")
+            going_default = going_opts.index(jra_going) if jra_going in going_opts else 0
+            track_condition = st.selectbox(
+                "馬場状態" + (" 【JRA公式】" if jra_going else ""),
+                going_opts, index=going_default,
+            )
         with col2:
             weather_opts = ["晴", "曇", "小雨", "雨", "雪", "不明"]
-            auto_weather = weather_data.get("description", "")
+            auto_weather = jra_data.get("weather") or weather_data.get("description", "")
             w_default = next((i for i, w in enumerate(weather_opts) if w in auto_weather), 5)
             weather = st.selectbox("天気", weather_opts, index=w_default)
         with col3:
             auto_temp = weather_data.get("temperature", "").replace("℃", "")
             temperature = st.text_input("気温 (℃)", value=auto_temp, placeholder="例: 18.5")
         with col4:
-            cushion_value = st.text_input("クッション値", placeholder="例: 9.2")
+            jra_cv = jra_data.get("cushion_value", "")
+            cushion_value = st.text_input(
+                "クッション値" + (" 【JRA公式】" if jra_cv else ""),
+                value=jra_cv, placeholder="例: 9.2",
+            )
 
         # ── 詳細データ取得 ────────────────────────────────
         col_fetch, col_fetch_status = st.columns([1, 3])
@@ -413,11 +478,18 @@ with tab1:
 
             if entries:
                 with st.spinner("Gemini AIが科学的黄金比で分析中..."):
+                    # JRA Ground Truthを取得（DB保存済みがあれば復元）
+                    jra_gt = st.session_state.jra_track_data or \
+                             get_jra_ground_truth(selected_race["race_id"])
+                    # 出走取消馬を除外
+                    scratched = jra_gt.get("scratched", [])
+                    active_entries = [h for h in entries if h["name"] not in scratched]
+
                     if st.session_state.api_key:
                         result = gemini_client.analyze_race(
                             api_key=st.session_state.api_key,
                             race_name=selected_race["race_name"],
-                            horses=entries,
+                            horses=active_entries,
                             track_condition=track_condition,
                             weather=weather,
                             temperature=temperature,
@@ -426,6 +498,7 @@ with tab1:
                             coat_gloss=coat_gloss,
                             hindquarter_pump=hindquarter_pump,
                             weights=load_weights(),
+                            jra_track_data=jra_gt,
                         )
                     else:
                         result = _mock_analysis(entries, selected_race["race_name"])

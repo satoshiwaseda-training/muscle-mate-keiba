@@ -119,6 +119,7 @@ def analyze_race(
     coat_gloss: str = "",
     hindquarter_pump: str = "",
     weights: dict = None,
+    jra_track_data: dict = None,
 ) -> dict:
     """
     Multi-dimensional race analysis with anti-odds-bias logic.
@@ -131,7 +132,44 @@ def analyze_race(
         _format_horse_bio(h) for h in horses
     )
 
-    env_block = f"天気:{weather or '不明'} 気温:{temperature or '不明'} 馬場状態:{track_condition} クッション値:{cushion_value or '不明'}"
+    # JRA公式データをGround Truthとして環境ブロックに反映（優先）
+    jra = jra_track_data or {}
+    eff_going = jra.get("going") or track_condition
+    eff_cushion = jra.get("cushion_value") or cushion_value
+    cushion_source = "【JRA公式】" if jra.get("cushion_value") else ""
+    going_source = "【JRA公式】" if jra.get("going") else ""
+
+    env_block = (
+        f"天気:{weather or '不明'} 気温:{temperature or '不明'} "
+        f"馬場状態:{eff_going}{going_source} "
+        f"クッション値:{eff_cushion or '不明'}{cushion_source}"
+    )
+
+    # JRA公式馬場詳細ブロック
+    jra_block = ""
+    if jra:
+        lines = ["## JRA公式馬場情報 【最優先データ・Ground Truth】"]
+        if jra.get("cushion_value"):
+            cv = float(jra["cushion_value"])
+            hardness = "硬め(8以下=高速馬場→先行有利)" if cv <= 8.0 else \
+                       "標準(8〜10=バランス型)" if cv <= 10.0 else "軟め(10超=パワー型有利)"
+            lines.append(
+                f"クッション値: {cv} → {hardness}"
+                f"\n  ※ 硬いほどスピード型・軽い馬体が有利。軟いほどパワー・重心低い馬が有利。"
+            )
+        if jra.get("water_content_goal"):
+            lines.append(f"含水率(ゴール前): {jra['water_content_goal']}")
+        if jra.get("water_content_4c"):
+            lines.append(f"含水率(4コーナー): {jra['water_content_4c']}")
+        if jra.get("track_bias_text"):
+            lines.append(f"馬場傾向: {jra['track_bias_text']}")
+        if jra.get("inner_rail_moved"):
+            lines.append("⚠ 内柵移動あり → 内ラチ沿いの距離ロス・有利不利が変化")
+        if jra.get("turf_replaced"):
+            lines.append("⚠ 芝張り替えあり → 新芝は時計が出やすく前有利傾向")
+        if jra.get("scratched"):
+            lines.append(f"出走取消: {', '.join(jra['scratched'])}")
+        jra_block = "\n".join(lines)
 
     paddock_block = ""
     if any([paddock_notes, coat_gloss, hindquarter_pump]):
@@ -169,6 +207,7 @@ def analyze_race(
 
 ## レース: {race_name}
 環境: {env_block}
+{jra_block}
 {paddock_block}
 
 ## 出走馬（バイオメカニカルデータ統合）

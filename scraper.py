@@ -956,7 +956,203 @@ def fetch_race_list_jra(race_date: date) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════
-# 11. Paddock reports — multi-source (race day SNS/news)
+# 11. JRA Official Track Conditions (Ground Truth)
+# ═══════════════════════════════════════════════════════════
+
+# JRA会場コード (URL用)
+JRA_VENUE_CODES = {
+    "東京": "tokyo", "中山": "nakayama", "阪神": "hanshin",
+    "京都": "kyoto", "中京": "chukyo", "小倉": "kokura",
+    "新潟": "niigata", "函館": "hakodate", "札幌": "sapporo", "福島": "fukushima",
+}
+
+
+def fetch_jra_track_conditions(venue: str, race_date: date) -> dict:
+    """
+    JRA公式サイトから馬場情報をGround Truthとして取得。
+
+    Returns:
+      cushion_value:       str   クッション値 (例: "9.2")
+      water_content_goal:  str   ゴール前含水率 (例: "11.5%")
+      water_content_4c:    str   4コーナー含水率 (例: "12.1%")
+      track_bias_text:     str   馬場傾向テキスト (内有利/外有利/平均的等)
+      going:               str   馬場状態 (良/稍重/重/不良)
+      inner_rail_moved:    bool  内柵移動の有無
+      turf_replaced:       bool  芝張り替えの有無
+      source:              str   "JRA公式"
+    """
+    result = {
+        "cushion_value": "",
+        "water_content_goal": "",
+        "water_content_4c": "",
+        "track_bias_text": "",
+        "going": "",
+        "inner_rail_moved": False,
+        "turf_replaced": False,
+        "source": "JRA公式",
+        "fetched_at": datetime.now().isoformat(),
+    }
+
+    venue_code = ""
+    for name, code in JRA_VENUE_CODES.items():
+        if name in venue:
+            venue_code = code
+            break
+
+    # ① JRA今日の馬場情報ページ
+    soup = _get("https://www.jra.go.jp/keiba/today/", encoding="utf-8", delay=1.5)
+    if soup:
+        _parse_jra_today_page(soup, venue, result)
+
+    # ② JRA venue-specific baba page
+    if venue_code and not result["cushion_value"]:
+        soup = _get(
+            f"https://www.jra.go.jp/keiba/baba/{venue_code}/",
+            encoding="utf-8", delay=1.2,
+        )
+        if soup:
+            _parse_jra_baba_page(soup, result)
+
+    # ③ JRA thisweek (静的HTML、エンコードはeuc-jpが多い)
+    if not result["cushion_value"]:
+        soup = _get("https://www.jra.go.jp/keiba/thisweek/", encoding="euc-jp", delay=1.2)
+        if soup:
+            _parse_jra_today_page(soup, venue, result)
+
+    return result
+
+
+def _parse_jra_today_page(soup: "BeautifulSoup", venue: str, result: dict):
+    """JRA今日・今週ページから馬場情報を抽出。"""
+    text = soup.get_text(" ", strip=True)
+
+    # 会場セクションを探す
+    venue_section = ""
+    for sec in soup.select(".kaisai, .baba_info, .trackInfo, section, article, div"):
+        t = sec.get_text(" ", strip=True)
+        if venue and venue in t:
+            venue_section = t
+            break
+    target = venue_section or text
+
+    _extract_jra_track_values(target, result)
+
+
+def _parse_jra_baba_page(soup: "BeautifulSoup", result: dict):
+    """JRA馬場情報専用ページを解析。"""
+    text = soup.get_text(" ", strip=True)
+    _extract_jra_track_values(text, result)
+
+
+def _extract_jra_track_values(text: str, result: dict):
+    """JRAページテキストからクッション値・含水率等を正規表現で抽出。"""
+    # クッション値
+    if not result["cushion_value"]:
+        for pat in [
+            r"クッション値[：:\s]*(\d+\.\d+)",
+            r"cushion[：:\s]*(\d+\.\d+)",
+            r"C[Vv][：:\s]*(\d+\.\d+)",
+        ]:
+            m = re.search(pat, text)
+            if m:
+                result["cushion_value"] = m.group(1)
+                break
+
+    # 含水率 (ゴール前)
+    if not result["water_content_goal"]:
+        for pat in [
+            r"ゴール前[^\d]*(\d+\.\d+)\s*%",
+            r"含水率[^\d（(]*(\d+\.\d+)\s*%",
+            r"水分[：:\s]*(\d+\.\d+)\s*%",
+        ]:
+            m = re.search(pat, text)
+            if m:
+                result["water_content_goal"] = m.group(1) + "%"
+                break
+
+    # 含水率 (4コーナー)
+    if not result["water_content_4c"]:
+        for pat in [
+            r"4[コか]ーナー[^\d]*(\d+\.\d+)\s*%",
+            r"4角[^\d]*(\d+\.\d+)\s*%",
+        ]:
+            m = re.search(pat, text)
+            if m:
+                result["water_content_4c"] = m.group(1) + "%"
+                break
+
+    # 馬場状態
+    if not result["going"]:
+        for going in ["不良", "重", "稍重", "良"]:
+            if going in text:
+                result["going"] = going
+                break
+
+    # 馬場傾向テキスト抽出
+    bias_keywords = ["内ラチ", "内柵", "外ラチ", "外柵", "内有利", "外有利",
+                     "芝張替", "張り替え", "張替え", "Aコース", "Bコース",
+                     "Cコース", "Dコース", "馬場傾向", "前有利", "差し有利"]
+    sentences = re.split(r'[。．\n]', text)
+    bias_sentences = [s.strip() for s in sentences
+                      if any(kw in s for kw in bias_keywords) and len(s) > 5]
+    if bias_sentences and not result["track_bias_text"]:
+        result["track_bias_text"] = "。".join(bias_sentences[:3])
+
+    # 内柵移動・芝張り替えフラグ
+    if any(kw in text for kw in ["内ラチ移動", "内柵移動", "ラチ移動"]):
+        result["inner_rail_moved"] = True
+    if any(kw in text for kw in ["芝張替", "張り替え", "張替え"]):
+        result["turf_replaced"] = True
+
+
+def fetch_jra_race_changes(race_id: str) -> dict:
+    """
+    JRA公式から出走取消・天候/馬場状態変更をリアルタイム取得。
+
+    Returns:
+      scratched:    list[str]  取消馬名リスト
+      going_change: str        最新馬場状態
+      weather:      str        最新天候
+    """
+    result = {"scratched": [], "going_change": "", "weather": "", "source": "JRA公式"}
+
+    # netkeiba shutuba は JRA公式データを反映していることが多い
+    soup = _get(
+        f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}",
+        encoding="utf-8",
+    )
+    if not soup:
+        return result
+
+    text = soup.get_text(" ", strip=True)
+
+    # 馬場状態
+    for going in ["不良", "重", "稍重", "良"]:
+        if going in text:
+            result["going_change"] = going
+            break
+
+    # 天候
+    for pat in [r"天候[：:]\s*(\S+)", r"天気[：:]\s*(\S+)"]:
+        m = re.search(pat, text)
+        if m:
+            result["weather"] = m.group(1)
+            break
+
+    # 出走取消馬
+    for row in soup.select("tr.HorseList, tr[class*='Horse']"):
+        # 取消・除外はセルにテキスト「取消」「除外」が入る
+        row_text = row.get_text(" ", strip=True)
+        if "取消" in row_text or "除外" in row_text:
+            name_tag = row.select_one(".HorseName a")
+            if name_tag:
+                result["scratched"].append(name_tag.get_text(strip=True))
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════
+# 12. Paddock reports — multi-source (race day SNS/news)
 # ═══════════════════════════════════════════════════════════
 
 def fetch_paddock_reports(race_id: str, horse_names: list, race_name: str = "") -> dict:
