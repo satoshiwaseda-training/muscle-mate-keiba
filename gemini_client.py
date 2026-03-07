@@ -18,7 +18,7 @@ def _get_model(api_key: str):
         import google.generativeai as genai
         genai.configure(api_key=api_key)
         _gemini_model = genai.GenerativeModel(
-            "gemini-2.0-flash",
+            "gemini-2.5-flash-preview-04-17",
             generation_config={"max_output_tokens": 600, "temperature": 0.3},
         )
         _current_api_key = api_key

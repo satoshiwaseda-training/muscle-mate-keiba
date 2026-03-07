@@ -153,7 +153,7 @@ with st.sidebar:
                 try:
                     import google.generativeai as _genai
                     _genai.configure(api_key=st.session_state.api_key)
-                    _m = _genai.GenerativeModel("gemini-2.0-flash")
+                    _m = _genai.GenerativeModel("gemini-2.5-flash-preview-04-17")
                     _r = _m.generate_content("日本語で「接続OK」とだけ返答してください")
                     st.success(f"Gemini応答: {_r.text.strip()[:50]}")
                 except Exception as _e:
