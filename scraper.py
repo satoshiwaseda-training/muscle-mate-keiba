@@ -401,30 +401,20 @@ def fetch_weather(venue: str, race_date: date, race_hour: int = 15) -> dict:
     lat, lon = coords
     today = date.today()
 
+    # OpenMeteo パラメータ (新旧両対応: wind_speed_10m / weather_code)
+    _hourly_vars = "temperature_2m,precipitation,wind_speed_10m,weather_code"
+    base_params = {
+        "latitude": lat, "longitude": lon,
+        "hourly": _hourly_vars,
+        "timezone": "Asia/Tokyo",
+        "start_date": race_date.isoformat(),
+        "end_date": race_date.isoformat(),
+    }
+
     if race_date >= today:
-        # Forecast
-        data = _get_json(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": lat, "longitude": lon,
-                "hourly": "temperature_2m,precipitation,windspeed_10m,weathercode",
-                "timezone": "Asia/Tokyo",
-                "start_date": race_date.isoformat(),
-                "end_date": race_date.isoformat(),
-            },
-        )
+        data = _get_json("https://api.open-meteo.com/v1/forecast", params=base_params)
     else:
-        # Historical archive
-        data = _get_json(
-            "https://archive-api.open-meteo.com/v1/archive",
-            params={
-                "latitude": lat, "longitude": lon,
-                "hourly": "temperature_2m,precipitation,windspeed_10m,weathercode",
-                "timezone": "Asia/Tokyo",
-                "start_date": race_date.isoformat(),
-                "end_date": race_date.isoformat(),
-            },
-        )
+        data = _get_json("https://archive-api.open-meteo.com/v1/archive", params=base_params)
 
     if not data or "hourly" not in data:
         return {"temperature": "取得失敗", "precipitation": "取得失敗",
@@ -437,8 +427,9 @@ def fetch_weather(venue: str, race_date: date, race_hour: int = 15) -> dict:
 
     temp = hourly["temperature_2m"][idx] if hourly.get("temperature_2m") else "?"
     precip = hourly["precipitation"][idx] if hourly.get("precipitation") else "?"
-    wind = hourly["windspeed_10m"][idx] if hourly.get("windspeed_10m") else "?"
-    wcode = hourly["weathercode"][idx] if hourly.get("weathercode") else 0
+    # 新パラメータ名優先、旧名フォールバック
+    wind = (hourly.get("wind_speed_10m") or hourly.get("windspeed_10m") or [None])[idx] or "?"
+    wcode = (hourly.get("weather_code") or hourly.get("weathercode") or [0])[idx] or 0
 
     desc = _weather_code_to_ja(wcode)
     return {
