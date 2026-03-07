@@ -9,8 +9,30 @@ from data_store import (
     load_weights, save_weights,
     compute_stats, get_recent_miss_summary,
     load_predictions, load_results,
+    save_pdca_log, load_pdca_log,
 )
 import gemini_client
+
+# 1レースあたりの重み変動上限（急激な過学習を防ぐ）
+MAX_WEIGHT_DELTA = 0.05
+
+
+def _apply_weight_damping(old_weights: dict, suggested: dict) -> dict:
+    """
+    重みの急変を防ぐダンピング処理。
+    1レースあたり最大 MAX_WEIGHT_DELTA (5%) までしか変化させない。
+    """
+    damped = {}
+    for k in old_weights:
+        old_v = old_weights.get(k, 0.0)
+        new_v = suggested.get(k, old_v)
+        delta = new_v - old_v
+        delta = max(-MAX_WEIGHT_DELTA, min(MAX_WEIGHT_DELTA, delta))
+        damped[k] = round(old_v + delta, 4)
+    total = sum(damped.values())
+    if total > 0:
+        damped = {k: round(v / total, 4) for k, v in damped.items()}
+    return damped
 
 
 def compare_and_evolve(race_id: str, api_key: str = "") -> dict:
@@ -53,11 +75,18 @@ def compare_and_evolve(race_id: str, api_key: str = "") -> dict:
             result=result,
             current_weights=old_weights,
         )
-        save_weights(reflection_data.get("suggested_weights", old_weights))
+        # ダンピング適用後に保存（急激な重み変動を防止）
+        raw_suggested = reflection_data.get("suggested_weights", old_weights)
+        new_weights = _apply_weight_damping(old_weights, raw_suggested)
+        save_weights(new_weights)
+        reflection_data["suggested_weights"] = new_weights
+    else:
+        new_weights = old_weights
 
-    return {
+    race_name = prediction.get("race_name", race_id)
+    evolve_result = {
         "race_id": race_id,
-        "race_name": prediction.get("race_name", race_id),
+        "race_name": race_name,
         "top_pick": top_pick,
         "hit_1st": hit_1st,
         "hit_top3": hit_top3,
@@ -65,10 +94,24 @@ def compare_and_evolve(race_id: str, api_key: str = "") -> dict:
         "reflection": reflection_data.get("reflection", ""),
         "odds_bias_audit": reflection_data.get("odds_bias_audit", ""),
         "key_lessons": reflection_data.get("key_lessons", []),
+        "miss_categories": reflection_data.get("miss_categories", {}),
         "weight_reasoning": reflection_data.get("weight_reasoning", ""),
         "old_weights": old_weights,
-        "new_weights": reflection_data.get("suggested_weights", old_weights),
+        "new_weights": new_weights,
     }
+
+    # PDCAログ保存（ダッシュボードの重み推移に使用）
+    save_pdca_log(race_id, {
+        "race_name": race_name,
+        "hit_1st": hit_1st,
+        "hit_top3": hit_top3,
+        "old_weights": old_weights,
+        "new_weights": new_weights,
+        "miss_categories": reflection_data.get("miss_categories", {}),
+        "key_lessons": reflection_data.get("key_lessons", []),
+    })
+
+    return evolve_result
 
 
 def _check_odds_bias(pred_horses: list[dict], result: dict) -> dict:

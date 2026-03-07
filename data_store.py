@@ -11,6 +11,7 @@ RESULTS_FILE = DATA_DIR / "results.json"
 WEIGHTS_FILE = DATA_DIR / "weights.json"
 HORSE_PROFILES_FILE = DATA_DIR / "horse_profiles.json"
 JRA_GROUND_TRUTH_FILE = DATA_DIR / "jra_ground_truth.json"
+PDCA_LOG_FILE = DATA_DIR / "pdca_log.json"
 
 # 科学的黄金比: 生体40% / 環境30% / 人間20% / 背景10%
 DEFAULT_WEIGHTS = {
@@ -237,6 +238,38 @@ def compute_stats() -> dict:
         "rate_1st": round(hit_1st / total, 3) if total else 0,
         "rate_top3": round(hit_top3 / total, 3) if total else 0,
     }
+
+
+def save_pdca_log(race_id: str, analysis: dict):
+    """Append a PDCA analysis record. Deduplicates by race_id."""
+    log = _load_json(PDCA_LOG_FILE, [])
+    entry = dict(analysis)
+    entry["race_id"] = race_id
+    entry["saved_at"] = datetime.now().isoformat()
+    log = [e for e in log if e.get("race_id") != race_id]
+    log.append(entry)
+    _save_json(PDCA_LOG_FILE, log)
+
+
+def load_pdca_log() -> list[dict]:
+    return _load_json(PDCA_LOG_FILE, [])
+
+
+def get_weight_history() -> list[dict]:
+    """Return per-race weight snapshots from PDCA log (for trend chart)."""
+    log = load_pdca_log()
+    history = []
+    for e in log:
+        if e.get("new_weights"):
+            history.append({
+                "race_id": e.get("race_id", ""),
+                "race_name": e.get("race_name", e.get("race_id", "")),
+                "saved_at": e.get("saved_at", ""),
+                "new_weights": e["new_weights"],
+                "miss_categories": e.get("miss_categories", {}),
+            })
+    history.sort(key=lambda x: x["saved_at"])
+    return history
 
 
 def get_recent_miss_summary(n: int = 5) -> list[dict]:

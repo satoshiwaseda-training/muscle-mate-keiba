@@ -1483,6 +1483,46 @@ def fetch_this_week_races() -> list[dict]:
     return races
 
 
+def fetch_past_g_races(n_weeks: int = 4) -> list[dict]:
+    """
+    直近N週分の終了済みG1/G2/G3レース一覧を取得する。
+    土曜・日曜の両日を対象に、今日より前の開催分のみ返す。
+
+    Returns:
+        list of race dicts (race_id, race_name, grade, venue, race_date, ...)
+    """
+    from datetime import timedelta as _td
+    today = date.today()
+    weekday = today.weekday()  # 月=0 … 日=6
+
+    # 直近の土曜（今日が土曜なら今日を含む）
+    days_since_sat = (weekday - 5) % 7
+    last_sat = today - _td(days=days_since_sat)
+
+    races: list[dict] = []
+    seen: set = set()
+
+    for w in range(n_weeks):
+        for day_delta in (0, 1):  # 土=0, 日=1
+            target = last_sat - _td(weeks=w) + _td(days=day_delta)
+            # 今日以降（未来）はスキップ
+            if target >= today:
+                continue
+            try:
+                day_races = fetch_race_list_netkeiba(target)
+            except Exception:
+                day_races = []
+            for r in day_races:
+                if r["race_id"] not in seen:
+                    seen.add(r["race_id"])
+                    races.append(r)
+        time.sleep(REQUEST_DELAY)
+
+    # 日付降順（新しい順）で返す
+    races.sort(key=lambda x: x.get("race_date", ""), reverse=True)
+    return races
+
+
 def fetch_entries(race_id: str, venue: str = "") -> list[dict]:
     entries = fetch_entries_netkeiba(race_id, venue)
     return entries if entries else _mock_entries(race_id)

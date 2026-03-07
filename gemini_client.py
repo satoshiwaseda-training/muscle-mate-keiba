@@ -283,29 +283,44 @@ def generate_reflection(
     finishing = result.get("finishing_order", [])
     payouts = result.get("payouts", {})
 
-    pred_text = " / ".join(
-        f"予想{h.get('rank')}位:{h['name']}(EV:{h.get('ev_gap','?')})"
+    # 予想馬の詳細（信頼スコア・EV・理由を含める）
+    pred_detail = "\n".join(
+        f"  予想{h.get('rank')}位: {h['name']} "
+        f"(信頼スコア:{h.get('confidence', h.get('score','?'))}, "
+        f"EV乖離:{h.get('ev_gap','?')}, "
+        f"理由:{h.get('reason','?')})"
         for h in pred_horses
     )
     result_text = " / ".join(
-        f"{h['rank']}着:{h['name']}" for h in finishing[:5]
+        f"{h['rank']}着:{h['name']}(オッズ:{h.get('odds','?')}倍)"
+        for h in finishing[:5]
     )
     payout_text = " ".join(f"{k}:{v}円" for k, v in payouts.items())
 
-    prompt = f"""競馬PDCA分析AI。レース「{race_name}」の予想vs結果を黄金比フレームワークで自己評価せよ。
+    prompt = f"""競馬PDCA分析AI。レース「{race_name}」の予想vs結果を黄金比フレームワークで詳細自己評価せよ。
 
-予想: {pred_text or 'なし'}
-結果: {result_text or 'なし'} {payout_text}
-現重み(黄金比): 生体{current_weights.get('bio_condition',0.40):.0%} 環境{current_weights.get('environment',0.30):.0%} 人間{current_weights.get('human_skill',0.20):.0%} 背景{current_weights.get('background',0.10):.0%}
+## 予想詳細（信頼スコア・理由付き）
+{pred_detail or 'なし'}
 
-必ず以下を分析:
-A) オッズバイアス監査: 人気馬を過大評価・穴馬の期待値を見逃していなかったか
-B) 生体シグナルの精度: 調教加速率・パドックNLPスコア・ベスト体重乖離が的中に寄与したか
-C) 環境要因の見落とし: 馬場・天気・輸送ストレスの影響を正しく評価できたか
-D) 人間・背景シグナル: 騎手相性・外厩調整の評価が正しかったか
+## 実際の結果
+{result_text or 'なし'}
+配当: {payout_text or 'なし'}
 
-JSONのみ返答(合計1.0):
-{{"reflection":"分析(2文)","odds_bias_audit":"バイアス自己評価(1文)","key_lessons":["教訓1","教訓2"],"suggested_weights":{{"bio_condition":0.40,"environment":0.30,"human_skill":0.20,"background":0.10}},"weight_reasoning":"変更理由(1文)"}}"""
+## 現在の重み（黄金比）
+生体(bio_condition):{current_weights.get('bio_condition',0.40):.0%} / 環境(environment):{current_weights.get('environment',0.30):.0%} / 人間(human_skill):{current_weights.get('human_skill',0.20):.0%} / 背景(background):{current_weights.get('background',0.10):.0%}
+
+## 必須分析項目
+A) 外れた主因の特定: 予想理由と実際の結果を照合し、どの要因の評価が誤っていたか具体的に指摘せよ
+B) ミスカテゴリ判定: 4要因それぞれについて「過大評価/過小評価/適切」を判定せよ
+   - bio_condition: 調教加速率・パドックNLPスコア・ベスト体重乖離の精度
+   - environment: 馬場状態・天気・輸送ストレスの影響評価
+   - human_skill: 騎手相性・大舞台成績の評価精度
+   - background: 外厩調整・血統適性の評価精度
+C) オッズバイアス監査: 人気馬を過大評価・穴馬の期待値を見逃していなかったか
+D) 次回への具体的教訓: 同条件のレースで何を変えるべきか
+
+JSONのみ返答(suggested_weightsの合計は必ず1.0):
+{{"reflection":"外れた主因の具体的分析(2文)","odds_bias_audit":"バイアス自己評価(1文)","key_lessons":["具体的教訓1","具体的教訓2","具体的教訓3"],"miss_categories":{{"bio_condition":"過大評価|過小評価|適切","environment":"過大評価|過小評価|適切","human_skill":"過大評価|過小評価|適切","background":"過大評価|過小評価|適切"}},"suggested_weights":{{"bio_condition":0.40,"environment":0.30,"human_skill":0.20,"background":0.10}},"weight_reasoning":"重み変更の根拠(1文)"}}"""
 
     raw = _call_gemini(api_key, prompt)
 
@@ -315,6 +330,7 @@ JSONのみ返答(合計1.0):
             "reflection": data.get("reflection", raw),
             "odds_bias_audit": data.get("odds_bias_audit", ""),
             "key_lessons": data.get("key_lessons", []),
+            "miss_categories": data.get("miss_categories", {}),
             "suggested_weights": data.get("suggested_weights", current_weights),
             "weight_reasoning": data.get("weight_reasoning", ""),
         }
@@ -323,6 +339,7 @@ JSONのみ返答(合計1.0):
             "reflection": raw,
             "odds_bias_audit": "",
             "key_lessons": [],
+            "miss_categories": {},
             "suggested_weights": current_weights,
             "weight_reasoning": "",
         }

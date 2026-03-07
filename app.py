@@ -28,6 +28,7 @@ from data_store import (
     save_jra_ground_truth,
     get_jra_ground_truth,
     merge_track_data,
+    get_weight_history,
 )
 
 # ─────────────────────────────────────────────
@@ -89,6 +90,9 @@ if "sl_hindq" not in st.session_state:
     st.session_state.sl_hindq = 3
 if "sl_gait" not in st.session_state:
     st.session_state.sl_gait = 3
+# 結果保存後に自動PDCA実行するためのフラグ
+if "auto_pdca_race" not in st.session_state:
+    st.session_state.auto_pdca_race = None
 
 
 # ─────────────────────────────────────────────
@@ -233,7 +237,7 @@ with st.sidebar:
 
 st.title("🏇 競馬AI予想システム")
 
-tab1, tab2, tab3 = st.tabs(["予想", "結果入力 & PDCA", "ダッシュボード"])
+tab1, tab2, tab3, tab4 = st.tabs(["予想", "結果入力 & PDCA", "ダッシュボード", "過去Gレース学習"])
 
 # ═════════════════════════════════════════════
 # Tab 1: Prediction
@@ -913,6 +917,10 @@ with tab2:
                             transport_km=km,
                         )
                 st.success("結果を保存しました")
+                # 予想データがあれば自動的にPDCA分析を実行するフラグをセット
+                if get_prediction(race_id2):
+                    st.session_state.auto_pdca_race = race_id2
+                st.rerun()
 
         # ── PDCA ────────────────────────────────────────
         st.divider()
@@ -926,8 +934,13 @@ with tab2:
         elif not result_exists:
             st.warning("結果データがありません。上記フォームで入力してください。")
         else:
-            if st.button("PDCA分析 & 黄金比重み自動更新", type="primary"):
-                with st.spinner("Geminiが反省分析中..."):
+            # 結果保存後の自動実行 or 手動ボタン
+            auto_run = st.session_state.auto_pdca_race == race_id2
+            if auto_run:
+                st.session_state.auto_pdca_race = None  # フラグをクリア
+
+            if auto_run or st.button("PDCA分析 & 黄金比重み自動更新", type="primary"):
+                with st.spinner("Geminiが外れ要因を分析・重みを自動調整中..."):
                     pdca_result = pdca_engine.compare_and_evolve(
                         race_id=race_id2,
                         api_key=st.session_state.api_key,
@@ -959,8 +972,37 @@ with tab2:
                     if pdca_result.get("odds_bias_audit"):
                         st.info(f"オッズバイアス監査: {pdca_result['odds_bias_audit']}")
 
+                    # ── ミスカテゴリ分析 ────────────────────
+                    miss_cats = pdca_result.get("miss_categories", {})
+                    if miss_cats:
+                        st.subheader("要因別ミスカテゴリ分析")
+                        _cat_color = {
+                            "過大評価": "#ff6b6b",
+                            "過小評価": "#ffd700",
+                            "適切":     "#00ff88",
+                        }
+                        mc_cols = st.columns(4)
+                        for i, (k, label) in enumerate(WEIGHT_LABELS.items()):
+                            verdict = miss_cats.get(k, "－")
+                            color = _cat_color.get(verdict, "#aaa")
+                            old_w = pdca_result["old_weights"].get(k, 0)
+                            new_w = pdca_result["new_weights"].get(k, 0)
+                            delta = new_w - old_w
+                            delta_str = f"{delta:+.1%}" if delta != 0 else "変更なし"
+                            delta_color = "#ff6b6b" if delta < 0 else "#00ff88" if delta > 0 else "#aaa"
+                            with mc_cols[i]:
+                                st.markdown(
+                                    f'<div style="border:1px solid {color};border-radius:8px;padding:10px;text-align:center;">'
+                                    f'<div style="font-size:0.85em;color:#ccc;">{label}</div>'
+                                    f'<div style="font-size:1.1em;font-weight:bold;color:{color};">{verdict}</div>'
+                                    f'<div style="font-size:0.8em;color:{delta_color};margin-top:4px;">'
+                                    f'重み: {old_w:.0%} → {new_w:.0%} ({delta_str})</div>'
+                                    f'</div>',
+                                    unsafe_allow_html=True,
+                                )
+
                     if pdca_result.get("reflection"):
-                        st.subheader("AI反省レポート")
+                        st.subheader("AI反省レポート（外れ要因の詳細分析）")
                         st.write(pdca_result["reflection"])
 
                     if pdca_result.get("key_lessons"):
@@ -968,17 +1010,9 @@ with tab2:
                         for lesson in pdca_result["key_lessons"]:
                             st.markdown(f"- {lesson}")
 
-                    col_ow, col_nw = st.columns(2)
-                    with col_ow:
-                        st.subheader("更新前の重み")
-                        for k, v in pdca_result["old_weights"].items():
-                            st.write(f"{WEIGHT_LABELS.get(k, k)}: {v:.1%}")
-                    with col_nw:
-                        st.subheader("更新後の重み")
-                        for k, v in pdca_result["new_weights"].items():
-                            st.write(f"{WEIGHT_LABELS.get(k, k)}: {v:.1%}")
                     if pdca_result.get("weight_reasoning"):
-                        st.caption(f"変更理由: {pdca_result['weight_reasoning']}")
+                        st.info(f"重み変更の根拠: {pdca_result['weight_reasoning']}")
+                    st.caption("※ 重みの変化は最大±5%/レースに制限されています（急激な過学習防止）")
 
 
 # ═════════════════════════════════════════════
@@ -1120,6 +1154,49 @@ with tab3:
             hide_index=True,
         )
 
+        # ── 重み推移グラフ（PDCAログ） ──────────────────
+        weight_hist = get_weight_history()
+        if len(weight_hist) >= 2:
+            st.subheader("重み自動調整の推移（PDCA履歴）")
+            wh_labels = [h["race_name"] for h in weight_hist]
+            wh_colors = {
+                "bio_condition": "#ff7f7f",
+                "environment":   "#7fdbff",
+                "human_skill":   "#00ff88",
+                "background":    "#ffd700",
+            }
+            fig_w = go.Figure()
+            for key, label in WEIGHT_LABELS.items():
+                vals = [h["new_weights"].get(key, 0) for h in weight_hist]
+                fig_w.add_trace(go.Scatter(
+                    x=wh_labels,
+                    y=vals,
+                    mode="lines+markers",
+                    name=label,
+                    line=dict(color=wh_colors.get(key, "#aaa"), width=2),
+                    marker=dict(size=7),
+                ))
+            # 黄金比の目標ライン
+            golden_vals = {"bio_condition": 0.40, "environment": 0.30,
+                           "human_skill": 0.20, "background": 0.10}
+            for key, label in WEIGHT_LABELS.items():
+                fig_w.add_hline(
+                    y=golden_vals[key],
+                    line=dict(color=wh_colors.get(key, "#aaa"), dash="dot", width=1),
+                    opacity=0.4,
+                )
+            fig_w.update_layout(
+                xaxis_title="レース",
+                yaxis_title="重み",
+                yaxis=dict(tickformat=".0%", range=[0, 0.6]),
+                template="plotly_dark",
+                height=300,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                margin=dict(t=40, b=40),
+            )
+            st.plotly_chart(fig_w, use_container_width=True)
+            st.caption("点線 = 科学的黄金比目標。実線 = PDCAによる自動調整後の値。")
+
         # ── 外れパターン ─────────────────────────────────
         trend = pdca_engine.get_trend_analysis()
         misses = trend.get("recent_misses", [])
@@ -1151,5 +1228,193 @@ with tab3:
             height=350,
         )
         st.plotly_chart(fig_init, use_container_width=True)
+
+
+# ═════════════════════════════════════════════
+# Tab 4: 過去Gレース学習
+# ═════════════════════════════════════════════
+
+with tab4:
+    st.header("過去Gレース一括学習")
+    st.caption(
+        "直近の終了済みG1/G2/G3レースを自動取得し、AIが「当時の予想」を再構築して "
+        "実際の結果と照合します。PDCA自己進化ループを複数レース分まとめて実行し、"
+        "黄金比パラメーターを実績ベースで調整します。"
+    )
+
+    if not st.session_state.api_key:
+        st.warning("Gemini API キーが設定されていません。サイドバーで設定してください。")
+    else:
+        # ── 過去レース取得 ───────────────────────────────────
+        col_fetch_past, col_n_weeks = st.columns([2, 1])
+        with col_n_weeks:
+            n_weeks = st.number_input("取得週数", min_value=1, max_value=8, value=4, step=1,
+                                      help="最大8週前までのGレースを対象にします")
+        with col_fetch_past:
+            if st.button("直近の終了済みGレースを取得", type="primary", use_container_width=True):
+                with st.spinner(f"直近{n_weeks}週のGレース一覧を取得中..."):
+                    past_races = scraper.fetch_past_g_races(int(n_weeks))
+                st.session_state["past_g_races"] = past_races
+                if past_races:
+                    st.success(f"{len(past_races)}レースを取得しました")
+                else:
+                    st.warning("Gレースが見つかりませんでした（netkeiba接続を確認してください）")
+
+        past_races = st.session_state.get("past_g_races", [])
+
+        if past_races:
+            st.divider()
+
+            # ── レース選択 ──────────────────────────────────
+            st.subheader("学習対象レースを選択")
+            race_options = {
+                f"[{r['grade']}] {r['race_name']} ({r.get('race_date','?')} {r.get('venue','')})": r
+                for r in past_races
+            }
+            selected_labels = st.multiselect(
+                "学習するレースを選択（複数可）",
+                options=list(race_options.keys()),
+                default=list(race_options.keys()),
+                help="デフォルトで全件選択。不要なレースはチェックを外してください。"
+            )
+            selected_past = [race_options[lbl] for lbl in selected_labels]
+
+            if not selected_past:
+                st.info("学習対象レースを1つ以上選択してください。")
+            else:
+                st.info(
+                    f"**{len(selected_past)}レース**を対象に学習します。\n\n"
+                    "処理内容: ① 出走馬データ取得 → ② 結果取得 → "
+                    "③ AI遡及予想生成 → ④ PDCA重み自動調整"
+                )
+
+                if st.button(
+                    f"一括学習を実行（{len(selected_past)}レース）",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    progress = st.progress(0)
+                    status = st.empty()
+                    log_area = st.empty()
+                    log_lines: list[str] = []
+
+                    learned = 0
+                    skipped = 0
+                    errors = 0
+
+                    for idx, race in enumerate(selected_past):
+                        rid = race["race_id"]
+                        rname = race["race_name"]
+                        progress.progress((idx) / len(selected_past))
+                        status.markdown(f"**[{idx+1}/{len(selected_past)}]** {rname} を処理中...")
+
+                        try:
+                            # ① 結果取得
+                            result_data = get_result(rid)
+                            if not result_data:
+                                fetched = scraper.fetch_result(rid)
+                                if not fetched:
+                                    log_lines.append(f"⚠ {rname}: 結果を取得できませんでした（スキップ）")
+                                    skipped += 1
+                                    log_area.markdown("\n".join(log_lines[-10:]))
+                                    continue
+                                result_data = {"race_name": rname, **fetched}
+                                save_result(rid, result_data)
+                                log_lines.append(f"✓ {rname}: 結果を取得・保存")
+                            else:
+                                log_lines.append(f"○ {rname}: 結果は保存済み")
+
+                            # ② 予想データが未存在なら遡及予想を生成
+                            pred_data = get_prediction(rid)
+                            if not pred_data:
+                                # 出走馬データを取得（過去レースでも利用可能）
+                                entries = scraper.fetch_entries(
+                                    rid, venue=race.get("venue", "")
+                                )
+                                if not entries:
+                                    log_lines.append(f"⚠ {rname}: 出走馬データを取得できませんでした（スキップ）")
+                                    skipped += 1
+                                    log_area.markdown("\n".join(log_lines[-10:]))
+                                    continue
+
+                                # 遡及AI予想（当時のデータで再構築）
+                                retro_result = gemini_client.analyze_race(
+                                    api_key=st.session_state.api_key,
+                                    race_name=rname,
+                                    horses=entries,
+                                    track_condition=race.get("track_condition", "良"),
+                                    weather=race.get("weather", ""),
+                                    weights=load_weights(),
+                                )
+                                save_prediction(rid, {
+                                    "race_name": rname,
+                                    "grade": race.get("grade", ""),
+                                    "horses": retro_result.get("horses", []),
+                                    "gemini_comment": retro_result.get("comment", ""),
+                                    "retroactive": True,  # 遡及予想フラグ
+                                })
+                                log_lines.append(f"✓ {rname}: 遡及予想を生成・保存")
+                            else:
+                                log_lines.append(f"○ {rname}: 予想は保存済み")
+
+                            # ③ PDCA実行（重み更新）
+                            pdca_res = pdca_engine.compare_and_evolve(
+                                race_id=rid,
+                                api_key=st.session_state.api_key,
+                            )
+                            if "error" in pdca_res:
+                                log_lines.append(f"✗ {rname}: PDCA エラー - {pdca_res['error']}")
+                                errors += 1
+                            else:
+                                hit = "1着的中" if pdca_res["hit_1st"] else ("3着内" if pdca_res["hit_top3"] else "外れ")
+                                cats = pdca_res.get("miss_categories", {})
+                                cat_str = " / ".join(
+                                    f"{WEIGHT_LABELS.get(k,k)}:{v}"
+                                    for k, v in cats.items() if v and v != "適切"
+                                )
+                                log_lines.append(
+                                    f"✓ {rname}: PDCA完了 [{hit}]"
+                                    + (f" 要調整: {cat_str}" if cat_str else " 全要因適切")
+                                )
+                                learned += 1
+
+                        except Exception as e:
+                            log_lines.append(f"✗ {rname}: 予期しないエラー - {e}")
+                            errors += 1
+
+                        log_area.markdown("\n".join(log_lines[-10:]))
+
+                    progress.progress(1.0)
+                    status.markdown("**処理完了！**")
+
+                    # ── 学習結果サマリー ─────────────────────
+                    st.divider()
+                    st.subheader("学習結果サマリー")
+                    s1, s2, s3 = st.columns(3)
+                    with s1:
+                        st.metric("PDCA完了", f"{learned}レース")
+                    with s2:
+                        st.metric("スキップ", f"{skipped}レース",
+                                  help="データ取得不可のレース")
+                    with s3:
+                        st.metric("エラー", f"{errors}レース")
+
+                    # 更新後の重みを表示
+                    new_w = load_weights()
+                    st.subheader("学習後の最新重み（黄金比）")
+                    w_cols = st.columns(4)
+                    for i, (k, label) in enumerate(WEIGHT_LABELS.items()):
+                        with w_cols[i]:
+                            default = {"bio_condition": 0.40, "environment": 0.30,
+                                       "human_skill": 0.20, "background": 0.10}
+                            delta = new_w.get(k, 0) - default[k]
+                            st.metric(label, f"{new_w.get(k, 0):.1%}",
+                                      delta=f"{delta:+.1%}",
+                                      delta_color="normal" if abs(delta) < 0.05 else "inverse")
+                    st.caption("※ 黄金比初期値（生体40% / 環境30% / 人間20% / 背景10%）との差分を表示")
+
+                    # 全ログ表示
+                    with st.expander("詳細ログを確認"):
+                        st.text("\n".join(log_lines))
 
 
