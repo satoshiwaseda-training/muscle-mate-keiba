@@ -96,7 +96,19 @@ def get_result(race_id: str) -> dict | None:
 # --- Weights ---
 
 def load_weights() -> dict:
-    return _load_json(WEIGHTS_FILE, DEFAULT_WEIGHTS.copy())
+    """ローカルファイル → GitHub Gist の順に重みを読み込む。"""
+    if WEIGHTS_FILE.exists():
+        return _load_json(WEIGHTS_FILE, DEFAULT_WEIGHTS.copy())
+    # ローカルになければ Gist から復元を試みる
+    try:
+        import github_sync
+        remote = github_sync.pull_weights()
+        if remote:
+            _save_json(WEIGHTS_FILE, remote)
+            return remote
+    except Exception:
+        pass
+    return DEFAULT_WEIGHTS.copy()
 
 
 def save_weights(weights: dict):
@@ -105,6 +117,12 @@ def save_weights(weights: dict):
     if total > 0:
         weights = {k: round(v / total, 4) for k, v in weights.items()}
     _save_json(WEIGHTS_FILE, weights)
+    # GitHub Gist にも同期（失敗しても無視）
+    try:
+        import github_sync
+        github_sync.push_weights(weights)
+    except Exception:
+        pass
 
 
 def reset_weights():
