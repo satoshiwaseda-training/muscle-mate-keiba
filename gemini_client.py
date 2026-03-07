@@ -31,7 +31,7 @@ def _call_gemini(api_key: str, prompt: str) -> str:
             model=_GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
-                max_output_tokens=4000,
+                max_output_tokens=8192,
                 temperature=0.3,
             ),
         )
@@ -264,19 +264,8 @@ JSONのみ返答:
 
     raw = _call_gemini(api_key, prompt)
 
-    try:
-        data = json.loads(_extract_json(raw))
-        # Normalize field names: score -> confidence for backward compat
-        for h in data.get("predictions", []):
-            if "score" in h and "confidence" not in h:
-                h["confidence"] = h.pop("score")
-        return {
-            "horses": data.get("predictions", []),
-            "comment": data.get("overall_comment", ""),
-            "raw_response": raw,
-        }
-    except Exception:
-        return {"horses": [], "comment": raw, "raw_response": raw}
+    horses, comment = _parse_race_response(raw)
+    return {"horses": horses, "comment": comment, "raw_response": raw}
 
 
 def generate_reflection(
@@ -405,3 +394,47 @@ def _extract_json(text: str) -> str:
     if match:
         return match.group(0)
     return text
+
+
+def _parse_race_response(raw: str) -> tuple[list, str]:
+    """
+    JSON全体のparse成功 → predictions + overall_comment を返す。
+    JSON切断などで失敗 → 正規表現で完結した prediction オブジェクトだけ救出する。
+    """
+    # --- まず全体parseを試みる ---
+    try:
+        data = json.loads(_extract_json(raw))
+        horses = data.get("predictions", [])
+        for h in horses:
+            if "score" in h and "confidence" not in h:
+                h["confidence"] = h.pop("score")
+        return horses, data.get("overall_comment", "")
+    except Exception:
+        pass
+
+    # --- 切断JSONから完結した prediction オブジェクトを個別に救出 ---
+    horses = []
+    # rank/name/score(confidence)/reason が揃っているオブジェクトだけ抽出
+    pattern = re.compile(
+        r'\{[^{}]*?"rank"\s*:\s*(\d+)[^{}]*?"name"\s*:\s*"([^"]+)"[^{}]*?\}',
+        re.DOTALL,
+    )
+    for m in pattern.finditer(raw):
+        try:
+            obj = json.loads(m.group(0))
+            if "score" in obj and "confidence" not in obj:
+                obj["confidence"] = obj.pop("score")
+            horses.append(obj)
+        except Exception:
+            pass
+
+    # rank で並び替え・重複除去
+    seen = set()
+    unique = []
+    for h in sorted(horses, key=lambda x: x.get("rank", 99)):
+        if h.get("name") not in seen:
+            seen.add(h.get("name"))
+            unique.append(h)
+
+    comment = raw if not unique else ""
+    return unique, comment
