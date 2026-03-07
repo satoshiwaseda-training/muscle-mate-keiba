@@ -1131,7 +1131,7 @@ with tab3:
                 line=dict(color="#7fdbff", width=2),
                 marker=dict(size=6),
             ))
-            fig.add_hrect(y0=0.25, y1=0.35, fillcolor="#00ff8822", line_width=0,
+            fig.add_hrect(y0=0.25, y1=0.35, fillcolor="rgba(0,255,136,0.13)", line_width=0,
                           annotation_text="1着25-35%ゾーン", annotation_position="top left")
             fig.update_layout(
                 xaxis_title="レース数",
@@ -1158,7 +1158,7 @@ with tab3:
                 theta=radar_labels + [radar_labels[0]],
                 fill="toself",
                 fillcolor="rgba(255,215,0,0.08)",
-                line=dict(color="#FFD70066", dash="dot"),
+                line=dict(color="rgba(255,215,0,0.4)", dash="dot"),
                 name="黄金比目標",
             ))
             fig_r.add_trace(go.Scatterpolar(
