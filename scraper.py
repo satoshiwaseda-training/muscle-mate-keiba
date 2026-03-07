@@ -956,6 +956,176 @@ def fetch_race_list_jra(race_date: date) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════
+# 11. Paddock reports — multi-source (race day SNS/news)
+# ═══════════════════════════════════════════════════════════
+
+def fetch_paddock_reports(race_id: str, horse_names: list, race_name: str = "") -> dict:
+    """
+    当日のパドック情報を複数の公開ソースから取得。
+    Sources (priority order):
+      1. netkeiba パドックページ
+      2. Yahoo!ニュース検索 (当日記事)
+      3. uma-jo.jp
+      4. keibago.com
+
+    Returns:
+      {horse_name: {"text": str, "source": str, "scores": dict}}
+    """
+    reports: dict = {}
+
+    # 1. netkeiba paddock
+    _scrape_netkeiba_paddock(race_id, horse_names, reports)
+
+    # 2. Yahoo!ニュース (SNS的な当日速報)
+    missing = [n for n in horse_names if not reports.get(n, {}).get("text")]
+    if missing:
+        _scrape_yahoo_news_paddock(race_name or race_id, missing, reports)
+
+    # 3. uma-jo.jp
+    missing = [n for n in horse_names if not reports.get(n, {}).get("text")]
+    if missing:
+        _scrape_umajo_paddock(race_id, missing, reports)
+
+    # 4. keibago.com
+    missing = [n for n in horse_names if not reports.get(n, {}).get("text")]
+    if missing:
+        _scrape_keibago_paddock(race_id, missing, reports)
+
+    # 未取得馬は空エントリ
+    for name in horse_names:
+        if name not in reports:
+            reports[name] = {"text": "", "source": "", "scores": {}}
+
+    return reports
+
+
+def _scrape_netkeiba_paddock(race_id: str, horse_names: list, reports: dict):
+    """netkeiba paddock.html からパドックコメントを取得。"""
+    soup = _get(
+        "https://race.netkeiba.com/race/paddock.html",
+        params={"race_id": race_id},
+        encoding="utf-8",
+    )
+    if not soup:
+        return
+
+    full_text = soup.get_text(" ", strip=True)
+
+    # horse-by-horse structured comments
+    for sel in [".PaddockComment", ".Paddock_Comment", ".HorsePaddock",
+                ".PaddockData_Item", ".paddock_comment"]:
+        for item in soup.select(sel):
+            name_tag = item.select_one(".HorseName, .Horse_Name, .name")
+            comment_tag = item.select_one(".Comment, .PaddockText, p, .text")
+            if not (name_tag and comment_tag):
+                continue
+            item_name = name_tag.get_text(strip=True)
+            text = comment_tag.get_text(strip=True)
+            for hn in horse_names:
+                if hn in item_name or item_name in hn:
+                    reports[hn] = {
+                        "text": text,
+                        "source": "netkeiba",
+                        "scores": parse_paddock_comment(text),
+                    }
+
+    # フォールバック: ページ全体テキストから馬名周辺の文を抽出
+    if not any(reports.get(n, {}).get("text") for n in horse_names):
+        for name in horse_names:
+            sentences = [s.strip() for s in re.split(r'[。．\n]', full_text)
+                         if name in s and len(s) > 10]
+            if sentences:
+                combined = "。".join(sentences[:3])
+                reports[name] = {
+                    "text": combined,
+                    "source": "netkeiba(全文抽出)",
+                    "scores": parse_paddock_comment(combined),
+                }
+
+
+def _scrape_yahoo_news_paddock(race_name: str, horse_names: list, reports: dict):
+    """Yahoo!ニュース競馬検索で当日パドック記事を取得。"""
+    query = f"{race_name} パドック"
+    soup = _get(
+        "https://news.yahoo.co.jp/search",
+        params={"p": query, "ei": "utf-8"},
+        delay=1.5,
+    )
+    if not soup:
+        return
+
+    # 全記事テキストを収集
+    snippets = []
+    for el in soup.select(".newsFeed_item_detail, .sc-fzoLsD, .article_body, p"):
+        t = el.get_text(strip=True)
+        if len(t) > 20:
+            snippets.append(t)
+
+    full_text = "。".join(snippets)
+
+    for name in horse_names:
+        sentences = [s.strip() for s in re.split(r'[。．\n]', full_text)
+                     if name in s and len(s) > 10]
+        if sentences:
+            combined = "。".join(sentences[:4])
+            reports[name] = {
+                "text": combined,
+                "source": "Yahoo!ニュース",
+                "scores": parse_paddock_comment(combined),
+            }
+
+
+def _scrape_umajo_paddock(race_id: str, horse_names: list, reports: dict):
+    """uma-jo.jp から当日パドックレポートを取得。"""
+    # uma-jo はレース日付ベースのURL構造
+    date_part = race_id[:8] if len(race_id) >= 8 else ""
+    if not date_part:
+        return
+
+    year, month, day = date_part[:4], date_part[4:6], date_part[6:8]
+    soup = _get(
+        f"https://uma-jo.jp/{year}/{month}/{day}/",
+        delay=1.2,
+    )
+    if not soup:
+        return
+
+    full_text = soup.get_text(" ", strip=True)
+    for name in horse_names:
+        sentences = [s.strip() for s in re.split(r'[。．\n]', full_text)
+                     if name in s and len(s) > 10]
+        if sentences:
+            combined = "。".join(sentences[:3])
+            reports[name] = {
+                "text": combined,
+                "source": "uma-jo.jp",
+                "scores": parse_paddock_comment(combined),
+            }
+
+
+def _scrape_keibago_paddock(race_id: str, horse_names: list, reports: dict):
+    """keibago.com から当日パドック情報を取得。"""
+    soup = _get(
+        f"https://keibago.com/race/{race_id}/paddock/",
+        delay=1.2,
+    )
+    if not soup:
+        return
+
+    full_text = soup.get_text(" ", strip=True)
+    for name in horse_names:
+        sentences = [s.strip() for s in re.split(r'[。．\n]', full_text)
+                     if name in s and len(s) > 10]
+        if sentences:
+            combined = "。".join(sentences[:3])
+            reports[name] = {
+                "text": combined,
+                "source": "keibago.com",
+                "scores": parse_paddock_comment(combined),
+            }
+
+
+# ═══════════════════════════════════════════════════════════
 # Unified public API
 # ═══════════════════════════════════════════════════════════
 

@@ -74,6 +74,8 @@ if "prediction_result" not in st.session_state:
     st.session_state.prediction_result = None
 if "weather_data" not in st.session_state:
     st.session_state.weather_data = {}
+if "paddock_reports" not in st.session_state:
+    st.session_state.paddock_reports = {}
 
 # ─────────────────────────────────────────────
 # Sidebar
@@ -283,13 +285,67 @@ with tab1:
             if st.session_state.entries and st.session_state.entries[0].get("bloodline"):
                 st.caption(f"詳細データ取得済: {len(st.session_state.entries)}頭")
 
-        # ── パドック所見 — スライダー入力 ────────────────
+        # ── パドック所見 ──────────────────────────────────
         st.markdown("---")
         st.subheader("パドック所見（生体コンディション評価）")
-        st.caption("各指標を 1（最低）〜 5（最高）で直感的に評価してください")
+
+        # 自動取得ボタン
+        col_pad_btn, col_pad_status = st.columns([1, 3])
+        with col_pad_btn:
+            if st.button("パドック情報を自動取得\n(SNS/ニュース)", use_container_width=True):
+                horse_names = [h["name"] for h in st.session_state.entries] if st.session_state.entries else []
+                with st.spinner("netkeiba・Yahoo!ニュース・uma-jo等から取得中..."):
+                    st.session_state.paddock_reports = scraper.fetch_paddock_reports(
+                        race_id=selected_race["race_id"],
+                        horse_names=horse_names,
+                        race_name=selected_race["race_name"],
+                    )
+                found = sum(1 for v in st.session_state.paddock_reports.values() if v.get("text"))
+                if found:
+                    st.success(f"{found}頭分のパドック情報を取得")
+                else:
+                    st.warning("パドック情報が見つかりませんでした（レース当日に再試行してください）")
+
+        # 取得済みレポートを表示
+        paddock_reports = st.session_state.paddock_reports
+        if paddock_reports:
+            with col_pad_status:
+                sources = list({v["source"] for v in paddock_reports.values() if v.get("source")})
+                st.caption(f"取得元: {', '.join(sources)}")
+
+            with st.expander("取得したパドック情報（馬別）", expanded=False):
+                for hname, rep in paddock_reports.items():
+                    if rep.get("text"):
+                        src_badge = f'<span style="color:#FFD700;font-size:0.8em;">[{rep["source"]}]</span>'
+                        sc = rep.get("scores", {})
+                        score_str = ""
+                        if sc:
+                            score_str = (
+                                f' 血管:{sc.get("vascularity_index",0):+.2f}'
+                                f' トモ:{sc.get("hindquarter_power",0):+.2f}'
+                                f' 歩様:{sc.get("gait_fluidity",0):+.2f}'
+                            )
+                        st.markdown(
+                            f'**{hname}** {src_badge}'
+                            f'<span style="color:#aaa;font-size:0.8em;">{score_str}</span><br>'
+                            f'<span style="color:#ddd;font-size:0.9em;">{rep["text"]}</span>',
+                            unsafe_allow_html=True,
+                        )
+                        st.divider()
+
+        # 自動取得スコアの集計（全馬平均 → スライダー初期値に反映）
+        def _auto_slider_default(key: str, fallback: int = 3) -> int:
+            scores = [v["scores"].get(key, 0) for v in paddock_reports.values()
+                      if v.get("scores") and v["scores"].get(key) is not None]
+            if not scores:
+                return fallback
+            avg = sum(scores) / len(scores)  # -1〜1
+            return max(1, min(5, round(avg * 2 + 3)))  # → 1〜5
+
+        st.caption("各指標を 1（最低）〜 5（最高）で評価（自動取得時は平均スコアを反映）")
 
         paddock_notes = st.text_input(
-            "総合所見メモ",
+            "総合所見メモ（補足）",
             placeholder="例: 3番の血管が浮き出ている。5番は踏み込みが深く滑らか。",
         )
 
@@ -297,7 +353,8 @@ with tab1:
         with col_p1:
             coat_score = st.slider(
                 "毛並み・光沢（内臓コンディション）",
-                min_value=1, max_value=5, value=3,
+                min_value=1, max_value=5,
+                value=_auto_slider_default("vascularity_index"),
                 help="1=くすみ/疲労感あり　5=ピカピカ/仕上げ完成",
             )
             coat_labels = {1: "くすんでいる(要注意)", 2: "やや悪い", 3: "普通",
@@ -313,7 +370,8 @@ with tab1:
         with col_p2:
             hindq_score = st.slider(
                 "トモのパンプアップ（推進力ポテンシャル）",
-                min_value=1, max_value=5, value=3,
+                min_value=1, max_value=5,
+                value=_auto_slider_default("hindquarter_power"),
                 help="1=張りなし/細い　5=パンプアップ最高/力強い",
             )
             hindq_labels = {1: "張りなし", 2: "やや甘い", 3: "普通",
@@ -329,7 +387,8 @@ with tab1:
         with col_p3:
             gait_score = st.slider(
                 "歩様・踏み込みの流動性（重心移動効率）",
-                min_value=1, max_value=5, value=3,
+                min_value=1, max_value=5,
+                value=_auto_slider_default("gait_fluidity"),
                 help="1=硬い/ぎこちない　5=踏み込み深く滑らか",
             )
             gait_labels = {1: "硬い(ぎこちない)", 2: "やや硬い", 3: "普通",
