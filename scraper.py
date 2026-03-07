@@ -372,9 +372,12 @@ def _get_json(url: str, params: dict = None) -> Optional[dict]:
     """Fetch JSON endpoint (used for OpenMeteo)."""
     try:
         time.sleep(0.3)
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        resp = requests.get(url, params=params, timeout=15)
+        data = resp.json()
+        if data.get("error"):
+            print(f"[scraper] JSON GET {url} API error: {data.get('reason')}")
+            return None
+        return data
     except Exception as e:
         print(f"[scraper] JSON GET {url} failed: {e}")
         return None
@@ -400,37 +403,89 @@ def fetch_weather(venue: str, race_date: date, race_hour: int = 15) -> dict:
 
     lat, lon = coords
     today = date.today()
+    days_ago = (today - race_date).days  # 負なら未来
 
-    # OpenMeteo パラメータ (新旧両対応: wind_speed_10m / weather_code)
     _hourly_vars = "temperature_2m,precipitation,wind_speed_10m,weather_code"
-    base_params = {
-        "latitude": lat, "longitude": lon,
-        "hourly": _hourly_vars,
-        "timezone": "Asia/Tokyo",
-        "start_date": race_date.isoformat(),
-        "end_date": race_date.isoformat(),
-    }
 
-    if race_date >= today:
-        data = _get_json("https://api.open-meteo.com/v1/forecast", params=base_params)
-    else:
-        # アーカイブAPIは最新5日間が未反映のため、失敗時はforecast APIにフォールバック
-        data = _get_json("https://archive-api.open-meteo.com/v1/archive", params=base_params)
+    data = None
+    used_source = ""
+
+    if days_ago < 0:
+        # 未来: forecast API (start_date/end_date)
+        params = {
+            "latitude": lat, "longitude": lon,
+            "hourly": _hourly_vars,
+            "timezone": "Asia/Tokyo",
+            "start_date": race_date.isoformat(),
+            "end_date": race_date.isoformat(),
+        }
+        data = _get_json("https://api.open-meteo.com/v1/forecast", params=params)
+        used_source = "OpenMeteo forecast"
+
+    elif days_ago <= 14:
+        # 直近14日: forecast API の past_days で取得（アーカイブ未反映期間対策）
+        params = {
+            "latitude": lat, "longitude": lon,
+            "hourly": _hourly_vars,
+            "timezone": "Asia/Tokyo",
+            "past_days": min(days_ago + 1, 92),
+            "forecast_days": 0,
+        }
+        data = _get_json("https://api.open-meteo.com/v1/forecast", params=params)
+        used_source = "OpenMeteo forecast(past)"
+        # 失敗時はアーカイブを試みる
         if not data or "hourly" not in data:
-            data = _get_json("https://api.open-meteo.com/v1/forecast", params=base_params)
+            params2 = {
+                "latitude": lat, "longitude": lon,
+                "hourly": _hourly_vars,
+                "timezone": "Asia/Tokyo",
+                "start_date": race_date.isoformat(),
+                "end_date": race_date.isoformat(),
+            }
+            data = _get_json("https://archive-api.open-meteo.com/v1/archive", params=params2)
+            used_source = "OpenMeteo archive"
+
+    else:
+        # 15日以上前: archive API
+        params = {
+            "latitude": lat, "longitude": lon,
+            "hourly": _hourly_vars,
+            "timezone": "Asia/Tokyo",
+            "start_date": race_date.isoformat(),
+            "end_date": race_date.isoformat(),
+        }
+        data = _get_json("https://archive-api.open-meteo.com/v1/archive", params=params)
+        used_source = "OpenMeteo archive"
 
     if not data or "hourly" not in data:
-        return {"temperature": "取得失敗", "precipitation": "取得失敗",
-                "windspeed": "取得失敗", "description": "APIエラー"}
+        return {
+            "temperature": "取得失敗", "precipitation": "取得失敗",
+            "windspeed": "取得失敗",
+            "description": "APIエラー",
+            "source": f"失敗({used_source}, {days_ago}日前)",
+        }
 
     hourly = data["hourly"]
     times = hourly.get("time", [])
     target = f"{race_date.isoformat()}T{race_hour:02d}:00"
-    idx = times.index(target) if target in times else min(race_hour, len(times) - 1)
+    if target in times:
+        idx = times.index(target)
+    elif times:
+        # ターゲット時刻が見つからない場合は最も近い時刻を使用
+        idx = min(range(len(times)), key=lambda i: abs(
+            (date.fromisoformat(times[i][:10]) - race_date).days * 24 +
+            int(times[i][11:13]) - race_hour
+        ))
+    else:
+        return {
+            "temperature": "取得失敗", "precipitation": "取得失敗",
+            "windspeed": "取得失敗",
+            "description": "時刻データなし",
+            "source": used_source,
+        }
 
     temp = hourly["temperature_2m"][idx] if hourly.get("temperature_2m") else "?"
     precip = hourly["precipitation"][idx] if hourly.get("precipitation") else "?"
-    # 新パラメータ名優先、旧名フォールバック
     wind = (hourly.get("wind_speed_10m") or hourly.get("windspeed_10m") or [None])[idx] or "?"
     wcode = (hourly.get("weather_code") or hourly.get("weathercode") or [0])[idx] or 0
 
@@ -440,7 +495,7 @@ def fetch_weather(venue: str, race_date: date, race_hour: int = 15) -> dict:
         "precipitation": f"{precip}mm",
         "windspeed": f"{wind}km/h",
         "description": desc,
-        "source": "OpenMeteo",
+        "source": used_source,
     }
 
 
