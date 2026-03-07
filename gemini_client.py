@@ -8,27 +8,33 @@ never as a direct quality proxy.
 import json
 import re
 
-_gemini_model = None
+_GEMINI_MODEL = "gemini-2.0-flash"
+_genai_client = None
 _current_api_key = None
 
 
-def _get_model(api_key: str):
-    global _gemini_model, _current_api_key
-    if _gemini_model is None or api_key != _current_api_key:
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        _gemini_model = genai.GenerativeModel(
-            "gemini-2.0-flash-001",
-            generation_config={"max_output_tokens": 600, "temperature": 0.3},
-        )
+def _get_client(api_key: str):
+    global _genai_client, _current_api_key
+    if _genai_client is None or api_key != _current_api_key:
+        from google import genai
+        _genai_client = genai.Client(api_key=api_key)
         _current_api_key = api_key
-    return _gemini_model
+    return _genai_client
 
 
 def _call_gemini(api_key: str, prompt: str) -> str:
     try:
-        model = _get_model(api_key)
-        response = model.generate_content(prompt)
+        from google import genai
+        from google.genai import types
+        client = _get_client(api_key)
+        response = client.models.generate_content(
+            model=_GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                max_output_tokens=600,
+                temperature=0.3,
+            ),
+        )
         return response.text
     except Exception as e:
         return f"[Gemini APIエラー] {e}"

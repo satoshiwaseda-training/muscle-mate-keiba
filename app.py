@@ -151,10 +151,14 @@ with st.sidebar:
         if st.button("接続テスト", use_container_width=True):
             with st.spinner("Gemini疎通確認中..."):
                 try:
-                    import google.generativeai as _genai
-                    _genai.configure(api_key=st.session_state.api_key)
-                    _m = _genai.GenerativeModel("gemini-2.0-flash-001")
-                    _r = _m.generate_content("日本語で「接続OK」とだけ返答してください")
+                    from google import genai as _genai
+                    from google.genai import types as _gtypes
+                    _client = _genai.Client(api_key=st.session_state.api_key)
+                    _r = _client.models.generate_content(
+                        model="gemini-2.0-flash",
+                        contents="日本語で「接続OK」とだけ返答してください",
+                        config=_gtypes.GenerateContentConfig(max_output_tokens=20),
+                    )
                     st.success(f"Gemini応答: {_r.text.strip()[:50]}")
                 except Exception as _e:
                     st.error(f"Gemini接続エラー: {_e}")
