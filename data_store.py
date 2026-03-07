@@ -42,6 +42,15 @@ def _save_json(path: Path, data):
 # --- Predictions ---
 
 def load_predictions() -> dict:
+    if not PREDICTIONS_FILE.exists():
+        try:
+            import github_sync
+            remote = github_sync.pull_file("predictions.json")
+            if remote:
+                _save_json(PREDICTIONS_FILE, remote)
+                return remote
+        except Exception:
+            pass
     return _load_json(PREDICTIONS_FILE, {})
 
 
@@ -59,6 +68,11 @@ def save_prediction(race_id: str, prediction: dict):
     prediction["timestamp"] = datetime.now().isoformat()
     data[race_id] = prediction
     _save_json(PREDICTIONS_FILE, data)
+    try:
+        import github_sync
+        github_sync.push_file("predictions.json", data)
+    except Exception:
+        pass
 
 
 def get_prediction(race_id: str) -> dict | None:
@@ -69,6 +83,15 @@ def get_prediction(race_id: str) -> dict | None:
 # --- Results ---
 
 def load_results() -> dict:
+    if not RESULTS_FILE.exists():
+        try:
+            import github_sync
+            remote = github_sync.pull_file("results.json")
+            if remote:
+                _save_json(RESULTS_FILE, remote)
+                return remote
+        except Exception:
+            pass
     return _load_json(RESULTS_FILE, {})
 
 
@@ -86,6 +109,11 @@ def save_result(race_id: str, result: dict):
     result["timestamp"] = datetime.now().isoformat()
     data[race_id] = result
     _save_json(RESULTS_FILE, data)
+    try:
+        import github_sync
+        github_sync.push_file("results.json", data)
+    except Exception:
+        pass
 
 
 def get_result(race_id: str) -> dict | None:
@@ -260,16 +288,30 @@ def compute_stats() -> dict:
 
 def save_pdca_log(race_id: str, analysis: dict):
     """Append a PDCA analysis record. Deduplicates by race_id."""
-    log = _load_json(PDCA_LOG_FILE, [])
+    log = load_pdca_log()
     entry = dict(analysis)
     entry["race_id"] = race_id
     entry["saved_at"] = datetime.now().isoformat()
     log = [e for e in log if e.get("race_id") != race_id]
     log.append(entry)
     _save_json(PDCA_LOG_FILE, log)
+    try:
+        import github_sync
+        github_sync.push_file("pdca_log.json", log)
+    except Exception:
+        pass
 
 
 def load_pdca_log() -> list[dict]:
+    if not PDCA_LOG_FILE.exists():
+        try:
+            import github_sync
+            remote = github_sync.pull_file("pdca_log.json")
+            if remote is not None:
+                _save_json(PDCA_LOG_FILE, remote)
+                return remote
+        except Exception:
+            pass
     return _load_json(PDCA_LOG_FILE, [])
 
 
