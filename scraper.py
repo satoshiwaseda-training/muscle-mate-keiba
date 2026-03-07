@@ -358,11 +358,11 @@ def _get(url: str, params: dict = None, encoding: str = None,
         time.sleep(delay)
         resp = requests.get(url, headers=HEADERS, params=params, timeout=12)
         resp.raise_for_status()
+        # Use raw bytes so BeautifulSoup reads the meta charset tag (EUC-JP etc.) correctly.
+        # Passing resp.text causes double-encoding issues on EUC-JP pages (netkeiba).
         if encoding:
-            resp.encoding = encoding
-        else:
-            resp.encoding = resp.apparent_encoding
-        return BeautifulSoup(resp.text, "html.parser")
+            return BeautifulSoup(resp.content, "html.parser", from_encoding=encoding)
+        return BeautifulSoup(resp.content, "html.parser")
     except Exception as e:
         print(f"[scraper] GET {url} failed: {e}")
         return None
@@ -764,55 +764,69 @@ def fetch_entries_netkeiba(race_id: str, venue: str = "") -> list[dict]:
     horses = []
     for row in soup.select("tr.HorseList"):
         cells = row.find_all("td")
-        if len(cells) < 8:
+        if len(cells) < 7:
             continue
         try:
-            num = cells[1].get_text(strip=True)
+            # 枠番[0] 馬番[1] チェック[2] 馬名[3] 性齢[4] 斤量[5] 騎手[6] 調教師[7] 馬体重[8] オッズ[9]
+            waku = cells[0].get_text(strip=True)
+            num  = cells[1].get_text(strip=True)
 
-            name_tag = row.select_one(".HorseName a") or row.select_one("td:nth-child(4) a")
-            name = name_tag.get_text(strip=True) if name_tag else ""
-            # Extract horse ID from href
+            # 馬名 + horse_id
+            horse_info_td = cells[3]
+            name_tag = horse_info_td.select_one("a")
+            name = name_tag.get_text(strip=True) if name_tag else horse_info_td.get_text(strip=True)
             horse_id = ""
             if name_tag:
-                href = name_tag.get("href", "")
-                m = re.search(r"/horse/(\d+)", href)
+                m = re.search(r"/horse/(\d+)", name_tag.get("href", ""))
                 horse_id = m.group(1) if m else ""
 
-            jockey_tag = row.select_one(".Jockey a")
-            jockey = jockey_tag.get_text(strip=True) if jockey_tag else ""
+            # 性齢
+            age = cells[4].get_text(strip=True) if len(cells) > 4 else ""
+
+            # 斤量
+            weight = cells[5].get_text(strip=True) if len(cells) > 5 else ""
+
+            # 騎手
+            jockey_td = cells[6] if len(cells) > 6 else None
+            jockey_tag = jockey_td.select_one("a") if jockey_td else None
+            jockey = jockey_tag.get_text(strip=True) if jockey_tag else (jockey_td.get_text(strip=True) if jockey_td else "")
             jockey_id = ""
             if jockey_tag:
-                href = jockey_tag.get("href", "")
-                m = re.search(r"/jockey/(?:result/recent/)?(\w+)", href)
+                m = re.search(r"/jockey/(?:result/recent/)?(\w+)", jockey_tag.get("href", ""))
                 jockey_id = m.group(1) if m else ""
 
-            trainer_tag = row.select_one(".Trainer a")
-            trainer = trainer_tag.get_text(strip=True) if trainer_tag else ""
+            # 調教師
+            trainer_td = cells[7] if len(cells) > 7 else None
+            trainer_tag = trainer_td.select_one("a") if trainer_td else None
+            trainer = trainer_tag.get_text(strip=True) if trainer_tag else (trainer_td.get_text(strip=True) if trainer_td else "")
             trainer_id = ""
             if trainer_tag:
-                href = trainer_tag.get("href", "")
-                m = re.search(r"/trainer/(?:result/recent/)?(\w+)", href)
+                m = re.search(r"/trainer/(?:result/recent/)?(\w+)", trainer_tag.get("href", ""))
                 trainer_id = m.group(1) if m else ""
 
+            # 馬体重
+            weight_td = cells[8] if len(cells) > 8 else None
+            horse_weight = weight_td.get_text(strip=True) if weight_td else ""
+
+            # オッズ（出走前は---の場合あり）
+            odds_td = cells[9] if len(cells) > 9 else None
+            odds = odds_td.get_text(strip=True) if odds_td else "0"
+            odds = odds.replace("---.-", "0").replace("---", "0")
+
+            # 馬主（存在しない場合は空）
             owner_tag = row.select_one(".Owner a")
             owner = owner_tag.get_text(strip=True) if owner_tag else ""
-
-            weight_tag = row.select_one(".Txt_C")
-            weight = weight_tag.get_text(strip=True) if weight_tag else ""
-
-            odds_tag = row.select_one(".Odds") or row.select_one(".Popular")
-            odds = odds_tag.get_text(strip=True) if odds_tag else "0"
-
-            # Age / sex
-            age_tag = row.select_one(".Age") or (cells[4] if len(cells) > 4 else None)
-            age = age_tag.get_text(strip=True) if age_tag else ""
 
             stable = TRAINER_STABLE.get(trainer, _guess_stable(trainer))
             ritto = _estimate_ritto(owner)
             transport = _transport_stress(stable, venue)
 
+            if not name:
+                continue
+
             horses.append({
                 "number": num,
+                "waku": waku,
                 "name": name,
                 "horse_id": horse_id,
                 "jockey": jockey,
@@ -822,6 +836,7 @@ def fetch_entries_netkeiba(race_id: str, venue: str = "") -> list[dict]:
                 "owner": owner,
                 "age": age,
                 "weight": weight,
+                "horse_weight": horse_weight,
                 "odds": odds,
                 "stable": stable,
                 "ritto": ritto,
@@ -911,32 +926,79 @@ def fetch_result_netkeiba(race_id: str) -> Optional[dict]:
         if len(cells) < 6:
             continue
         try:
-            rank = cells[0].get_text(strip=True)
-            name_tag = row.select_one(".HorseName a")
-            name = name_tag.get_text(strip=True) if name_tag else cells[3].get_text(strip=True)
-            time_tag = row.select_one(".RecordTime")
-            finish_time = time_tag.get_text(strip=True) if time_tag else ""
-            odds_tag = row.select_one(".Odds")
-            final_odds = odds_tag.get_text(strip=True) if odds_tag else ""
+            rank_text = cells[0].get_text(strip=True)
+            if not rank_text.isdigit():
+                continue  # 除外・取消・中止などをスキップ
+
+            # 馬名: Horse_Info セルの <a> タグ、なければセルテキスト
+            horse_info = row.select_one("td.Horse_Info a") or row.select_one(".HorseName a")
+            name = horse_info.get_text(strip=True) if horse_info else cells[3].get_text(strip=True)
+            horse_id = ""
+            if horse_info:
+                m = re.search(r"/horse/(\d+)", horse_info.get("href", ""))
+                horse_id = m.group(1) if m else ""
+
+            # タイム: Time クラスの最初のセル
+            time_cell = row.select_one("td.Time")
+            finish_time = time_cell.get_text(strip=True) if time_cell else ""
+
+            # オッズ: Txt_R クラスの Odds セル（人気順位ではなくオッズ数値側）
+            odds_cells = row.select("td.Odds")
+            final_odds = ""
+            for oc in odds_cells:
+                txt = oc.get_text(strip=True)
+                if "." in txt:  # 小数点ありがオッズ値
+                    final_odds = txt
+                    break
+            if not final_odds and odds_cells:
+                final_odds = odds_cells[-1].get_text(strip=True)
+
+            # 馬体重
+            weight_cell = row.select_one("td.Weight")
+            horse_weight = weight_cell.get_text(strip=True) if weight_cell else ""
+
+            # 騎手
+            jockey_cell = row.select_one("td.Jockey a") or row.select_one("td.Jockey")
+            jockey = jockey_cell.get_text(strip=True) if jockey_cell else ""
+
             finishing_order.append({
-                "rank": int(rank) if rank.isdigit() else 99,
-                "name": name, "time": finish_time, "odds": final_odds,
+                "rank": int(rank_text),
+                "name": name,
+                "horse_id": horse_id,
+                "jockey": jockey,
+                "time": finish_time,
+                "odds": final_odds,
+                "horse_weight": horse_weight,
             })
         except Exception:
             continue
 
-    payouts = {}
-    for row in soup.select("tr.Payout_Detail_Table_Row, .Payout_Detail tr"):
-        cells = row.find_all("td")
-        if len(cells) >= 2:
-            bet_type = cells[0].get_text(strip=True)
-            val = cells[-1].get_text(strip=True).replace(",", "").replace("円", "")
-            try:
-                payouts[bet_type] = int(val)
-            except ValueError:
-                pass
+    # 払い戻し: ResultPaybackLeftWrap / ResultPaybackRightWrap
+    payouts = _parse_netkeiba_payouts(soup)
 
     return {"finishing_order": finishing_order, "payouts": payouts} if finishing_order else None
+
+
+def _parse_netkeiba_payouts(soup: BeautifulSoup) -> dict:
+    """
+    払い戻しセクションから単勝・複勝・馬連などを抽出する。
+    各 <li> または行テキストが「馬券種 馬番 金額円 人気」の形式になっている。
+    """
+    payouts = {}
+    bet_types = ["単勝", "複勝", "枠連", "馬連", "ワイド", "馬単", "3連複", "3連単"]
+    for wrap in soup.select("div.ResultPaybackLeftWrap, div.ResultPaybackRightWrap, div.Payout"):
+        for item in wrap.select("tr"):  # 払い戻しはtr要素に入っている
+            text = item.get_text(" ", strip=True)
+            for bt in bet_types:
+                if text.startswith(bt) and bt not in payouts:
+                    m = re.search(r"([\d,]+)円", text)
+                    if m:
+                        try:
+                            payouts[bt] = int(m.group(1).replace(",", ""))
+                        except ValueError:
+                            pass
+                    break
+    return payouts
 
 
 # ═══════════════════════════════════════════════════════════
