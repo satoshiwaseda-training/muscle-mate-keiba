@@ -47,14 +47,15 @@ st.set_page_config(
 
 def _resolve_api_key() -> str:
     # 1. Streamlit Cloud Secrets (最優先)
-    try:
-        key = st.secrets["GEMINI_API_KEY"]
-        if key and key != "your_gemini_api_key_here":
-            return key
-    except (KeyError, Exception):
-        pass
+    for secret_key in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
+        try:
+            key = st.secrets[secret_key]
+            if key and key not in ("your_gemini_api_key_here", "your_google_api_key_here"):
+                return key
+        except (KeyError, Exception):
+            pass
     # 2. .env / 環境変数
-    return os.getenv("GEMINI_API_KEY", "")
+    return os.getenv("GOOGLE_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")
 
 
 # ─────────────────────────────────────────────
@@ -159,7 +160,7 @@ with st.sidebar:
                     st.error(f"Gemini接続エラー: {_e}")
     else:
         st.error("Gemini API: 未接続（Secrets未設定）")
-        st.caption("Streamlit Cloud → Settings → Secrets に\nGEMINI_API_KEY を設定してください")
+        st.caption("Streamlit Cloud → Settings → Secrets に\nGOOGLE_API_KEY を設定してください")
 
     st.divider()
 
