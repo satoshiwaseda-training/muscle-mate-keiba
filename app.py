@@ -102,17 +102,33 @@ if "auto_pdca_race" not in st.session_state:
 
 def _build_system_instruction() -> str:
     """現在のPDCA学習済み重みと蓄積教訓からsystem_instructionを生成する。"""
-    weights = load_weights()
-    # PDCAログから全教訓を収集（重複排除・最新優先）
-    log = load_pdca_log()
-    seen: set = set()
-    lessons: list[str] = []
-    for entry in reversed(log):
-        for lesson in entry.get("key_lessons", []):
-            if lesson and lesson not in seen:
-                seen.add(lesson)
-                lessons.append(lesson)
-    return gemini_client.build_system_instruction(weights, lessons[:20])
+    try:
+        weights = load_weights()
+        # PDCAログから全教訓を収集（重複排除・最新優先）
+        log = load_pdca_log()
+        seen: set = set()
+        lessons: list[str] = []
+        for entry in reversed(log):
+            for lesson in entry.get("key_lessons", []):
+                if lesson and lesson not in seen:
+                    seen.add(lesson)
+                    lessons.append(lesson)
+        if hasattr(gemini_client, "build_system_instruction"):
+            return gemini_client.build_system_instruction(weights, lessons[:20])
+        # フォールバック: gemini_clientが古い場合はインライン生成
+        bio = weights.get("bio_condition", 0.40)
+        env = weights.get("environment",   0.30)
+        hum = weights.get("human_skill",   0.20)
+        bkg = weights.get("background",    0.10)
+        lessons_text = ("\n".join(f"- {l}" for l in lessons[:20])) if lessons else ""
+        return (
+            f"あなたは反オッズ依存型×運動生理学の競馬AI専門家です。\n"
+            f"PDCA学習済み重み: 生体{bio:.1%} 環境{env:.1%} 人間{hum:.1%} 背景{bkg:.1%}\n"
+            f"オッズが低いという理由だけで馬を評価することは禁止。\n"
+            + (f"\n過去の教訓:\n{lessons_text}" if lessons_text else "")
+        )
+    except Exception:
+        return ""
 
 
 def _mock_analysis(horses: list, race_name: str) -> dict:
@@ -1201,8 +1217,14 @@ with tab3:
 
         # ── Gemini学習済みsystem_instruction 確認 ────────
         with st.expander("Geminiへの学習内容を確認（system_instruction）"):
-            si = _build_system_instruction()
-            st.code(si, language="markdown")
+            try:
+                si = _build_system_instruction()
+                if si:
+                    st.code(si, language="markdown")
+                else:
+                    st.info("PDCAをまだ実行していません。学習後に重みと教訓が表示されます。")
+            except Exception as _e:
+                st.warning(f"system_instruction の生成に失敗しました: {_e}")
             st.caption(
                 "この内容がすべての予想・PDCA呼び出しで system_instruction として "
                 "Geminiに渡されます。PDCAを重ねるほど重みと教訓が自動更新されます。"
