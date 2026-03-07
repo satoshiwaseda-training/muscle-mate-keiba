@@ -827,9 +827,26 @@ with tab1:
 with tab2:
     st.header("結果入力 & PDCA自己進化")
 
+    # ── レース一覧未取得の場合はTab2内でも取得できる ──
     if not st.session_state.races:
-        st.info("先に「予想」タブでレース情報を取得してください。")
-    else:
+        st.info("レース一覧が未取得です。以下から取得するか、「予想」タブでも取得できます。")
+        _t2c1, _t2c2, _t2c3 = st.columns([2, 1, 1])
+        with _t2c1:
+            _t2_date = st.date_input("取得日付", value=date.today(), key="tab2_race_date")
+        with _t2c2:
+            if st.button("今日のGレース取得", key="tab2_fetch_today", use_container_width=True):
+                with st.spinner("取得中..."):
+                    _fetched = scraper.fetch_race_list(_t2_date)
+                st.session_state.races = _fetched
+                st.rerun()
+        with _t2c3:
+            if st.button("直近4週の過去レース取得", key="tab2_fetch_past", use_container_width=True):
+                with st.spinner("過去Gレース取得中..."):
+                    _fetched = scraper.fetch_past_g_races(4)
+                st.session_state.races = _fetched
+                st.rerun()
+
+    if st.session_state.races:
         race_options2 = {
             f"[{r['grade']}] {r['race_name']}": r for r in st.session_state.races
         }
@@ -930,7 +947,32 @@ with tab2:
         result_exists = get_result(race_id2)
 
         if not pred_exists:
-            st.warning("このレースの予想データがありません。先に「予想」タブで分析してください。")
+            st.warning("このレースの予想データがありません。")
+            if st.button("AIで遡及予想を生成してPDCAを実行", key="gen_retro_pred", type="primary"):
+                with st.spinner("出走馬データ取得中..."):
+                    _entries = scraper.fetch_entries(race_id2, venue=race2.get("venue", ""))
+                if not _entries:
+                    st.error("出走馬データを取得できませんでした。")
+                else:
+                    with st.spinner("Geminiで遡及予想を生成中..."):
+                        _retro = gemini_client.analyze_race(
+                            api_key=st.session_state.api_key,
+                            race_name=race2["race_name"],
+                            horses=_entries,
+                            track_condition=race2.get("track_condition", "良"),
+                            weather=race2.get("weather", ""),
+                            weights=load_weights(),
+                        )
+                    save_prediction(race_id2, {
+                        "race_name": race2["race_name"],
+                        "grade": race2.get("grade", ""),
+                        "horses": _retro.get("horses", []),
+                        "gemini_comment": _retro.get("comment", ""),
+                        "retroactive": True,
+                    })
+                    st.success("遡及予想を生成しました。PDCA分析を続けます...")
+                    st.session_state.auto_pdca_race = race_id2
+                    st.rerun()
         elif not result_exists:
             st.warning("結果データがありません。上記フォームで入力してください。")
         else:
