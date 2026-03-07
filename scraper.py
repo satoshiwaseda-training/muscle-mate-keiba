@@ -414,7 +414,10 @@ def fetch_weather(venue: str, race_date: date, race_hour: int = 15) -> dict:
     if race_date >= today:
         data = _get_json("https://api.open-meteo.com/v1/forecast", params=base_params)
     else:
+        # アーカイブAPIは最新5日間が未反映のため、失敗時はforecast APIにフォールバック
         data = _get_json("https://archive-api.open-meteo.com/v1/archive", params=base_params)
+        if not data or "hourly" not in data:
+            data = _get_json("https://api.open-meteo.com/v1/forecast", params=base_params)
 
     if not data or "hourly" not in data:
         return {"temperature": "取得失敗", "precipitation": "取得失敗",
