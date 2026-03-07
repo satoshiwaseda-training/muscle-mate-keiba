@@ -31,7 +31,7 @@ def _call_gemini(api_key: str, prompt: str) -> str:
             model=_GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
-                max_output_tokens=600,
+                max_output_tokens=4000,
                 temperature=0.3,
             ),
         )
