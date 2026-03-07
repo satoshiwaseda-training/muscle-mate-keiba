@@ -81,6 +81,13 @@ if "paddock_reports" not in st.session_state:
     st.session_state.paddock_reports = {}
 if "jra_track_data" not in st.session_state:
     st.session_state.jra_track_data = {}
+# スライダー状態（明示的にkey管理して自動更新を可能にする）
+if "sl_coat" not in st.session_state:
+    st.session_state.sl_coat = 3
+if "sl_hindq" not in st.session_state:
+    st.session_state.sl_hindq = 3
+if "sl_gait" not in st.session_state:
+    st.session_state.sl_gait = 3
 
 
 # ─────────────────────────────────────────────
@@ -406,42 +413,91 @@ with tab1:
         # 自動取得ボタン
         col_pad_btn, col_pad_status = st.columns([1, 3])
         with col_pad_btn:
-            if st.button("パドック情報を自動取得\n(KeibaLab/SNS/ニュース)", use_container_width=True):
-                horse_names = [h["name"] for h in st.session_state.entries] if st.session_state.entries else []
-                with st.spinner("KeibaLab・netkeiba・Yahoo!ニュース等から取得中..."):
-                    # SNS/ニュース系パドックテキスト
-                    reports = scraper.fetch_paddock_reports(
+            if st.button("パドック情報を自動取得\n(調教/SNS/ニュース)", use_container_width=True):
+                entries_now = st.session_state.entries or []
+                horse_names = [h["name"] for h in entries_now]
+                with st.spinner("パドック情報を複数ソースから取得中..."):
+                    reports = {}
+
+                    # ① すでに取得済みの調教評価テキストをパドック代理として使用（最速・確実）
+                    for h in entries_now:
+                        name = h["name"]
+                        sources = []
+                        # 調教評価コメント
+                        if h.get("training_eval"):
+                            sources.append(h["training_eval"])
+                        # 近走成績テキスト
+                        if h.get("recent_form"):
+                            sources.append(h["recent_form"])
+                        combined = " ".join(sources)
+                        if combined.strip():
+                            reports[name] = {
+                                "text": combined,
+                                "source": "調教データ(取得済)",
+                                "scores": scraper.parse_paddock_comment(combined),
+                                "weight_kg": None,
+                                "weight_change": None,
+                            }
+
+                    # ② netkeiba/SNS/ニュース系（追加テキスト取得）
+                    web_reports = scraper.fetch_paddock_reports(
                         race_id=selected_race["race_id"],
                         horse_names=horse_names,
                         race_name=selected_race["race_name"],
                     )
-                    # KeibaLab 馬体重・短評
+                    for name, rep in web_reports.items():
+                        if rep.get("text"):
+                            if name in reports:
+                                # 既存テキストに追記してスコア再計算
+                                merged_text = reports[name]["text"] + " " + rep["text"]
+                                reports[name]["text"] = merged_text
+                                reports[name]["source"] += f"+{rep['source']}"
+                                reports[name]["scores"] = scraper.parse_paddock_comment(merged_text)
+                            else:
+                                reports[name] = rep
+
+                    # ③ KeibaLab 馬体重
                     kl_weights = scraper.fetch_keibalab_horse_weights(
                         selected_race["race_id"], horse_names
                     )
-                    # KeibaLabのコメントをreportsにマージ
                     for name, kl in kl_weights.items():
                         if name not in reports:
                             reports[name] = {"text": "", "source": "", "scores": {}}
-                        if kl.get("comment") and not reports[name].get("text"):
-                            reports[name]["text"] = kl["comment"]
-                            reports[name]["source"] = "KeibaLab"
                         reports[name]["weight_kg"] = kl.get("weight")
                         reports[name]["weight_change"] = kl.get("change")
-                    # Gemini NLPスコアリング
+                        if kl.get("comment"):
+                            reports[name]["text"] += " " + kl["comment"]
+
+                    # ④ Gemini NLPスコアリング（テキストがある馬のみ）
                     if st.session_state.api_key:
                         for name, rep in reports.items():
-                            if rep.get("text"):
+                            if rep.get("text") and len(rep["text"]) > 5:
                                 nlp = gemini_client.score_paddock_text(
                                     st.session_state.api_key, name, rep["text"]
                                 )
                                 rep["gemini_scores"] = nlp
+
                     st.session_state.paddock_reports = reports
-                found = sum(1 for v in st.session_state.paddock_reports.values() if v.get("text"))
+
+                    # ⑤ スライダーを全馬平均スコアで自動更新
+                    def _avg_score(key: str) -> int:
+                        vals = [v["scores"].get(key, 0) for v in reports.values()
+                                if v.get("scores")]
+                        if not vals:
+                            return 3
+                        avg = sum(vals) / len(vals)
+                        return max(1, min(5, round(avg * 2 + 3)))
+
+                    st.session_state.sl_coat  = _avg_score("vascularity_index")
+                    st.session_state.sl_hindq = _avg_score("hindquarter_power")
+                    st.session_state.sl_gait  = _avg_score("gait_fluidity")
+
+                found = sum(1 for v in reports.values() if v.get("text"))
                 if found:
-                    st.success(f"{found}頭分のパドック情報を取得・Gemini採点済み")
+                    st.success(f"{found}頭分のパドック情報を取得・スライダーを自動更新しました")
                 else:
-                    st.warning("パドック情報が見つかりませんでした（レース当日に再試行してください）")
+                    st.warning("パドック情報が見つかりませんでした（詳細データを先に取得してください）")
+                st.rerun()
 
         # 取得済みレポートを表示
         paddock_reports = st.session_state.paddock_reports
@@ -494,73 +550,53 @@ with tab1:
                     )
                     st.divider()
 
-        # 自動取得スコアの集計（全馬平均 → スライダー初期値に反映）
-        def _auto_slider_default(key: str, fallback: int = 3) -> int:
-            scores = [v["scores"].get(key, 0) for v in paddock_reports.values()
-                      if v.get("scores") and v["scores"].get(key) is not None]
-            if not scores:
-                return fallback
-            avg = sum(scores) / len(scores)  # -1〜1
-            return max(1, min(5, round(avg * 2 + 3)))  # → 1〜5
-
-        st.caption("各指標を 1（最低）〜 5（最高）で評価（自動取得時は平均スコアを反映）")
+        st.caption("各指標を 1（最低）〜 5（最高）で評価（パドック自動取得後は自動更新）")
 
         paddock_notes = st.text_input(
             "総合所見メモ（補足）",
             placeholder="例: 3番の血管が浮き出ている。5番は踏み込みが深く滑らか。",
         )
 
+        _label_colors = {1: "#ff4444", 2: "#ff9900", 3: "#aaaaaa", 4: "#88ee44", 5: "#00ff88"}
         col_p1, col_p2, col_p3 = st.columns(3)
         with col_p1:
             coat_score = st.slider(
                 "毛並み・光沢（内臓コンディション）",
-                min_value=1, max_value=5,
-                value=_auto_slider_default("vascularity_index"),
+                min_value=1, max_value=5, key="sl_coat",
                 help="1=くすみ/疲労感あり　5=ピカピカ/仕上げ完成",
             )
             coat_labels = {1: "くすんでいる(要注意)", 2: "やや悪い", 3: "普通",
                            4: "光沢あり", 5: "光沢あり(優秀)"}
             coat_gloss = coat_labels[coat_score]
-            _coat_colors = {1: "#ff4444", 2: "#ff9900", 3: "#aaaaaa", 4: "#88ee44", 5: "#00ff88"}
             st.markdown(
-                f'<div style="color:{_coat_colors[coat_score]};font-weight:bold;">'
-                f'→ {coat_gloss}</div>',
-                unsafe_allow_html=True,
-            )
+                f'<div style="color:{_label_colors[coat_score]};font-weight:bold;">'
+                f'→ {coat_gloss}</div>', unsafe_allow_html=True)
 
         with col_p2:
             hindq_score = st.slider(
                 "トモのパンプアップ（推進力ポテンシャル）",
-                min_value=1, max_value=5,
-                value=_auto_slider_default("hindquarter_power"),
+                min_value=1, max_value=5, key="sl_hindq",
                 help="1=張りなし/細い　5=パンプアップ最高/力強い",
             )
             hindq_labels = {1: "張りなし", 2: "やや甘い", 3: "普通",
                             4: "パンプアップ良好", 5: "パンプアップ最高"}
             hindquarter_pump = hindq_labels[hindq_score]
-            _hindq_colors = {1: "#ff4444", 2: "#ff9900", 3: "#aaaaaa", 4: "#88ee44", 5: "#00ff88"}
             st.markdown(
-                f'<div style="color:{_hindq_colors[hindq_score]};font-weight:bold;">'
-                f'→ {hindquarter_pump}</div>',
-                unsafe_allow_html=True,
-            )
+                f'<div style="color:{_label_colors[hindq_score]};font-weight:bold;">'
+                f'→ {hindquarter_pump}</div>', unsafe_allow_html=True)
 
         with col_p3:
             gait_score = st.slider(
                 "歩様・踏み込みの流動性（重心移動効率）",
-                min_value=1, max_value=5,
-                value=_auto_slider_default("gait_fluidity"),
+                min_value=1, max_value=5, key="sl_gait",
                 help="1=硬い/ぎこちない　5=踏み込み深く滑らか",
             )
             gait_labels = {1: "硬い(ぎこちない)", 2: "やや硬い", 3: "普通",
                            4: "滑らか", 5: "踏み込み最高"}
             gait_fluidity = gait_labels[gait_score]
-            _gait_colors = {1: "#ff4444", 2: "#ff9900", 3: "#aaaaaa", 4: "#88ee44", 5: "#00ff88"}
             st.markdown(
-                f'<div style="color:{_gait_colors[gait_score]};font-weight:bold;">'
-                f'→ {gait_fluidity}</div>',
-                unsafe_allow_html=True,
-            )
+                f'<div style="color:{_label_colors[gait_score]};font-weight:bold;">'
+                f'→ {gait_fluidity}</div>', unsafe_allow_html=True)
 
         # ── AI分析実行 ────────────────────────────────────
         st.markdown("---")
@@ -625,6 +661,9 @@ with tab1:
                 3: {"border": "#CD7F32", "bg": "#1a0f00", "icon": "3rd", "badge_bg": "#CD7F32", "badge_fg": "#000"},
             }
 
+            # 馬名→馬番マップ（entriesから引く）
+            _num_map = {h["name"]: h.get("number", "") for h in st.session_state.entries}
+
             if not horses:
                 st.warning("予想馬のデータを取得できませんでした。")
             else:
@@ -638,6 +677,9 @@ with tab1:
                     ev_label = f"EV乖離: {ev_gap}" if ev_gap else ""
                     cc = CARD_CONF.get(rank, CARD_CONF[3])
                     conf_pct = min(conf, 100)
+                    horse_name = horse.get("name", "?")
+                    horse_num = _num_map.get(horse_name, "")
+                    num_display = f"<span style='font-size:1.1em;font-weight:900;color:{cc['border']};margin-right:4px;'>#{horse_num}</span>" if horse_num else ""
 
                     with cols[i]:
                         st.markdown(
@@ -659,7 +701,7 @@ with tab1:
     <span style="color:{cc['border']};font-size:0.8em;font-weight:600;">スコア {conf}</span>
   </div>
   <div style="font-size:1.5em;font-weight:900;margin-bottom:6px;">
-    {horse.get('name', '?')}
+    {num_display}{horse_name}
   </div>
   <div style="margin-bottom:10px;">
     <div style="background:#333;border-radius:4px;height:6px;width:100%;">
