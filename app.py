@@ -1091,6 +1091,9 @@ with tab2:
                         st.info(f"重み変更の根拠: {pdca_result['weight_reasoning']}")
                     st.caption("※ 重みの変化は最大±5%/レースに制限されています（急激な過学習防止）")
 
+                    # サイドバーの科学的黄金比を最新値に更新
+                    st.rerun()
+
 
 # ═════════════════════════════════════════════
 # Tab 3: Dashboard
@@ -1511,5 +1514,8 @@ with tab4:
                     # 全ログ表示
                     with st.expander("詳細ログを確認"):
                         st.text("\n".join(log_lines))
+
+                    # サイドバーの科学的黄金比を最新値に更新
+                    st.rerun()
 
 
