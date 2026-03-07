@@ -363,15 +363,20 @@ def _format_horse_bio(h: dict) -> str:
 
     # Physics line (only if data present)
     phys_parts = []
-    if physics.get("final_split"):
-        phys_parts.append(f"ラスト1F:{physics['final_split']}秒")
-    if physics.get("acceleration_rate") != 0:
-        phys_parts.append(f"加速率:{physics['acceleration_rate']:+.3f}")
-    if physics.get("cardio_index") != 0:
-        phys_parts.append(f"心肺指標:{physics['cardio_index']:+.3f}")
-    if nlp.get("weight_status") is not None and nlp["weight_status"] < -0.3:
+    _fs  = physics.get("final_split")
+    _acc = physics.get("acceleration_rate")
+    _ci  = physics.get("cardio_index")
+    if _fs:
+        phys_parts.append(f"ラスト1F:{_fs}秒")
+    if _acc is not None and _acc != 0:
+        phys_parts.append(f"加速率:{_acc:+.3f}")
+    if _ci is not None and _ci != 0:
+        phys_parts.append(f"心肺指標:{_ci:+.3f}")
+    _ws = nlp.get("weight_status")
+    _sq = nlp.get("stride_quality")
+    if _ws is not None and _ws < -0.3:
         phys_parts.append("★太め残り")
-    if nlp.get("stride_quality") is not None and nlp["stride_quality"] > 0.3:
+    if _sq is not None and _sq > 0.3:
         phys_parts.append("踏み込み◎")
 
     # Bio scores line

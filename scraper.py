@@ -841,7 +841,7 @@ def fetch_entries_netkeiba(race_id: str, venue: str = "") -> list[dict]:
                 "stable": stable,
                 "ritto": ritto,
                 "transport_stress": transport,
-                # Filled by enrich_entries():
+                # Filled by enrich_entries() — safe defaults to avoid KeyError
                 "recent_form": "",
                 "bloodline": "",
                 "weight_trend": "",
@@ -849,6 +849,11 @@ def fetch_entries_netkeiba(race_id: str, venue: str = "") -> list[dict]:
                 "jockey_g1_wins": "",
                 "trainer_win_rate": "",
                 "training_eval": "",
+                "training_physics": {"final_split": 0.0, "acceleration_rate": 0.0, "cardio_index": 0.0},
+                "training_nlp": {},
+                "paddock_scores": {},
+                "best_weight_analysis": {},
+                "transport_profile": {},
             })
         except Exception:
             continue
