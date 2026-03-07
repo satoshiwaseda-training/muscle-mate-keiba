@@ -8,7 +8,7 @@ never as a direct quality proxy.
 import json
 import re
 
-_GEMINI_MODEL = "gemini-2.0-flash"
+_GEMINI_MODEL = "gemini-2.5-flash"
 _genai_client = None
 _current_api_key = None
 

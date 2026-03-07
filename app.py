@@ -155,7 +155,7 @@ with st.sidebar:
                     from google.genai import types as _gtypes
                     _client = _genai.Client(api_key=st.session_state.api_key)
                     _r = _client.models.generate_content(
-                        model="gemini-2.0-flash",
+                        model="gemini-2.5-flash",
                         contents="日本語で「接続OK」とだけ返答してください",
                         config=_gtypes.GenerateContentConfig(max_output_tokens=20),
                     )
