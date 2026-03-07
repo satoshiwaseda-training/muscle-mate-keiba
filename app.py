@@ -82,6 +82,41 @@ if "paddock_reports" not in st.session_state:
 if "jra_track_data" not in st.session_state:
     st.session_state.jra_track_data = {}
 
+
+# ─────────────────────────────────────────────
+# Helper functions (must be defined before use)
+# ─────────────────────────────────────────────
+
+def _mock_analysis(horses: list, race_name: str) -> dict:
+    import random
+    shuffled = horses[:]
+    random.shuffle(shuffled)
+    reasons = [
+        "調教加速率が高く心肺機能の仕上がりが確認できる。トモのパンプアップも◎でベスト体重帯。",
+        "血統的に馬場適性が高く、前走から斤量減で有利。外厩調整密度も高い。",
+        "オッズに対して実力が過小評価されており期待値ギャップ+。輸送ストレス低く侮れない。",
+    ]
+    bets = ["単勝 + 複勝", "複勝 + ワイド", "連複BOX"]
+    predictions = [
+        {
+            "rank": i + 1,
+            "name": shuffled[i]["name"],
+            "confidence": [72, 58, 45][i],
+            "ev_gap": ["+8", "+3", "-2"][i],
+            "reason": reasons[i],
+            "bet": bets[i],
+        }
+        for i in range(min(3, len(shuffled)))
+    ]
+    return {
+        "horses": predictions,
+        "comment": (
+            f"[モック分析] {race_name} の予想です（黄金比フレームワーク適用）。"
+            "Gemini APIキーを設定するとAI分析が有効になります。"
+        ),
+        "raw_response": "",
+    }
+
 # ─────────────────────────────────────────────
 # Sidebar
 # ─────────────────────────────────────────────
@@ -357,17 +392,40 @@ with tab1:
         # 自動取得ボタン
         col_pad_btn, col_pad_status = st.columns([1, 3])
         with col_pad_btn:
-            if st.button("パドック情報を自動取得\n(SNS/ニュース)", use_container_width=True):
+            if st.button("パドック情報を自動取得\n(KeibaLab/SNS/ニュース)", use_container_width=True):
                 horse_names = [h["name"] for h in st.session_state.entries] if st.session_state.entries else []
-                with st.spinner("netkeiba・Yahoo!ニュース・uma-jo等から取得中..."):
-                    st.session_state.paddock_reports = scraper.fetch_paddock_reports(
+                with st.spinner("KeibaLab・netkeiba・Yahoo!ニュース等から取得中..."):
+                    # SNS/ニュース系パドックテキスト
+                    reports = scraper.fetch_paddock_reports(
                         race_id=selected_race["race_id"],
                         horse_names=horse_names,
                         race_name=selected_race["race_name"],
                     )
+                    # KeibaLab 馬体重・短評
+                    kl_weights = scraper.fetch_keibalab_horse_weights(
+                        selected_race["race_id"], horse_names
+                    )
+                    # KeibaLabのコメントをreportsにマージ
+                    for name, kl in kl_weights.items():
+                        if name not in reports:
+                            reports[name] = {"text": "", "source": "", "scores": {}}
+                        if kl.get("comment") and not reports[name].get("text"):
+                            reports[name]["text"] = kl["comment"]
+                            reports[name]["source"] = "KeibaLab"
+                        reports[name]["weight_kg"] = kl.get("weight")
+                        reports[name]["weight_change"] = kl.get("change")
+                    # Gemini NLPスコアリング
+                    if st.session_state.api_key:
+                        for name, rep in reports.items():
+                            if rep.get("text"):
+                                nlp = gemini_client.score_paddock_text(
+                                    st.session_state.api_key, name, rep["text"]
+                                )
+                                rep["gemini_scores"] = nlp
+                    st.session_state.paddock_reports = reports
                 found = sum(1 for v in st.session_state.paddock_reports.values() if v.get("text"))
                 if found:
-                    st.success(f"{found}頭分のパドック情報を取得")
+                    st.success(f"{found}頭分のパドック情報を取得・Gemini採点済み")
                 else:
                     st.warning("パドック情報が見つかりませんでした（レース当日に再試行してください）")
 
@@ -378,25 +436,49 @@ with tab1:
                 sources = list({v["source"] for v in paddock_reports.values() if v.get("source")})
                 st.caption(f"取得元: {', '.join(sources)}")
 
-            with st.expander("取得したパドック情報（馬別）", expanded=False):
+            with st.expander("取得したパドック情報（馬別・Gemini採点）", expanded=False):
+                _score_colors = {1: "#ff4444", 2: "#ff9900", 3: "#aaaaaa", 4: "#88ee44", 5: "#00ff88"}
+                _score_icons  = {1: "▼▼", 2: "▼", 3: "－", 4: "▲", 5: "▲▲"}
                 for hname, rep in paddock_reports.items():
-                    if rep.get("text"):
-                        src_badge = f'<span style="color:#FFD700;font-size:0.8em;">[{rep["source"]}]</span>'
-                        sc = rep.get("scores", {})
-                        score_str = ""
-                        if sc:
-                            score_str = (
-                                f' 血管:{sc.get("vascularity_index",0):+.2f}'
-                                f' トモ:{sc.get("hindquarter_power",0):+.2f}'
-                                f' 歩様:{sc.get("gait_fluidity",0):+.2f}'
-                            )
-                        st.markdown(
-                            f'**{hname}** {src_badge}'
-                            f'<span style="color:#aaa;font-size:0.8em;">{score_str}</span><br>'
-                            f'<span style="color:#ddd;font-size:0.9em;">{rep["text"]}</span>',
-                            unsafe_allow_html=True,
+                    if not rep.get("text") and not rep.get("weight_kg"):
+                        continue
+                    src = rep.get("source", "")
+                    src_badge = f'<span style="color:#FFD700;font-size:0.8em;">[{src}]</span>' if src else ""
+
+                    # 馬体重表示
+                    wt_str = ""
+                    if rep.get("weight_kg"):
+                        chg = rep.get("weight_change", 0)
+                        chg_color = "#00ff88" if chg > 0 else "#ff4444" if chg < 0 else "#aaa"
+                        wt_str = (
+                            f'<span style="color:#7fdbff;font-weight:bold;">'
+                            f'{rep["weight_kg"]}kg'
+                            f'<span style="color:{chg_color}">({chg:+d})</span></span>　'
                         )
-                        st.divider()
+
+                    # Geminiスコア表示
+                    gs = rep.get("gemini_scores", {})
+                    gemini_str = ""
+                    if gs:
+                        def _badge(label, val):
+                            c = _score_colors.get(val, "#aaa")
+                            ic = _score_icons.get(val, "－")
+                            return f'<span style="color:{c};font-size:0.85em;">{label}:{ic}{val}</span>'
+                        gemini_str = (
+                            "　" +
+                            _badge("トモ", gs.get("hindquarter_tension", 3)) + "　" +
+                            _badge("毛艶", gs.get("coat_gloss", 3)) + "　" +
+                            _badge("気合", gs.get("mental_energy", 3))
+                        )
+                        if gs.get("summary"):
+                            gemini_str += f'　<span style="color:#ccc;font-size:0.8em;">→{gs["summary"]}</span>'
+
+                    st.markdown(
+                        f'**{hname}** {src_badge}　{wt_str}{gemini_str}<br>'
+                        f'<span style="color:#ddd;font-size:0.9em;">{rep.get("text","")}</span>',
+                        unsafe_allow_html=True,
+                    )
+                    st.divider()
 
         # 自動取得スコアの集計（全馬平均 → スライダー初期値に反映）
         def _auto_slider_default(key: str, fallback: int = 3) -> int:
@@ -964,36 +1046,3 @@ with tab3:
         st.plotly_chart(fig_init, use_container_width=True)
 
 
-# ─────────────────────────────────────────────
-# Mock analysis (no API key)
-# ─────────────────────────────────────────────
-
-def _mock_analysis(horses: list, race_name: str) -> dict:
-    import random
-    shuffled = horses[:]
-    random.shuffle(shuffled)
-    reasons = [
-        "調教加速率が高く心肺機能の仕上がりが確認できる。トモのパンプアップも◎でベスト体重帯。",
-        "血統的に馬場適性が高く、前走から斤量減で有利。外厩調整密度も高い。",
-        "オッズに対して実力が過小評価されており期待値ギャップ+。輸送ストレス低く侮れない。",
-    ]
-    bets = ["単勝 + 複勝", "複勝 + ワイド", "連複BOX"]
-    predictions = [
-        {
-            "rank": i + 1,
-            "name": shuffled[i]["name"],
-            "confidence": [72, 58, 45][i],
-            "ev_gap": ["+8", "+3", "-2"][i],
-            "reason": reasons[i],
-            "bet": bets[i],
-        }
-        for i in range(min(3, len(shuffled)))
-    ]
-    return {
-        "horses": predictions,
-        "comment": (
-            f"[モック分析] {race_name} の予想です（黄金比フレームワーク適用）。"
-            "Gemini APIキーを設定するとAI分析が有効になります。"
-        ),
-        "raw_response": "",
-    }

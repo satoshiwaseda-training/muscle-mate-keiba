@@ -34,6 +34,46 @@ def _call_gemini(api_key: str, prompt: str) -> str:
         return f"[Gemini APIエラー] {e}"
 
 
+def score_paddock_text(api_key: str, horse_name: str, paddock_text: str) -> dict:
+    """
+    パドック短評テキストをGeminiで5段階スコアに変換。
+
+    Returns:
+      hindquarter_tension: int  1-5  筋肉の張り（トモ）
+      coat_gloss:          int  1-5  毛艶（内臓の状態）
+      mental_energy:       int  1-5  気合（メンタル）
+      summary:             str       1行評価
+    """
+    if not paddock_text:
+        return {"hindquarter_tension": 3, "coat_gloss": 3, "mental_energy": 3, "summary": "情報なし"}
+
+    prompt = f"""あなたは競馬の馬体評価専門家です。「{horse_name}」のパドック短評を読み、以下の3項目を1〜5の整数で採点してください。
+
+パドック短評:「{paddock_text}」
+
+採点基準:
+1=最低/要注意, 2=やや悪い, 3=普通/標準, 4=良好, 5=最高/絶好調
+
+JSONのみ返答:
+{{"hindquarter_tension":3,"coat_gloss":3,"mental_energy":3,"summary":"1行評価"}}
+
+hindquarter_tension: トモ(後肢・臀部)の筋肉の張り・パンプアップ度
+coat_gloss: 毛艶・皮膚の光沢（内臓コンディションの代理指標）
+mental_energy: 気合・活気・前向きさ（レース適性メンタル）"""
+
+    raw = _call_gemini(api_key, prompt)
+    try:
+        data = json.loads(_extract_json(raw))
+        return {
+            "hindquarter_tension": max(1, min(5, int(data.get("hindquarter_tension", 3)))),
+            "coat_gloss": max(1, min(5, int(data.get("coat_gloss", 3)))),
+            "mental_energy": max(1, min(5, int(data.get("mental_energy", 3)))),
+            "summary": data.get("summary", ""),
+        }
+    except Exception:
+        return {"hindquarter_tension": 3, "coat_gloss": 3, "mental_energy": 3, "summary": raw[:100]}
+
+
 def analyze_bio_mechanics(
     api_key: str,
     horse_name: str,
