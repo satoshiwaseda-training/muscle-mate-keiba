@@ -3,6 +3,12 @@
 Anti-odds-bias design: scoring is driven by environmental, biological,
 and strategic signals. Odds are used ONLY to compute expected-value gap,
 never as a direct quality proxy.
+
+System-instruction learning:
+  build_system_instruction() generates a persistent system prompt that
+  encodes PDCA-adjusted weights and accumulated lessons. This is passed
+  as system_instruction to every Gemini call so the model "remembers"
+  what it has learned across sessions without fine-tuning.
 """
 
 import json
@@ -11,6 +17,67 @@ import re
 _GEMINI_MODEL = "gemini-2.5-flash"
 _genai_client = None
 _current_api_key = None
+
+
+def build_system_instruction(weights: dict, lessons: list[str] | None = None) -> str:
+    """
+    PDCAで自動調整された重みと蓄積した教訓を、Geminiへの
+    system_instruction（永続記憶）として文字列化する。
+
+    この文字列を GenerateContentConfig(system_instruction=...) に渡すことで
+    Geminiはファインチューニングなしに学習済み知識を保持する。
+
+    Args:
+        weights: load_weights() で取得したPDCA調整済み重み辞書
+        lessons: PDCA履歴から収集した教訓リスト（最新N件）
+
+    Returns:
+        system_instruction として渡す文字列
+    """
+    bio = weights.get("bio_condition", 0.40)
+    env = weights.get("environment",   0.30)
+    hum = weights.get("human_skill",   0.20)
+    bkg = weights.get("background",    0.10)
+
+    # 黄金比(初期値)との差分を注記
+    deltas = {
+        "bio_condition": bio - 0.40,
+        "environment":   env - 0.30,
+        "human_skill":   hum - 0.20,
+        "background":    bkg - 0.10,
+    }
+    def _delta_note(key: str) -> str:
+        d = deltas[key]
+        if abs(d) < 0.001:
+            return "（初期値維持）"
+        direction = "↑強化" if d > 0 else "↓抑制"
+        return f"（初期値比 {d:+.1%} {direction}）"
+
+    lessons_section = ""
+    if lessons:
+        top = lessons[-15:]  # 最新15件
+        lessons_section = (
+            "\n\n## 過去PDCAから蓄積した重要教訓（必ず守ること）\n"
+            + "\n".join(f"- {l}" for l in top)
+        )
+
+    return f"""あなたは「反オッズ依存型×運動生理学」競馬AI専門家です。
+実際のレース結果に基づくPDCAサイクルで最適化された重み配分を厳守してください。
+
+## 学習済み科学的黄金比（PDCA自動調整済み）
+
+| 要因 | 重み | 状態 |
+|------|------|------|
+| 生体・コンディション（調教加速率/パドックNLP/ベスト体重） | {bio:.1%} | {_delta_note("bio_condition")} |
+| 環境・適性（馬場/天気/輸送/クッション値） | {env:.1%} | {_delta_note("environment")} |
+| 人間・相性（騎手大舞台実績/コンビ成績/斤量） | {hum:.1%} | {_delta_note("human_skill")} |
+| 背景・資本（外厩/馬主資金力/血統適性） | {bkg:.1%} | {_delta_note("background")} |
+
+## 絶対ルール
+- オッズが低い（人気がある）という理由だけで馬を評価することは絶対禁止
+- オッズは期待値ギャップ（EV gap）の計算にのみ使用する
+- 上記の重み配分で各馬を採点し、合計100点満点で評価すること
+- 重みが初期値から変化している場合、その要因を特に重視（または軽視）すること{lessons_section}"""
 
 
 def _get_client(api_key: str):
@@ -22,18 +89,25 @@ def _get_client(api_key: str):
     return _genai_client
 
 
-def _call_gemini(api_key: str, prompt: str) -> str:
+def _call_gemini(api_key: str, prompt: str, system_instruction: str = "") -> str:
     try:
         from google import genai
         from google.genai import types
         client = _get_client(api_key)
+        config = types.GenerateContentConfig(
+            max_output_tokens=8192,
+            temperature=0.3,
+        )
+        if system_instruction:
+            config = types.GenerateContentConfig(
+                max_output_tokens=8192,
+                temperature=0.3,
+                system_instruction=system_instruction,
+            )
         response = client.models.generate_content(
             model=_GEMINI_MODEL,
             contents=prompt,
-            config=types.GenerateContentConfig(
-                max_output_tokens=8192,
-                temperature=0.3,
-            ),
+            config=config,
         )
         return response.text
     except Exception as e:
@@ -166,6 +240,7 @@ def analyze_race(
     hindquarter_pump: str = "",
     weights: dict = None,
     jra_track_data: dict = None,
+    system_instruction: str = "",
 ) -> dict:
     """
     Multi-dimensional race analysis with anti-odds-bias logic.
@@ -262,7 +337,7 @@ def analyze_race(
 JSONのみ返答:
 {{"predictions":[{{"rank":1,"name":"馬名","score":85,"ev_gap":"+12","reason":"理由(運動生理学的根拠を含む1文)","bet":"推奨"}},{{"rank":2,"name":"馬名","score":72,"ev_gap":"+5","reason":"理由","bet":"推奨"}},{{"rank":3,"name":"馬名","score":61,"ev_gap":"-2","reason":"理由","bet":"推奨"}}],"overall_comment":"総評(運動生理学視点含む1文)"}}"""
 
-    raw = _call_gemini(api_key, prompt)
+    raw = _call_gemini(api_key, prompt, system_instruction=system_instruction)
 
     horses, comment = _parse_race_response(raw)
     return {"horses": horses, "comment": comment, "raw_response": raw}

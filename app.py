@@ -29,6 +29,7 @@ from data_store import (
     get_jra_ground_truth,
     merge_track_data,
     get_weight_history,
+    load_pdca_log,
 )
 
 # ─────────────────────────────────────────────
@@ -98,6 +99,21 @@ if "auto_pdca_race" not in st.session_state:
 # ─────────────────────────────────────────────
 # Helper functions (must be defined before use)
 # ─────────────────────────────────────────────
+
+def _build_system_instruction() -> str:
+    """現在のPDCA学習済み重みと蓄積教訓からsystem_instructionを生成する。"""
+    weights = load_weights()
+    # PDCAログから全教訓を収集（重複排除・最新優先）
+    log = load_pdca_log()
+    seen: set = set()
+    lessons: list[str] = []
+    for entry in reversed(log):
+        for lesson in entry.get("key_lessons", []):
+            if lesson and lesson not in seen:
+                seen.add(lesson)
+                lessons.append(lesson)
+    return gemini_client.build_system_instruction(weights, lessons[:20])
+
 
 def _mock_analysis(horses: list, race_name: str) -> dict:
     import random
@@ -627,6 +643,7 @@ with tab1:
                     active_entries = [h for h in entries if h["name"] not in scratched]
 
                     if st.session_state.api_key:
+                        _weights = load_weights()
                         result = gemini_client.analyze_race(
                             api_key=st.session_state.api_key,
                             race_name=selected_race["race_name"],
@@ -638,8 +655,9 @@ with tab1:
                             paddock_notes=paddock_notes,
                             coat_gloss=coat_gloss,
                             hindquarter_pump=hindquarter_pump,
-                            weights=load_weights(),
+                            weights=_weights,
                             jra_track_data=jra_gt,
+                            system_instruction=_build_system_instruction(),
                         )
                     else:
                         result = _mock_analysis(entries, selected_race["race_name"])
@@ -962,6 +980,7 @@ with tab2:
                             track_condition=race2.get("track_condition", "良"),
                             weather=race2.get("weather", ""),
                             weights=load_weights(),
+                            system_instruction=_build_system_instruction(),
                         )
                     save_prediction(race_id2, {
                         "race_name": race2["race_name"],
@@ -1180,6 +1199,17 @@ with tab3:
 
         st.divider()
 
+        # ── Gemini学習済みsystem_instruction 確認 ────────
+        with st.expander("Geminiへの学習内容を確認（system_instruction）"):
+            si = _build_system_instruction()
+            st.code(si, language="markdown")
+            st.caption(
+                "この内容がすべての予想・PDCA呼び出しで system_instruction として "
+                "Geminiに渡されます。PDCAを重ねるほど重みと教訓が自動更新されます。"
+            )
+
+        st.divider()
+
         # ── 直近履歴テーブル ─────────────────────────────
         show_cols = ["race_name", "hit_1st", "hit_top3", "confidence",
                      "ev_gap", "odds_biased", "missed_ev", "timestamp"]
@@ -1379,7 +1409,7 @@ with tab4:
                                     log_area.markdown("\n".join(log_lines[-10:]))
                                     continue
 
-                                # 遡及AI予想（当時のデータで再構築）
+                                # 遡及AI予想（当時のデータで再構築・学習済みsystem_instruction使用）
                                 retro_result = gemini_client.analyze_race(
                                     api_key=st.session_state.api_key,
                                     race_name=rname,
@@ -1387,6 +1417,7 @@ with tab4:
                                     track_condition=race.get("track_condition", "良"),
                                     weather=race.get("weather", ""),
                                     weights=load_weights(),
+                                    system_instruction=_build_system_instruction(),
                                 )
                                 save_prediction(rid, {
                                     "race_name": rname,
