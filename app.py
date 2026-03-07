@@ -1,0 +1,867 @@
+"""Streamlit UI for 競馬G1/G2/G3 自律進化型予想アプリ."""
+
+import os
+import re as _re
+from datetime import date
+
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+import scraper
+import gemini_client
+import pdca_engine
+from data_store import (
+    save_prediction,
+    save_result,
+    load_weights,
+    get_prediction,
+    get_result,
+    compute_stats,
+    upsert_best_weight_record,
+)
+
+# ─────────────────────────────────────────────
+# Page config
+# ─────────────────────────────────────────────
+
+st.set_page_config(
+    page_title="競馬AI予想 - 自律進化型",
+    page_icon="🏇",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ─────────────────────────────────────────────
+# API key: st.secrets → .env → empty (mock mode)
+# ─────────────────────────────────────────────
+
+def _resolve_api_key() -> str:
+    # 1. Streamlit Cloud Secrets (最優先)
+    try:
+        key = st.secrets["GEMINI_API_KEY"]
+        if key and key != "your_gemini_api_key_here":
+            return key
+    except (KeyError, Exception):
+        pass
+    # 2. .env / 環境変数
+    return os.getenv("GEMINI_API_KEY", "")
+
+
+# ─────────────────────────────────────────────
+# Session state init
+# ─────────────────────────────────────────────
+
+# 毎回Secretsから最新のAPIキーを取得（Secrets追加後も即反映）
+_resolved = _resolve_api_key()
+if _resolved:
+    st.session_state.api_key = _resolved
+elif "api_key" not in st.session_state:
+    st.session_state.api_key = ""
+if "races" not in st.session_state:
+    st.session_state.races = []
+if "selected_race" not in st.session_state:
+    st.session_state.selected_race = None
+if "entries" not in st.session_state:
+    st.session_state.entries = []
+if "prediction_result" not in st.session_state:
+    st.session_state.prediction_result = None
+if "weather_data" not in st.session_state:
+    st.session_state.weather_data = {}
+
+# ─────────────────────────────────────────────
+# Sidebar
+# ─────────────────────────────────────────────
+
+WEIGHT_LABELS = {
+    "bio_condition": "生体・コンディション",
+    "environment": "環境・適性",
+    "human_skill": "人間・相性",
+    "background": "背景・資本",
+}
+WEIGHT_COLORS = {
+    "bio_condition": "#00ff88",
+    "environment": "#7fdbff",
+    "human_skill": "#FFD700",
+    "background": "#ff6b6b",
+}
+
+with st.sidebar:
+    st.title("🏇 競馬AI予想")
+    st.caption("自律進化型 G1/G2/G3 予想システム")
+
+    st.divider()
+
+    st.divider()
+
+    # ── 今週末クイック取得 ────────────────────────────────
+    saturday, sunday = scraper.get_this_week_race_dates()
+    if st.button(
+        f"今週末のレースを取得\n({saturday.strftime('%m/%d土')} & {sunday.strftime('%m/%d日')})",
+        type="primary",
+        use_container_width=True,
+    ):
+        with st.spinner("今週の土日レースを取得中..."):
+            races = scraper.fetch_this_week_races()
+            st.session_state.races = races
+            st.session_state.selected_race = None
+            st.session_state.entries = []
+            st.session_state.prediction_result = None
+        if races:
+            st.success(f"{len(races)}件のG1/G2/G3レースを取得（土日合計）")
+        else:
+            st.warning("今週末のG1/G2/G3レースが見つかりませんでした")
+
+    st.caption("または特定日を指定して取得")
+
+    # ── 個別日付指定 ─────────────────────────────────────
+    # デフォルトを直近土曜に設定
+    selected_date = st.date_input(
+        "開催日付（個別指定）",
+        value=saturday,
+        min_value=date(2020, 1, 1),
+        max_value=date(2030, 12, 31),
+    )
+
+    if st.button("指定日のレースを取得", use_container_width=True):
+        with st.spinner("レース情報を取得中..."):
+            races = scraper.fetch_race_list(selected_date)
+            st.session_state.races = races
+            st.session_state.selected_race = None
+            st.session_state.entries = []
+            st.session_state.prediction_result = None
+        if races:
+            st.success(f"{len(races)}件のG1/G2/G3レースを取得")
+        else:
+            st.warning(f"{selected_date.strftime('%m/%d')}のG1/G2/G3レースが見つかりませんでした")
+
+    st.divider()
+
+    # Golden ratio weight display
+    weights = load_weights()
+    st.subheader("科学的黄金比 (PDCA学習済)")
+    for k, v in weights.items():
+        label = WEIGHT_LABELS.get(k, k)
+        color = WEIGHT_COLORS.get(k, "#aaa")
+        st.markdown(
+            f'<div style="margin-bottom:6px;">'
+            f'<span style="color:{color};font-weight:bold;">{label}</span>'
+            f'<span style="color:#aaa;font-size:0.85em;"> {v:.0%}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        st.progress(min(v, 1.0))
+
+
+# ─────────────────────────────────────────────
+# Main content
+# ─────────────────────────────────────────────
+
+st.title("🏇 競馬AI予想システム")
+
+tab1, tab2, tab3 = st.tabs(["予想", "結果入力 & PDCA", "ダッシュボード"])
+
+# ═════════════════════════════════════════════
+# Tab 1: Prediction
+# ═════════════════════════════════════════════
+
+with tab1:
+    st.header("レース予想")
+
+    if not st.session_state.races:
+        st.info("サイドバーから日付を選択し「レース情報取得」をクリックしてください。")
+    else:
+        race_options = {
+            f"[{r['grade']}] {r['race_name']} {r['venue']} {r['time']}"
+            + (f" 【{r['race_date']}】" if r.get("race_date") else ""): r
+            for r in st.session_state.races
+        }
+        selected_label = st.selectbox("レース選択", options=list(race_options.keys()))
+        selected_race = race_options[selected_label]
+
+        # ── 天気自動取得 ──────────────────────────────────
+        col_weather_btn, col_weather_info = st.columns([1, 3])
+        with col_weather_btn:
+            if st.button("天気を自動取得 (OpenMeteo)", use_container_width=True):
+                venue = selected_race.get("venue", "")
+                try:
+                    race_hour = int(selected_race.get("time", "15:00").split(":")[0])
+                except Exception:
+                    race_hour = 15
+                # race_date フィールドがあればそれを優先、なければ selected_date
+                _rdate = selected_race.get("race_date")
+                if _rdate:
+                    from datetime import date as _date
+                    _fetch_date = _date.fromisoformat(_rdate)
+                else:
+                    _fetch_date = selected_date
+                with st.spinner("天気データ取得中..."):
+                    st.session_state.weather_data = scraper.fetch_weather(
+                        venue, _fetch_date, race_hour
+                    )
+
+        weather_data = st.session_state.weather_data
+        with col_weather_info:
+            if weather_data:
+                st.info(
+                    f"**{weather_data.get('description','')}**  "
+                    f"気温:{weather_data.get('temperature','')}  "
+                    f"降水:{weather_data.get('precipitation','')}  "
+                    f"風速:{weather_data.get('windspeed','')}  "
+                    f"({weather_data.get('source','')})"
+                )
+
+        # ── 環境情報 ──────────────────────────────────────
+        st.caption("環境・馬場情報（自動取得後に手動調整可）")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            track_condition = st.selectbox("馬場状態", ["良", "稍重", "重", "不良"], index=0)
+        with col2:
+            weather_opts = ["晴", "曇", "小雨", "雨", "雪", "不明"]
+            auto_weather = weather_data.get("description", "")
+            w_default = next((i for i, w in enumerate(weather_opts) if w in auto_weather), 5)
+            weather = st.selectbox("天気", weather_opts, index=w_default)
+        with col3:
+            auto_temp = weather_data.get("temperature", "").replace("℃", "")
+            temperature = st.text_input("気温 (℃)", value=auto_temp, placeholder="例: 18.5")
+        with col4:
+            cushion_value = st.text_input("クッション値", placeholder="例: 9.2")
+
+        # ── 詳細データ取得 ────────────────────────────────
+        col_fetch, col_fetch_status = st.columns([1, 3])
+        with col_fetch:
+            fetch_detail = st.button(
+                "詳細データ取得\n(騎手・調教・血統)",
+                help="netkeiba DBから各馬の詳細情報を取得します。約1分かかります。",
+                use_container_width=True,
+            )
+
+        if fetch_detail:
+            with st.spinner("出走馬ベースデータ取得中..."):
+                base_entries = scraper.fetch_entries(
+                    selected_race["race_id"], venue=selected_race.get("venue", "")
+                )
+
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
+            def _progress(i, total, name):
+                progress_bar.progress((i + 1) / total)
+                status_text.text(f"詳細取得中 ({i+1}/{total}): {name}")
+
+            with st.spinner("騎手・血統・調教データ取得中..."):
+                enriched = scraper.enrich_entries(
+                    base_entries, selected_race["race_id"], _progress
+                )
+            progress_bar.empty()
+            status_text.empty()
+
+            for h in enriched:
+                hid = h.get("horse_id", "")
+                current_w = 0
+                m = _re.search(r"(\d{3,4})kg", h.get("weight_trend", ""))
+                if m:
+                    current_w = int(m.group(1))
+                h["best_weight_analysis"] = (
+                    scraper.compute_best_weight_analysis(hid, current_w)
+                    if hid and current_w else {}
+                )
+                h["transport_profile"] = (
+                    scraper.build_transport_weight_profile(hid) if hid else {}
+                )
+
+            st.session_state.entries = enriched
+            st.success(f"{len(enriched)}頭の詳細データを取得しました")
+
+        with col_fetch_status:
+            if st.session_state.entries and st.session_state.entries[0].get("bloodline"):
+                st.caption(f"詳細データ取得済: {len(st.session_state.entries)}頭")
+
+        # ── パドック所見 — スライダー入力 ────────────────
+        st.markdown("---")
+        st.subheader("パドック所見（生体コンディション評価）")
+        st.caption("各指標を 1（最低）〜 5（最高）で直感的に評価してください")
+
+        paddock_notes = st.text_input(
+            "総合所見メモ",
+            placeholder="例: 3番の血管が浮き出ている。5番は踏み込みが深く滑らか。",
+        )
+
+        col_p1, col_p2, col_p3 = st.columns(3)
+        with col_p1:
+            coat_score = st.slider(
+                "毛並み・光沢（内臓コンディション）",
+                min_value=1, max_value=5, value=3,
+                help="1=くすみ/疲労感あり　5=ピカピカ/仕上げ完成",
+            )
+            coat_labels = {1: "くすんでいる(要注意)", 2: "やや悪い", 3: "普通",
+                           4: "光沢あり", 5: "光沢あり(優秀)"}
+            coat_gloss = coat_labels[coat_score]
+            _coat_colors = {1: "#ff4444", 2: "#ff9900", 3: "#aaaaaa", 4: "#88ee44", 5: "#00ff88"}
+            st.markdown(
+                f'<div style="color:{_coat_colors[coat_score]};font-weight:bold;">'
+                f'→ {coat_gloss}</div>',
+                unsafe_allow_html=True,
+            )
+
+        with col_p2:
+            hindq_score = st.slider(
+                "トモのパンプアップ（推進力ポテンシャル）",
+                min_value=1, max_value=5, value=3,
+                help="1=張りなし/細い　5=パンプアップ最高/力強い",
+            )
+            hindq_labels = {1: "張りなし", 2: "やや甘い", 3: "普通",
+                            4: "パンプアップ良好", 5: "パンプアップ最高"}
+            hindquarter_pump = hindq_labels[hindq_score]
+            _hindq_colors = {1: "#ff4444", 2: "#ff9900", 3: "#aaaaaa", 4: "#88ee44", 5: "#00ff88"}
+            st.markdown(
+                f'<div style="color:{_hindq_colors[hindq_score]};font-weight:bold;">'
+                f'→ {hindquarter_pump}</div>',
+                unsafe_allow_html=True,
+            )
+
+        with col_p3:
+            gait_score = st.slider(
+                "歩様・踏み込みの流動性（重心移動効率）",
+                min_value=1, max_value=5, value=3,
+                help="1=硬い/ぎこちない　5=踏み込み深く滑らか",
+            )
+            gait_labels = {1: "硬い(ぎこちない)", 2: "やや硬い", 3: "普通",
+                           4: "滑らか", 5: "踏み込み最高"}
+            gait_fluidity = gait_labels[gait_score]
+            _gait_colors = {1: "#ff4444", 2: "#ff9900", 3: "#aaaaaa", 4: "#88ee44", 5: "#00ff88"}
+            st.markdown(
+                f'<div style="color:{_gait_colors[gait_score]};font-weight:bold;">'
+                f'→ {gait_fluidity}</div>',
+                unsafe_allow_html=True,
+            )
+
+        # ── AI分析実行 ────────────────────────────────────
+        st.markdown("---")
+        if st.button("AI分析実行", type="primary", use_container_width=False):
+            if not st.session_state.entries:
+                with st.spinner("出走馬情報を取得中..."):
+                    st.session_state.entries = scraper.fetch_entries(
+                        selected_race["race_id"], venue=selected_race.get("venue", "")
+                    )
+            entries = st.session_state.entries
+
+            if entries:
+                with st.spinner("Gemini AIが科学的黄金比で分析中..."):
+                    if st.session_state.api_key:
+                        result = gemini_client.analyze_race(
+                            api_key=st.session_state.api_key,
+                            race_name=selected_race["race_name"],
+                            horses=entries,
+                            track_condition=track_condition,
+                            weather=weather,
+                            temperature=temperature,
+                            cushion_value=cushion_value,
+                            paddock_notes=paddock_notes,
+                            coat_gloss=coat_gloss,
+                            hindquarter_pump=hindquarter_pump,
+                            weights=load_weights(),
+                        )
+                    else:
+                        result = _mock_analysis(entries, selected_race["race_name"])
+
+                    save_prediction(
+                        race_id=selected_race["race_id"],
+                        prediction={
+                            "race_name": selected_race["race_name"],
+                            "grade": selected_race["grade"],
+                            "horses": result["horses"],
+                            "gemini_comment": result["comment"],
+                        },
+                    )
+                    st.session_state.prediction_result = result
+                    st.session_state.selected_race = selected_race
+                    st.success("予想が完了しました！")
+
+        # ── 予想結果カード ────────────────────────────────
+        if st.session_state.prediction_result:
+            result = st.session_state.prediction_result
+            horses = result.get("horses", [])[:3]
+
+            st.subheader("予想結果")
+
+            CARD_CONF = {
+                1: {"border": "#FFD700", "bg": "#1f1a00", "icon": "1st", "badge_bg": "#FFD700", "badge_fg": "#000"},
+                2: {"border": "#C0C0C0", "bg": "#1a1a1a", "icon": "2nd", "badge_bg": "#C0C0C0", "badge_fg": "#000"},
+                3: {"border": "#CD7F32", "bg": "#1a0f00", "icon": "3rd", "badge_bg": "#CD7F32", "badge_fg": "#000"},
+            }
+
+            if not horses:
+                st.warning("予想馬のデータを取得できませんでした。")
+            else:
+                cols = st.columns(len(horses))
+                for i, horse in enumerate(horses):
+                    rank = horse.get("rank", i + 1)
+                    conf = horse.get("confidence", 0)
+                    ev_gap = str(horse.get("ev_gap", ""))
+                    ev_positive = ev_gap.startswith("+")
+                    ev_color = "#00ff88" if ev_positive else ("#ff6b6b" if ev_gap.startswith("-") else "#aaa")
+                    ev_label = f"EV乖離: {ev_gap}" if ev_gap else ""
+                    cc = CARD_CONF.get(rank, CARD_CONF[3])
+                    conf_pct = min(conf, 100)
+
+                    with cols[i]:
+                        st.markdown(
+                            f"""
+<div style="
+    border: 2px solid {cc['border']};
+    border-radius: 14px;
+    padding: 20px 18px 16px;
+    background: {cc['bg']};
+    margin-bottom: 12px;
+    box-shadow: 0 0 12px {cc['border']}44;
+">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+    <span style="
+      background:{cc['badge_bg']};color:{cc['badge_fg']};
+      font-weight:900;font-size:1.0em;padding:3px 10px;
+      border-radius:20px;letter-spacing:1px;
+    ">{cc['icon']}</span>
+    <span style="color:{cc['border']};font-size:0.8em;font-weight:600;">スコア {conf}</span>
+  </div>
+  <div style="font-size:1.5em;font-weight:900;margin-bottom:6px;">
+    {horse.get('name', '?')}
+  </div>
+  <div style="margin-bottom:10px;">
+    <div style="background:#333;border-radius:4px;height:6px;width:100%;">
+      <div style="background:{cc['border']};border-radius:4px;height:6px;width:{conf_pct}%;"></div>
+    </div>
+  </div>
+  <div style="color:{ev_color};font-size:1.0em;font-weight:700;margin-bottom:8px;">
+    {ev_label if ev_label else '&nbsp;'}
+  </div>
+  <div style="color:#ccc;font-size:0.88em;line-height:1.5;margin-bottom:10px;">
+    {horse.get('reason', '')}
+  </div>
+  <div style="
+    background:#0a2a1a;border:1px solid #00ff8844;
+    border-radius:6px;padding:6px 10px;
+    color:#00ff88;font-weight:700;font-size:0.9em;
+  ">推奨: {horse.get('bet', '')}</div>
+</div>
+""",
+                            unsafe_allow_html=True,
+                        )
+
+            if result.get("comment"):
+                with st.expander("AI総合コメント（運動生理学視点）"):
+                    st.write(result["comment"])
+
+            # Entry list with bio columns
+            if st.session_state.entries:
+                st.subheader("出走馬一覧（バイオメカニカルデータ統合）")
+                for h in st.session_state.entries:
+                    tp = h.get("training_physics") or {}
+                    h["_acc_rate"] = f"{tp['acceleration_rate']:+.3f}" if tp.get("acceleration_rate") else ""
+                    h["_cardio"] = f"{tp['cardio_index']:+.3f}" if tp.get("cardio_index") else ""
+                    ps = h.get("paddock_scores") or {}
+                    h["_vasc"] = f"{ps['vascularity_index']:+.2f}" if ps.get("vascularity_index") else ""
+                    h["_hindq"] = f"{ps['hindquarter_power']:+.2f}" if ps.get("hindquarter_power") else ""
+                    h["_gait"] = f"{ps['gait_fluidity']:+.2f}" if ps.get("gait_fluidity") else ""
+                    bwa = h.get("best_weight_analysis") or {}
+                    h["_best_wt"] = (
+                        f"{bwa['best_weight']}kg({bwa.get('deviation',0):+d}) {bwa.get('classification','')}"
+                        if bwa.get("best_weight") else ""
+                    )
+                    tpro = h.get("transport_profile") or {}
+                    h["_weakness"] = (tpro.get("patterns") or [""])[0]
+
+                priority_cols = [
+                    ("number", "馬番"), ("name", "馬名"), ("jockey", "騎手"),
+                    ("weight", "斤量"), ("odds", "オッズ"), ("stable", "所属"),
+                    ("ritto", "外厩"), ("transport_stress", "輸送"),
+                    ("bloodline", "血統"), ("recent_form", "近走"),
+                    ("weight_trend", "馬体重推移"), ("jockey_win_rate", "騎手勝率"),
+                    ("jockey_g1_wins", "G1勝数"), ("trainer_win_rate", "調教師勝率"),
+                    ("training_eval", "調教評価"),
+                    ("_acc_rate", "加速率"), ("_cardio", "心肺指標"),
+                    ("_vasc", "血管露出"), ("_hindq", "トモ力"), ("_gait", "歩様流動"),
+                    ("_best_wt", "ベスト体重"), ("_weakness", "個体弱点"),
+                ]
+                df = pd.DataFrame(st.session_state.entries)
+                show = [(c, l) for c, l in priority_cols if c in df.columns]
+                df_show = df[[c for c, _ in show]].rename(columns={c: l for c, l in show})
+                st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+
+# ═════════════════════════════════════════════
+# Tab 2: Results & PDCA
+# ═════════════════════════════════════════════
+
+with tab2:
+    st.header("結果入力 & PDCA自己進化")
+
+    if not st.session_state.races:
+        st.info("先に「予想」タブでレース情報を取得してください。")
+    else:
+        race_options2 = {
+            f"[{r['grade']}] {r['race_name']}": r for r in st.session_state.races
+        }
+        sel2 = st.selectbox("対象レース", options=list(race_options2.keys()), key="result_race_sel")
+        race2 = race_options2[sel2]
+        race_id2 = race2["race_id"]
+
+        col_fetch, _ = st.columns([1, 2])
+        with col_fetch:
+            if st.button("スクレイピングで結果取得"):
+                with st.spinner("結果を取得中..."):
+                    fetched = scraper.fetch_result(race_id2)
+                if fetched:
+                    save_result(race_id2, {"race_name": race2["race_name"], **fetched})
+                    st.success("結果を自動取得しました")
+                else:
+                    st.warning("結果を取得できませんでした。手動入力してください。")
+
+        st.subheader("手動結果入力")
+        with st.form("result_form"):
+            st.caption("着順を入力（最低1着〜3着）")
+            cols = st.columns(3)
+            with cols[0]:
+                w1 = st.text_input("1着 馬名")
+                t1 = st.text_input("1着 タイム", placeholder="1:33.5")
+            with cols[1]:
+                w2 = st.text_input("2着 馬名")
+                t2 = st.text_input("2着 タイム", placeholder="1:33.8")
+            with cols[2]:
+                w3 = st.text_input("3着 馬名")
+                t3 = st.text_input("3着 タイム", placeholder="1:34.0")
+
+            st.caption("配当")
+            col_p1, col_p2, col_p3 = st.columns(3)
+            with col_p1:
+                payout_win = st.number_input("単勝 (円)", min_value=0, value=0, step=10)
+            with col_p2:
+                payout_place = st.number_input("複勝1着 (円)", min_value=0, value=0, step=10)
+            with col_p3:
+                payout_exacta = st.number_input("馬連 (円)", min_value=0, value=0, step=10)
+
+            submitted = st.form_submit_button("結果を保存", type="primary")
+            if submitted and w1:
+                finishing_order = [
+                    {"rank": r, "name": n, "time": t}
+                    for r, n, t in [(1, w1, t1), (2, w2, t2), (3, w3, t3)]
+                    if n
+                ]
+                payouts = {}
+                if payout_win:
+                    payouts["単勝"] = payout_win
+                if payout_place:
+                    payouts["複勝"] = payout_place
+                if payout_exacta:
+                    payouts["馬連"] = payout_exacta
+
+                save_result(race_id2, {
+                    "race_name": race2["race_name"],
+                    "finishing_order": finishing_order,
+                    "payouts": payouts,
+                })
+
+                # Update horse profile DB for best-weight / transport tracking
+                venue2 = race2.get("venue", "")
+                weather_temp2 = st.session_state.weather_data.get("temperature", "")
+                stable_map = {h["name"]: h for h in st.session_state.get("entries", [])}
+                for fo in finishing_order:
+                    hdata = stable_map.get(fo["name"], {})
+                    hid = hdata.get("horse_id", "")
+                    if not hid:
+                        continue
+                    wm = _re.search(r"(\d{3,4})kg", hdata.get("weight_trend", ""))
+                    w_kg = int(wm.group(1)) if wm else 0
+                    km_match = _re.search(r"(\d+)km", hdata.get("transport_stress", ""))
+                    km = int(km_match.group(1)) if km_match else 0
+                    if w_kg:
+                        _rec_date = race2.get("race_date", selected_date.isoformat())
+                        upsert_best_weight_record(
+                            horse_id=hid,
+                            race_date=_rec_date,
+                            rank=fo["rank"],
+                            weight_kg=w_kg,
+                            venue=venue2,
+                            weather_temp=weather_temp2,
+                            transport_km=km,
+                        )
+                st.success("結果を保存しました")
+
+        # ── PDCA ────────────────────────────────────────
+        st.divider()
+        st.subheader("PDCA自己進化実行")
+
+        pred_exists = get_prediction(race_id2)
+        result_exists = get_result(race_id2)
+
+        if not pred_exists:
+            st.warning("このレースの予想データがありません。先に「予想」タブで分析してください。")
+        elif not result_exists:
+            st.warning("結果データがありません。上記フォームで入力してください。")
+        else:
+            if st.button("PDCA分析 & 黄金比重み自動更新", type="primary"):
+                with st.spinner("Geminiが反省分析中..."):
+                    pdca_result = pdca_engine.compare_and_evolve(
+                        race_id=race_id2,
+                        api_key=st.session_state.api_key,
+                    )
+
+                if "error" in pdca_result:
+                    st.error(pdca_result["error"])
+                else:
+                    col_hit1, col_hit3, col_bias = st.columns(3)
+                    with col_hit1:
+                        if pdca_result["hit_1st"]:
+                            st.success(f"1着的中！ ({pdca_result['top_pick']})")
+                        else:
+                            st.error(f"1着外れ (予想: {pdca_result['top_pick']})")
+                    with col_hit3:
+                        if pdca_result["hit_top3"]:
+                            st.success("3着内的中！")
+                        else:
+                            st.warning("3着内も外れ")
+                    with col_bias:
+                        bias = pdca_result.get("odds_bias_flag", {})
+                        if bias.get("missed_ev"):
+                            st.error(f"EV機会損失あり (実際の1着オッズ: {bias.get('winner_odds')}倍)")
+                        elif bias.get("biased"):
+                            st.warning("人気馬優先バイアスを検出")
+                        else:
+                            st.success("オッズバイアスなし")
+
+                    if pdca_result.get("odds_bias_audit"):
+                        st.info(f"オッズバイアス監査: {pdca_result['odds_bias_audit']}")
+
+                    if pdca_result.get("reflection"):
+                        st.subheader("AI反省レポート")
+                        st.write(pdca_result["reflection"])
+
+                    if pdca_result.get("key_lessons"):
+                        st.subheader("今回の教訓")
+                        for lesson in pdca_result["key_lessons"]:
+                            st.markdown(f"- {lesson}")
+
+                    col_ow, col_nw = st.columns(2)
+                    with col_ow:
+                        st.subheader("更新前の重み")
+                        for k, v in pdca_result["old_weights"].items():
+                            st.write(f"{WEIGHT_LABELS.get(k, k)}: {v:.1%}")
+                    with col_nw:
+                        st.subheader("更新後の重み")
+                        for k, v in pdca_result["new_weights"].items():
+                            st.write(f"{WEIGHT_LABELS.get(k, k)}: {v:.1%}")
+                    if pdca_result.get("weight_reasoning"):
+                        st.caption(f"変更理由: {pdca_result['weight_reasoning']}")
+
+
+# ═════════════════════════════════════════════
+# Tab 3: Dashboard
+# ═════════════════════════════════════════════
+
+with tab3:
+    st.header("ダッシュボード")
+
+    stats = compute_stats()
+
+    # ── KPI ──────────────────────────────────────────────
+    kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+    with kpi1:
+        st.metric("総分析レース数", stats["total_races"])
+    with kpi2:
+        st.metric("1着的中率", f"{stats['rate_1st']:.1%}", f"{stats['hit_1st']}回")
+    with kpi3:
+        st.metric("3着内的中率", f"{stats['rate_top3']:.1%}", f"{stats['hit_top3']}回")
+    with kpi4:
+        weights_now = load_weights()
+        bio_w = weights_now.get("bio_condition", 0.40)
+        st.metric("生体ウェイト", f"{bio_w:.0%}", help="科学的黄金比の現在値 (目標40%)")
+    with kpi5:
+        env_w = weights_now.get("environment", 0.30)
+        st.metric("環境ウェイト", f"{env_w:.0%}", help="科学的黄金比の現在値 (目標30%)")
+
+    st.divider()
+
+    history = pdca_engine.get_hit_rate_history()
+    if history:
+        df_hist = pd.DataFrame(history)
+        df_hist["累計1着的中率"] = df_hist["hit_1st"].expanding().mean()
+        df_hist["累計3着内的中率"] = df_hist["hit_top3"].expanding().mean()
+
+        # ── 2カラム: 勝率推移 | 要因別寄与度レーダー ──────
+        chart_col, radar_col = st.columns([3, 2])
+
+        with chart_col:
+            st.subheader("予想精度推移")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=list(range(1, len(df_hist) + 1)),
+                y=df_hist["累計1着的中率"],
+                mode="lines+markers",
+                name="1着的中率",
+                line=dict(color="#FFD700", width=2),
+                marker=dict(size=6),
+            ))
+            fig.add_trace(go.Scatter(
+                x=list(range(1, len(df_hist) + 1)),
+                y=df_hist["累計3着内的中率"],
+                mode="lines+markers",
+                name="3着内的中率",
+                line=dict(color="#7fdbff", width=2),
+                marker=dict(size=6),
+            ))
+            fig.add_hrect(y0=0.25, y1=0.35, fillcolor="#00ff8822", line_width=0,
+                          annotation_text="1着25-35%ゾーン", annotation_position="top left")
+            fig.update_layout(
+                xaxis_title="レース数",
+                yaxis_title="的中率",
+                yaxis=dict(tickformat=".0%"),
+                template="plotly_dark",
+                height=320,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                margin=dict(t=40, b=40),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        with radar_col:
+            st.subheader("要因別寄与度")
+            w = load_weights()
+            radar_labels = [WEIGHT_LABELS.get(k, k) for k in w]
+            radar_values = list(w.values())
+            # Golden ratio targets
+            golden = [0.40, 0.30, 0.20, 0.10]
+
+            fig_r = go.Figure()
+            fig_r.add_trace(go.Scatterpolar(
+                r=golden + [golden[0]],
+                theta=radar_labels + [radar_labels[0]],
+                fill="toself",
+                fillcolor="rgba(255,215,0,0.08)",
+                line=dict(color="#FFD70066", dash="dot"),
+                name="黄金比目標",
+            ))
+            fig_r.add_trace(go.Scatterpolar(
+                r=radar_values + [radar_values[0]],
+                theta=radar_labels + [radar_labels[0]],
+                fill="toself",
+                fillcolor="rgba(127,219,255,0.18)",
+                line=dict(color="#7fdbff", width=2),
+                name="現在値",
+            ))
+            fig_r.update_layout(
+                polar=dict(radialaxis=dict(visible=True, range=[0, 0.5],
+                                           tickformat=".0%")),
+                template="plotly_dark",
+                height=320,
+                legend=dict(orientation="h", yanchor="bottom", y=-0.15),
+                margin=dict(t=20, b=60),
+            )
+            st.plotly_chart(fig_r, use_container_width=True)
+
+        # ── バイアス指標 ──────────────────────────────────
+        if "odds_biased" in df_hist.columns:
+            bias_rate = df_hist["odds_biased"].mean()
+            ev_miss = df_hist["missed_ev"].mean() if "missed_ev" in df_hist.columns else 0
+            bc1, bc2 = st.columns(2)
+            with bc1:
+                color = "normal" if bias_rate < 0.4 else "inverse"
+                st.metric("人気偏重率", f"{bias_rate:.0%}",
+                          help="予想1位が最低オッズ馬だった割合。40%未満が目標。",
+                          delta=f"{'良好' if bias_rate < 0.4 else '要改善'}",
+                          delta_color=color)
+            with bc2:
+                color2 = "normal" if ev_miss < 0.3 else "inverse"
+                st.metric("EV機会損失率", f"{ev_miss:.0%}",
+                          help="実際の勝馬が予想馬より1.5倍以上高オッズだった割合。30%未満が目標。",
+                          delta=f"{'良好' if ev_miss < 0.3 else '要改善'}",
+                          delta_color=color2)
+
+        st.divider()
+
+        # ── 直近履歴テーブル ─────────────────────────────
+        show_cols = ["race_name", "hit_1st", "hit_top3", "confidence",
+                     "ev_gap", "odds_biased", "missed_ev", "timestamp"]
+        show_cols = [c for c in show_cols if c in df_hist.columns]
+        rename_map = {
+            "race_name": "レース名", "hit_1st": "1着的中", "hit_top3": "3着内的中",
+            "confidence": "スコア", "ev_gap": "EV乖離", "odds_biased": "人気偏重",
+            "missed_ev": "EV機会損失", "timestamp": "分析日時",
+        }
+        st.subheader("分析履歴")
+        st.dataframe(
+            df_hist[show_cols].rename(columns=rename_map),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # ── 外れパターン ─────────────────────────────────
+        trend = pdca_engine.get_trend_analysis()
+        misses = trend.get("recent_misses", [])
+        if misses:
+            st.subheader("最近の外れパターン")
+            df_miss = pd.DataFrame(misses)
+            df_miss.columns = ["レース名", "予想本命", "実際の1着"]
+            st.dataframe(df_miss, use_container_width=True, hide_index=True)
+
+    else:
+        st.info("予想データがありません。「予想」タブでレース分析を実行してください。")
+
+        # Show the golden ratio radar even with no data
+        st.subheader("科学的黄金比フレームワーク")
+        w = load_weights()
+        radar_labels = [WEIGHT_LABELS.get(k, k) for k in w]
+        radar_values = list(w.values())
+        fig_init = go.Figure(go.Scatterpolar(
+            r=radar_values + [radar_values[0]],
+            theta=radar_labels + [radar_labels[0]],
+            fill="toself",
+            fillcolor="rgba(127,219,255,0.2)",
+            line=dict(color="#7fdbff", width=2),
+            name="初期黄金比",
+        ))
+        fig_init.update_layout(
+            polar=dict(radialaxis=dict(visible=True, range=[0, 0.5], tickformat=".0%")),
+            template="plotly_dark",
+            height=350,
+        )
+        st.plotly_chart(fig_init, use_container_width=True)
+
+
+# ─────────────────────────────────────────────
+# Mock analysis (no API key)
+# ─────────────────────────────────────────────
+
+def _mock_analysis(horses: list, race_name: str) -> dict:
+    import random
+    shuffled = horses[:]
+    random.shuffle(shuffled)
+    reasons = [
+        "調教加速率が高く心肺機能の仕上がりが確認できる。トモのパンプアップも◎でベスト体重帯。",
+        "血統的に馬場適性が高く、前走から斤量減で有利。外厩調整密度も高い。",
+        "オッズに対して実力が過小評価されており期待値ギャップ+。輸送ストレス低く侮れない。",
+    ]
+    bets = ["単勝 + 複勝", "複勝 + ワイド", "連複BOX"]
+    predictions = [
+        {
+            "rank": i + 1,
+            "name": shuffled[i]["name"],
+            "confidence": [72, 58, 45][i],
+            "ev_gap": ["+8", "+3", "-2"][i],
+            "reason": reasons[i],
+            "bet": bets[i],
+        }
+        for i in range(min(3, len(shuffled)))
+    ]
+    return {
+        "horses": predictions,
+        "comment": (
+            f"[モック分析] {race_name} の予想です（黄金比フレームワーク適用）。"
+            "Gemini APIキーを設定するとAI分析が有効になります。"
+        ),
+        "raw_response": "",
+    }
