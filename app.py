@@ -110,10 +110,7 @@ def _mock_analysis(horses: list, race_name: str) -> dict:
     ]
     return {
         "horses": predictions,
-        "comment": (
-            f"[モック分析] {race_name} の予想です（黄金比フレームワーク適用）。"
-            "Gemini APIキーを設定するとAI分析が有効になります。"
-        ),
+        "comment": f"[デモ分析] {race_name} の予想です（黄金比フレームワーク適用・ランダム）。",
         "raw_response": "",
     }
 
@@ -139,6 +136,23 @@ with st.sidebar:
     st.caption("自律進化型 G1/G2/G3 予想システム")
 
     st.divider()
+
+    # ── Gemini API 状態表示 ─────────────────────────────
+    if st.session_state.api_key:
+        st.success("Gemini API: 接続済み")
+        if st.button("接続テスト", use_container_width=True):
+            with st.spinner("Gemini疎通確認中..."):
+                try:
+                    import google.generativeai as _genai
+                    _genai.configure(api_key=st.session_state.api_key)
+                    _m = _genai.GenerativeModel("gemini-2.0-flash")
+                    _r = _m.generate_content("日本語で「接続OK」とだけ返答してください")
+                    st.success(f"Gemini応答: {_r.text.strip()[:50]}")
+                except Exception as _e:
+                    st.error(f"Gemini接続エラー: {_e}")
+    else:
+        st.error("Gemini API: 未接続（Secrets未設定）")
+        st.caption("Streamlit Cloud → Settings → Secrets に\nGEMINI_API_KEY を設定してください")
 
     st.divider()
 
@@ -675,38 +689,84 @@ with tab1:
             # Entry list with bio columns
             if st.session_state.entries:
                 st.subheader("出走馬一覧（バイオメカニカルデータ統合）")
+                pad_reps = st.session_state.paddock_reports
+
                 for h in st.session_state.entries:
+                    name = h.get("name", "")
+
+                    # 調教物理解析
                     tp = h.get("training_physics") or {}
-                    h["_acc_rate"] = f"{tp['acceleration_rate']:+.3f}" if tp.get("acceleration_rate") else ""
-                    h["_cardio"] = f"{tp['cardio_index']:+.3f}" if tp.get("cardio_index") else ""
-                    ps = h.get("paddock_scores") or {}
-                    h["_vasc"] = f"{ps['vascularity_index']:+.2f}" if ps.get("vascularity_index") else ""
-                    h["_hindq"] = f"{ps['hindquarter_power']:+.2f}" if ps.get("hindquarter_power") else ""
-                    h["_gait"] = f"{ps['gait_fluidity']:+.2f}" if ps.get("gait_fluidity") else ""
+                    h["_acc_rate"] = f"{tp['acceleration_rate']:+.3f}" if tp.get("acceleration_rate") else "－"
+                    h["_cardio"]   = f"{tp['cardio_index']:+.3f}"       if tp.get("cardio_index")    else "－"
+
+                    # パドックNLPスコア（自動取得分 or 手入力分）
+                    rep = pad_reps.get(name, {})
+                    gs  = rep.get("gemini_scores") or {}
+                    ps  = rep.get("scores") or h.get("paddock_scores") or {}
+
+                    def _fmt_score(v, digits=2):
+                        return f"{v:+.{digits}f}" if v else "－"
+
+                    h["_tomu"]  = str(gs.get("hindquarter_tension", "")) or _fmt_score(ps.get("hindquarter_power"))
+                    h["_coat"]  = str(gs.get("coat_gloss", ""))          or _fmt_score(ps.get("vascularity_index"))
+                    h["_kiiai"] = str(gs.get("mental_energy", ""))        or "－"
+                    h["_gait"]  = _fmt_score(ps.get("gait_fluidity"))
+
+                    # KeibaLab 当日馬体重
+                    kl_wt = rep.get("weight_kg")
+                    kl_ch = rep.get("weight_change")
+                    if kl_wt:
+                        sign = "+" if kl_ch and kl_ch > 0 else ""
+                        h["_today_weight"] = f"{kl_wt}kg({sign}{kl_ch})" if kl_ch is not None else f"{kl_wt}kg"
+                    else:
+                        h["_today_weight"] = ""
+
+                    # パドックコメント要約
+                    h["_pad_comment"] = rep.get("text", "")[:40] if rep.get("text") else ""
+
+                    # ベスト体重
                     bwa = h.get("best_weight_analysis") or {}
                     h["_best_wt"] = (
                         f"{bwa['best_weight']}kg({bwa.get('deviation',0):+d}) {bwa.get('classification','')}"
                         if bwa.get("best_weight") else ""
                     )
+
+                    # 個体弱点
                     tpro = h.get("transport_profile") or {}
                     h["_weakness"] = (tpro.get("patterns") or [""])[0]
 
                 priority_cols = [
-                    ("number", "馬番"), ("name", "馬名"), ("jockey", "騎手"),
-                    ("weight", "斤量"), ("odds", "オッズ"), ("stable", "所属"),
-                    ("ritto", "外厩"), ("transport_stress", "輸送"),
-                    ("bloodline", "血統"), ("recent_form", "近走"),
-                    ("weight_trend", "馬体重推移"), ("jockey_win_rate", "騎手勝率"),
-                    ("jockey_g1_wins", "G1勝数"), ("trainer_win_rate", "調教師勝率"),
-                    ("training_eval", "調教評価"),
-                    ("_acc_rate", "加速率"), ("_cardio", "心肺指標"),
-                    ("_vasc", "血管露出"), ("_hindq", "トモ力"), ("_gait", "歩様流動"),
-                    ("_best_wt", "ベスト体重"), ("_weakness", "個体弱点"),
+                    ("number",         "馬番"),
+                    ("name",           "馬名"),
+                    ("jockey",         "騎手"),
+                    ("weight",         "斤量"),
+                    ("odds",           "オッズ"),
+                    ("_today_weight",  "当日体重(KeibaLab)"),
+                    ("stable",         "所属"),
+                    ("ritto",          "外厩"),
+                    ("transport_stress","輸送"),
+                    ("bloodline",      "血統"),
+                    ("recent_form",    "近走"),
+                    ("weight_trend",   "馬体重推移"),
+                    ("jockey_win_rate","騎手勝率"),
+                    ("jockey_g1_wins", "G1勝数"),
+                    ("trainer_win_rate","調教師勝率"),
+                    ("training_eval",  "調教評価"),
+                    ("_acc_rate",      "加速率"),
+                    ("_cardio",        "心肺指標"),
+                    ("_tomu",          "トモ(1-5)"),
+                    ("_coat",          "毛艶(1-5)"),
+                    ("_kiiai",         "気合(1-5)"),
+                    ("_gait",          "歩様流動"),
+                    ("_pad_comment",   "パドック短評"),
+                    ("_best_wt",       "ベスト体重"),
+                    ("_weakness",      "個体弱点"),
                 ]
                 df = pd.DataFrame(st.session_state.entries)
                 show = [(c, l) for c, l in priority_cols if c in df.columns]
                 df_show = df[[c for c, _ in show]].rename(columns={c: l for c, l in show})
                 st.dataframe(df_show, use_container_width=True, hide_index=True)
+                st.caption("※ トモ/毛艶/気合はGemini採点(1-5)。パドック情報自動取得後に更新されます。")
 
 
 # ═════════════════════════════════════════════
