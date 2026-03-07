@@ -11,11 +11,29 @@ Public data sources:
 import time
 import re
 import json
+import html
 from datetime import date, datetime
 from typing import Optional
 
 import requests
 from bs4 import BeautifulSoup
+
+
+def _clean_text(text: str) -> str:
+    """HTMLエンティティ・競馬印記号・制御文字をクリーニングする。"""
+    if not text:
+        return ""
+    # HTMLエンティティをデコード (&#10003; → ✓ など)
+    text = html.unescape(text)
+    # 競馬印記号（◎本命 ○対抗 ▲単穴 △連下 ☆穴 ×消 など）を除去
+    text = re.sub(r'[◎○◯▲△☆★×✓✔✗✘]', '', text)
+    # 連続ハイフン・ダッシュ整理
+    text = re.sub(r'-{2,}', '', text)
+    # 制御文字・不可視文字除去
+    text = re.sub(r'[\x00-\x1f\x7f\u200b\u200c\u200d\ufeff]', '', text)
+    # 余分な空白を整理
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 HEADERS = {
     "User-Agent": (
@@ -1345,8 +1363,8 @@ def _scrape_netkeiba_paddock(race_id: str, horse_names: list, reports: dict):
             comment_tag = item.select_one(".Comment, .PaddockText, p, .text")
             if not (name_tag and comment_tag):
                 continue
-            item_name = name_tag.get_text(strip=True)
-            text = comment_tag.get_text(strip=True)
+            item_name = _clean_text(name_tag.get_text(strip=True))
+            text = _clean_text(comment_tag.get_text(strip=True))
             for hn in horse_names:
                 if hn in item_name or item_name in hn:
                     reports[hn] = {
@@ -1358,7 +1376,7 @@ def _scrape_netkeiba_paddock(race_id: str, horse_names: list, reports: dict):
     # フォールバック: ページ全体テキストから馬名周辺の文を抽出
     if not any(reports.get(n, {}).get("text") for n in horse_names):
         for name in horse_names:
-            sentences = [s.strip() for s in re.split(r'[。．\n]', full_text)
+            sentences = [_clean_text(s) for s in re.split(r'[。．\n]', full_text)
                          if name in s and len(s) > 10]
             if sentences:
                 combined = "。".join(sentences[:3])
@@ -1390,7 +1408,7 @@ def _scrape_yahoo_news_paddock(race_name: str, horse_names: list, reports: dict)
     full_text = "。".join(snippets)
 
     for name in horse_names:
-        sentences = [s.strip() for s in re.split(r'[。．\n]', full_text)
+        sentences = [_clean_text(s) for s in re.split(r'[。．\n]', full_text)
                      if name in s and len(s) > 10]
         if sentences:
             combined = "。".join(sentences[:4])
@@ -1418,7 +1436,7 @@ def _scrape_umajo_paddock(race_id: str, horse_names: list, reports: dict):
 
     full_text = soup.get_text(" ", strip=True)
     for name in horse_names:
-        sentences = [s.strip() for s in re.split(r'[。．\n]', full_text)
+        sentences = [_clean_text(s) for s in re.split(r'[。．\n]', full_text)
                      if name in s and len(s) > 10]
         if sentences:
             combined = "。".join(sentences[:3])
@@ -1440,7 +1458,7 @@ def _scrape_keibago_paddock(race_id: str, horse_names: list, reports: dict):
 
     full_text = soup.get_text(" ", strip=True)
     for name in horse_names:
-        sentences = [s.strip() for s in re.split(r'[。．\n]', full_text)
+        sentences = [_clean_text(s) for s in re.split(r'[。．\n]', full_text)
                      if name in s and len(s) > 10]
         if sentences:
             combined = "。".join(sentences[:3])

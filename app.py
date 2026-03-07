@@ -426,10 +426,10 @@ with tab1:
                         sources = []
                         # 調教評価コメント
                         if h.get("training_eval"):
-                            sources.append(h["training_eval"])
+                            sources.append(scraper._clean_text(h["training_eval"]))
                         # 近走成績テキスト
                         if h.get("recent_form"):
-                            sources.append(h["recent_form"])
+                            sources.append(scraper._clean_text(h["recent_form"]))
                         combined = " ".join(sources)
                         if combined.strip():
                             reports[name] = {
