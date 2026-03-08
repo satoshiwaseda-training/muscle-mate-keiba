@@ -410,31 +410,22 @@ def fetch_weather(venue: str, race_date: date, race_hour: int = 15) -> dict:
     data = None
     used_source = ""
 
-    if days_ago < 0:
-        # 未来: forecast API (start_date/end_date)
+    if days_ago <= 14:
+        # 未来〜直近14日: forecast API (forecast_days + 必要時 past_days)
+        ahead = max(-days_ago + 1, 1)  # 未来日数+1 (最低1)
         params = {
             "latitude": lat, "longitude": lon,
             "hourly": _hourly_vars,
             "timezone": "Asia/Tokyo",
-            "start_date": race_date.isoformat(),
-            "end_date": race_date.isoformat(),
+            "forecast_days": min(ahead, 16),
         }
+        # 過去分が必要な場合のみ past_days を追加 (0は送らない)
+        if days_ago > 0:
+            params["past_days"] = min(days_ago + 1, 92)
         data = _get_json("https://api.open-meteo.com/v1/forecast", params=params)
         used_source = "OpenMeteo forecast"
-
-    elif days_ago <= 14:
-        # 直近14日: forecast API の past_days で取得（アーカイブ未反映期間対策）
-        params = {
-            "latitude": lat, "longitude": lon,
-            "hourly": _hourly_vars,
-            "timezone": "Asia/Tokyo",
-            "past_days": min(days_ago + 1, 92),
-            "forecast_days": 0,
-        }
-        data = _get_json("https://api.open-meteo.com/v1/forecast", params=params)
-        used_source = "OpenMeteo forecast(past)"
-        # 失敗時はアーカイブを試みる
-        if not data or "hourly" not in data:
+        # 失敗時はアーカイブを試みる (過去日のみ)
+        if (not data or "hourly" not in data) and days_ago > 0:
             params2 = {
                 "latitude": lat, "longitude": lon,
                 "hourly": _hourly_vars,
@@ -458,11 +449,13 @@ def fetch_weather(venue: str, race_date: date, race_hour: int = 15) -> dict:
         used_source = "OpenMeteo archive"
 
     if not data or "hourly" not in data:
+        reason = data.get("reason", "") if isinstance(data, dict) else ""
+        print(f"[weather] {used_source} failed: days_ago={days_ago}, reason={reason}, data_keys={list(data.keys()) if isinstance(data, dict) else data}")
         return {
             "temperature": "取得失敗", "precipitation": "取得失敗",
             "windspeed": "取得失敗",
             "description": "APIエラー",
-            "source": f"失敗({used_source}, {days_ago}日前)",
+            "source": f"失敗({used_source}, {days_ago}日前, {reason or 'no hourly'})",
         }
 
     hourly = data["hourly"]
