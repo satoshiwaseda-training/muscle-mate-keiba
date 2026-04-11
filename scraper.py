@@ -12,11 +12,43 @@ import time
 import re
 import json
 import html
+import random
 from datetime import date, datetime
+from pathlib import Path
 from typing import Optional
 
 import requests
 from bs4 import BeautifulSoup
+
+# ── Retry / backoff ─────────────────────────────────────
+MAX_RETRIES = 4          # total attempts per request (1 initial + 3 retries)
+BACKOFF_BASE = 1.8       # exponential factor: 1.8, 3.24, 5.83, 10.5 s
+RETRY_STATUS = {408, 429, 500, 502, 503, 504}
+
+# ── Disk cache for enrichment fetches ──────────────────
+_CACHE_ROOT = Path(__file__).parent / "data" / "scraper_cache"
+
+def _cache_path(kind: str, key: str) -> Path:
+    (_CACHE_ROOT / kind).mkdir(parents=True, exist_ok=True)
+    safe_key = re.sub(r"[^\w\-]", "_", str(key))
+    return _CACHE_ROOT / kind / f"{safe_key}.json"
+
+def _cache_load(kind: str, key: str):
+    p = _cache_path(kind, key)
+    if not p.exists():
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _cache_save(kind: str, key: str, data) -> None:
+    try:
+        with open(_cache_path(kind, key), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[scraper] cache save {kind}/{key} failed: {e}")
 
 
 def _clean_text(text: str) -> str:
@@ -354,33 +386,51 @@ def _is_hot_temp(weather_temp: str) -> bool:
 
 def _get(url: str, params: dict = None, encoding: str = None,
          delay: float = REQUEST_DELAY) -> Optional[BeautifulSoup]:
-    try:
-        time.sleep(delay)
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=12)
-        resp.raise_for_status()
-        # Use raw bytes so BeautifulSoup reads the meta charset tag (EUC-JP etc.) correctly.
-        # Passing resp.text causes double-encoding issues on EUC-JP pages (netkeiba).
-        if encoding:
-            return BeautifulSoup(resp.content, "html.parser", from_encoding=encoding)
-        return BeautifulSoup(resp.content, "html.parser")
-    except Exception as e:
-        print(f"[scraper] GET {url} failed: {e}")
-        return None
+    # Polite crawl rate + retry with exponential backoff on transient errors.
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        wait = delay if attempt == 0 else BACKOFF_BASE ** attempt + random.random()
+        time.sleep(wait)
+        try:
+            resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+            if resp.status_code in RETRY_STATUS:
+                last_err = f"HTTP {resp.status_code}"
+                continue
+            resp.raise_for_status()
+            if encoding:
+                return BeautifulSoup(resp.content, "html.parser", from_encoding=encoding)
+            return BeautifulSoup(resp.content, "html.parser")
+        except requests.RequestException as e:
+            last_err = str(e)
+            continue
+    print(f"[scraper] GET {url} failed after {MAX_RETRIES} attempts: {last_err}")
+    return None
 
 
 def _get_json(url: str, params: dict = None) -> Optional[dict]:
-    """Fetch JSON endpoint (used for OpenMeteo)."""
-    try:
-        time.sleep(0.3)
-        resp = requests.get(url, params=params, timeout=15)
-        data = resp.json()
-        if data.get("error"):
-            print(f"[scraper] JSON GET {url} API error: {data.get('reason')}")
-            return None
-        return data
-    except Exception as e:
-        print(f"[scraper] JSON GET {url} failed: {e}")
-        return None
+    """Fetch JSON endpoint with retry + backoff (used for OpenMeteo)."""
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        wait = 0.3 if attempt == 0 else BACKOFF_BASE ** attempt + random.random()
+        time.sleep(wait)
+        try:
+            resp = requests.get(url, params=params, timeout=15)
+            if resp.status_code in RETRY_STATUS:
+                last_err = f"HTTP {resp.status_code}"
+                continue
+            data = resp.json()
+            if isinstance(data, dict) and data.get("error"):
+                print(f"[scraper] JSON GET {url} API error: {data.get('reason')}")
+                return None
+            return data
+        except requests.RequestException as e:
+            last_err = str(e)
+            continue
+        except ValueError as e:
+            last_err = f"invalid json: {e}"
+            continue
+    print(f"[scraper] JSON GET {url} failed after {MAX_RETRIES} attempts: {last_err}")
+    return None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -571,11 +621,15 @@ def fetch_horse_detail(horse_id: str) -> dict:
 # ═══════════════════════════════════════════════════════════
 
 def fetch_jockey_stats(jockey_id: str) -> dict:
+    """Fetch jockey career stats from db.netkeiba.com/jockey/{jockey_id}/.
+
+    The profile page has a `table.ResultsByYears` block whose 累計 row holds
+    career totals. Column layout (as of 2026-04):
+      [年度, 順位, 1着, 2着, 3着, 4着〜, 騎乗回数, 重賞出走, 重賞勝利,
+       勝率, 連対率, 複勝率, 代表馬]
+    We read 累計 row and pull 勝率 (col 9), 複勝率 (col 11), 重賞勝利 (col 8).
     """
-    Fetch jockey career stats from db.netkeiba.com/jockey/{jockey_id}/.
-    Returns win_rate, place_rate, g1_wins, single_recovery_rate.
-    """
-    url = f"https://db.netkeiba.com/jockey/result/recent/{jockey_id}/"
+    url = f"https://db.netkeiba.com/jockey/{jockey_id}/"
     soup = _get(url)
     if soup is None:
         return {}
@@ -583,30 +637,28 @@ def fetch_jockey_stats(jockey_id: str) -> dict:
     stats = {"jockey_id": jockey_id, "win_rate": "", "place_rate": "",
              "g1_wins": "", "single_recovery": ""}
 
-    tbl = soup.select_one("table.db_prof_table, table.race_table_01")
-    if tbl:
-        rows = tbl.select("tr")
-        for row in rows:
-            cells = row.find_all("td")
-            if len(cells) >= 6:
-                try:
-                    rides = int(cells[0].get_text(strip=True).replace(",", ""))
-                    wins = int(cells[1].get_text(strip=True).replace(",", ""))
-                    seconds = int(cells[2].get_text(strip=True).replace(",", ""))
-                    thirds = int(cells[3].get_text(strip=True).replace(",", ""))
-                    if rides > 0:
-                        stats["win_rate"] = f"{wins/rides:.1%}"
-                        stats["place_rate"] = f"{(wins+seconds+thirds)/rides:.1%}"
-                except Exception:
-                    pass
-                break
-
-    # G1 wins: count from results filtered by grade
-    grade_url = f"https://db.netkeiba.com/jockey/result/recent/{jockey_id}/?grade=G1"
-    g1_soup = _get(grade_url)
-    if g1_soup:
-        g1_wins_match = re.search(r"(\d+)勝", g1_soup.get_text())
-        stats["g1_wins"] = g1_wins_match.group(1) + "勝" if g1_wins_match else "?"
+    # Career summary sits in the first ResultsByYears table (JRA 中央).
+    summary = soup.select_one("table.ResultsByYears")
+    if summary:
+        for row in summary.select("tr"):
+            cells = row.find_all(["th", "td"])
+            if not cells:
+                continue
+            label = cells[0].get_text(strip=True)
+            if label != "累計" or len(cells) < 12:
+                continue
+            # Numeric columns are plain text; percent cols have "％"
+            def _pct(s: str) -> str:
+                s = s.replace("％", "%").strip()
+                return s if s and s != "%" else ""
+            try:
+                stats["win_rate"] = _pct(cells[9].get_text(strip=True))
+                stats["place_rate"] = _pct(cells[11].get_text(strip=True))
+                # 重賞勝利 = graded stakes wins, use as g1 proxy floor
+                stats["g1_wins"] = cells[8].get_text(strip=True) + "勝"
+            except Exception:
+                pass
+            break
 
     return stats
 
@@ -645,9 +697,89 @@ def fetch_trainer_stats(trainer_id: str) -> dict:
 # 5. Training times — race.netkeiba.com/oikiri
 # ═══════════════════════════════════════════════════════════
 
-def fetch_training_times(race_id: str) -> list[dict]:
+# ── Training critic text → ordinal score ─────────────
+# Ordinal mapping of the free Training_Critic text found on the oikiri
+# page. Longest phrases come first so more specific strings (e.g. "仕上がり
+# 抜群") win over shorter prefixes (e.g. "仕上がり"). Neutral default 0.50
+# applies when a non-empty text contains none of these phrases.
+
+TRAINING_CRITIC_ORDINAL: list[tuple[str, float]] = sorted([
+    # S-tier: peak condition
+    ("仕上がり抜群", 1.00),
+    ("絶好調", 1.00),
+    ("文句なし", 1.00),
+    ("万全", 1.00),
+    # A-tier: well-prepared
+    ("態勢は整った", 0.80),
+    ("好仕上がり", 0.80),
+    ("状態良好", 0.80),
+    ("態勢整う", 0.75),
+    ("順調", 0.75),
+    ("好調", 0.80),
+    # B+-tier: upward / satisfactory
+    ("状態上向き", 0.45),
+    ("上昇途上", 0.35),
+    ("まずまずの仕上がり", 0.60),
+    ("悪くない", 0.60),
+    ("まずまず", 0.60),
+    # B-tier: neutral
+    ("普通", 0.50),
+    ("平凡", 0.50),
+    ("及第点", 0.50),
+    # C-tier: concern
+    ("物足りない", 0.35),
+    ("今ひとつ", 0.35),
+    ("いまいち", 0.35),
+    # D-tier: worry
+    ("物足りず", 0.20),
+    ("状態に疑問", 0.20),
+    ("不安", 0.20),
+    # E-tier: bad
+    ("状態悪い", 0.10),
+    ("大幅減", 0.10),
+    ("太め", 0.15),
+], key=lambda kv: -len(kv[0]))  # longest-match-first
+
+
+def parse_training_critic(text: str) -> float:
+    """Map a free Training_Critic string to an ordinal score in [0.0, 1.0].
+
+    Empty text → 0.0 (no signal). Non-empty text with no phrase match → 0.50.
+    Matches are longest-first so "仕上がり抜群" does not get caught by an
+    earlier shorter rule.
     """
-    Fetch training (追い切り) times for all horses in a race.
+    if not text:
+        return 0.0
+    for phrase, score in TRAINING_CRITIC_ORDINAL:
+        if phrase in text:
+            return score
+    return 0.50
+
+
+def synthetic_training_acceleration(critic_score: float,
+                                    scale: float = 0.16) -> float:
+    """Convert a critic ordinal score to a synthetic training_acceleration.
+
+    score_runner expects training_acceleration in roughly [-0.15, +0.15].
+    With scale=0.16, critic=1.0 → +0.08, critic=0.0 → -0.08, critic=0.5 → 0.
+    We start intentionally weak (×0.16) — bump to 0.20 or 0.24 only if
+    the ranking-changed rate stays too flat under live evaluation.
+    """
+    if critic_score <= 0:
+        return 0.0
+    return (critic_score - 0.5) * scale
+
+
+def fetch_training_times(race_id: str) -> list[dict]:
+    """Fetch training (追い切り) text-only fields for all horses in a race.
+
+    Numeric lap times (一番時計, ハロン) are behind netkeiba's paid paywall
+    on the free /oikiri/ page — trying to extract them returns either
+    placeholder `--` marks or header junk. We deliberately do NOT parse
+    `lap` numerically here; instead we extract the text evaluation
+    (.Training_Critic cell) which is free, and later map it to a synthetic
+    ordinal acceleration via `parse_training_critic()`.
+
     Returns list of {name, course, lap, evaluation}.
     """
     url = f"https://race.netkeiba.com/race/oikiri.html?race_id={race_id}"
@@ -656,23 +788,21 @@ def fetch_training_times(race_id: str) -> list[dict]:
         return []
 
     results = []
-    for row in soup.select("tr.OikiriList_Row, tr[class*='HorseList']"):
-        cells = row.find_all("td")
-        if len(cells) < 4:
+    for row in soup.select("tr[class*='HorseList']"):
+        name_tag = row.select_one(".Horse_Name, .HorseName")
+        if not name_tag:
             continue
-        try:
-            name_tag = row.select_one(".HorseName, .Horse_Name")
-            name = name_tag.get_text(strip=True) if name_tag else cells[1].get_text(strip=True)
-            course_tag = row.select_one(".Course, .TrackCourse")
-            course = course_tag.get_text(strip=True) if course_tag else cells[2].get_text(strip=True)
-            time_tag = row.select_one(".Time, .OikiriTime")
-            lap = time_tag.get_text(strip=True) if time_tag else cells[3].get_text(strip=True)
-            eval_tag = row.select_one(".Hyouka, .Evaluation")
-            evaluation = eval_tag.get_text(strip=True) if eval_tag else ""
-            results.append({"name": name, "course": course, "lap": lap, "evaluation": evaluation})
-        except Exception:
+        name = _clean_text(name_tag.get_text(strip=True))
+        if not name:
             continue
-
+        critic_tag = row.select_one(".Training_Critic")
+        evaluation = _clean_text(critic_tag.get_text(strip=True)) if critic_tag else ""
+        results.append({
+            "name": name,
+            "course": "",       # paywalled
+            "lap": "",          # paywalled
+            "evaluation": evaluation,
+        })
     return results
 
 
@@ -912,58 +1042,169 @@ def fetch_entries_netkeiba(race_id: str, venue: str = "") -> list[dict]:
     return horses if horses else _mock_entries(race_id)
 
 
+def _cached_horse_detail(horse_id: str) -> dict:
+    cached = _cache_load("horse", horse_id)
+    if cached is not None:
+        return cached
+    detail = fetch_horse_detail(horse_id) or {}
+    if detail:
+        _cache_save("horse", horse_id, detail)
+    return detail
+
+
+def _cached_jockey_stats(jockey_id: str) -> dict:
+    cached = _cache_load("jockey", jockey_id)
+    if cached is not None:
+        return cached
+    jstats = fetch_jockey_stats(jockey_id) or {}
+    if jstats:
+        _cache_save("jockey", jockey_id, jstats)
+    return jstats
+
+
+def _cached_training_times(race_id: str) -> list:
+    cached = _cache_load("training", race_id)
+    if cached is not None:
+        return cached
+    times = fetch_training_times(race_id) or []
+    if times:
+        _cache_save("training", race_id, times)
+    return times
+
+
+def _cached_paddock_reports(race_id: str, horse_names: list, race_name: str = "") -> dict:
+    """Disk-cached per-race paddock report fetch."""
+    cached = _cache_load("paddock", race_id)
+    if cached is not None:
+        return cached
+    reports = fetch_paddock_reports(race_id, horse_names, race_name) or {}
+    if reports:
+        _cache_save("paddock", race_id, reports)
+    return reports
+
+
 def enrich_entries(horses: list[dict], race_id: str,
-                   progress_callback=None) -> list[dict]:
+                   progress_callback=None, race_name: str = "") -> list[dict]:
     """
     Fetch detailed public data for each horse:
       - Horse recent races + bloodline (db.netkeiba)
       - Jockey stats (db.netkeiba)
-      - Training times (netkeiba oikiri)
-    This is slow (~N*3 requests). Call separately from a "詳細取得" button.
+      - Training times — text critic only (lap numerics paywalled)
+      - Paddock reports (multi-source)
+
+    Resilient:
+      - Per-horse try/except so a single failure does not break the race
+      - Disk-cached per horse_id / jockey_id / race_id (see data/scraper_cache)
+      - Whole-race snapshot cached under enrich_race/<race_id>.json
+      - Success/failure counts saved under enrich_stats/<race_id>.json
     """
-    training_map = {t["name"]: t for t in fetch_training_times(race_id)}
+    # Fast path: full-race cache hit
+    cached_race = _cache_load("enrich_race", race_id)
+    if cached_race and len(cached_race) == len(horses):
+        return cached_race
+
+    training_map = {t["name"]: t for t in _cached_training_times(race_id)}
+
+    # Paddock reports — single race-level fetch, covers all horses in one call.
+    horse_names = [h.get("name", "") for h in horses]
+    paddock_map = _cached_paddock_reports(race_id, horse_names, race_name)
+
+    stats = {"total": len(horses), "ok": 0, "partial": 0, "failed": 0}
 
     for i, h in enumerate(horses):
         if progress_callback:
             progress_callback(i, len(horses), h["name"])
 
+        horse_ok = True
+        horse_errors = 0
+
         # Horse detail
         if h.get("horse_id"):
-            detail = fetch_horse_detail(h["horse_id"])
-            if detail:
-                races = detail.get("recent_races", [])
-                h["recent_form"] = " → ".join(
-                    f'{r["date"]} {r["race_name"]} {r["rank"]}着'
-                    for r in races[:3]
-                )
-                h["bloodline"] = f"父:{detail.get('sire','?')} 母:{detail.get('dam','?')}"
-                h["weight_trend"] = " ".join(detail.get("weight_trend", [])[:3])
+            try:
+                detail = _cached_horse_detail(h["horse_id"])
+                if detail:
+                    races = detail.get("recent_races", [])
+                    h["recent_form"] = " → ".join(
+                        f'{r["date"]} {r["race_name"]} {r["rank"]}着'
+                        for r in races[:3]
+                    )
+                    h["bloodline"] = f"父:{detail.get('sire','?')} 母:{detail.get('dam','?')}"
+                    h["weight_trend"] = " ".join(detail.get("weight_trend", [])[:3])
+                else:
+                    horse_errors += 1
+            except Exception as e:
+                horse_errors += 1
+                print(f"[enrich] horse_detail {h.get('name','?')}: {e}")
 
         # Jockey stats
         if h.get("jockey_id"):
-            jstats = fetch_jockey_stats(h["jockey_id"])
-            h["jockey_win_rate"] = jstats.get("win_rate", "")
-            h["jockey_g1_wins"] = jstats.get("g1_wins", "")
+            try:
+                jstats = _cached_jockey_stats(h["jockey_id"])
+                h["jockey_win_rate"] = jstats.get("win_rate", "")
+                h["jockey_g1_wins"] = jstats.get("g1_wins", "")
+                if not jstats:
+                    horse_errors += 1
+            except Exception as e:
+                horse_errors += 1
+                print(f"[enrich] jockey_stats {h.get('name','?')}: {e}")
 
-        # Training eval + physics analysis
-        train = training_map.get(h["name"], {})
-        if train:
-            lap_str = train.get("lap", "")
-            eval_str = train.get("evaluation", "")
-            h["training_eval"] = f"{train.get('course','')} {lap_str} {eval_str}"
-            # Physics analysis
-            h["training_physics"] = analyze_training_physics(lap_str)
-            # NLP score of evaluation text
-            h["training_nlp"] = parse_training_comment(eval_str)
+        # Training — text-only (numeric laps paywalled).
+        # Use the free Training_Critic text → ordinal score → synthetic
+        # training_acceleration. This lets score_runner's training term
+        # bite without modifying train.py.
+        try:
+            train = training_map.get(h["name"], {})
+            eval_str = train.get("evaluation", "") if train else ""
+            critic_score = parse_training_critic(eval_str)
+            h["training_eval"] = eval_str
+            h["training_critic_score"] = critic_score
+            synth_acc = synthetic_training_acceleration(critic_score)
+            h["training_physics"] = {
+                "final_split": 0.0,
+                "acceleration_rate": synth_acc,
+                "cardio_index": critic_score * 0.5,  # weak proxy
+            }
+            h["training_nlp"] = parse_training_comment(eval_str) if eval_str else {}
+            if not eval_str:
+                horse_errors += 1
+        except Exception as e:
+            horse_errors += 1
+            h.setdefault("training_physics", {"final_split": 0.0, "acceleration_rate": 0.0, "cardio_index": 0.0})
+            h.setdefault("training_nlp", {})
+            print(f"[enrich] training {h.get('name','?')}: {e}")
+
+        # Paddock — use the per-race fetch_paddock_reports results.
+        try:
+            report = paddock_map.get(h["name"], {}) if paddock_map else {}
+            paddock_text = report.get("text", "") or h.get("paddock_comment", "")
+            h["paddock_comment"] = paddock_text
+            scores = report.get("scores")
+            if not scores:
+                scores = parse_paddock_comment(paddock_text) if paddock_text else {}
+            h["paddock_scores"] = scores or {}
+            if not paddock_text:
+                horse_errors += 1
+        except Exception as e:
+            h["paddock_scores"] = {}
+            horse_errors += 1
+            print(f"[enrich] paddock {h.get('name','?')}: {e}")
+
+        if horse_ok and horse_errors == 0:
+            stats["ok"] += 1
+        elif horse_ok:
+            stats["partial"] += 1
         else:
-            h["training_physics"] = {"final_split": 0.0, "acceleration_rate": 0.0, "cardio_index": 0.0}
-            h["training_nlp"] = {}
+            stats["failed"] += 1
 
-        # Paddock NLP scores (from pre-filled training_eval text or evaluation field)
-        paddock_text = h.get("paddock_comment", "")
-        h["paddock_scores"] = parse_paddock_comment(paddock_text)
-
+    # Persist snapshot + stats so a crash still leaves partial progress on disk.
+    _cache_save("enrich_race", race_id, horses)
+    _cache_save("enrich_stats", race_id, stats)
     return horses
+
+
+def get_enrich_stats(race_id: str) -> Optional[dict]:
+    """Return the most recently saved enrichment stats for a race, or None."""
+    return _cache_load("enrich_stats", race_id)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1434,15 +1675,17 @@ def fetch_paddock_reports(race_id: str, horse_names: list, race_name: str = "") 
     if missing:
         _scrape_yahoo_news_paddock(race_name or race_id, missing, reports)
 
-    # 3. uma-jo.jp
-    missing = [n for n in horse_names if not reports.get(n, {}).get("text")]
-    if missing:
-        _scrape_umajo_paddock(race_id, missing, reports)
+    # 3. uma-jo.jp — DISABLED 2026-04: domain is dead (DNS failure).
+    #    Keeping the function defined for future re-enable; skipping the call
+    #    saves ~21s retry budget per race.
+    # missing = [n for n in horse_names if not reports.get(n, {}).get("text")]
+    # if missing:
+    #     _scrape_umajo_paddock(race_id, missing, reports)
 
-    # 4. keibago.com
-    missing = [n for n in horse_names if not reports.get(n, {}).get("text")]
-    if missing:
-        _scrape_keibago_paddock(race_id, missing, reports)
+    # 4. keibago.com — DISABLED 2026-04: domain is dead. Same rationale.
+    # missing = [n for n in horse_names if not reports.get(n, {}).get("text")]
+    # if missing:
+    #     _scrape_keibago_paddock(race_id, missing, reports)
 
     # 未取得馬は空エントリ
     for name in horse_names:
