@@ -49,12 +49,13 @@ DIVERSITY_MAX_ODDS_MULTIPLE = 6.0  # no horse in S may exceed 6x the favorite's 
 #   adjusted_i    = base_prob_i * multiplier_i
 #   win_prob_i    = adjusted_i / sum(adjusted_j)        (renormalized)
 
-DEFAULT_CALIBRATION_K = 1.5     # applied to edge source:
-                                # - structured_edge (from score_runner): typical
-                                #   range [-0.05, +0.25] → swing ~[-7%, +45%]
-                                # - composite_condition-0.5 fallback: range
-                                #   [-0.5, +0.5] → swing ~[-53%, +112%] (larger;
-                                #   only used when structured_edge unavailable)
+DEFAULT_CALIBRATION_K = 4.0     # bumped from 1.5 (2.67× amplification) to give
+                                # structured edge meaningful pull against market
+                                # anchor. With STRUCTURED_GAIN=2.0 in score_runner,
+                                # edge range is now [-0.10, +0.36] → multiplier
+                                # swing ~[-33%, +328%]. Paired with loose rule
+                                # (cons≥1, comp≥0.60, odds≤15) so outliers get
+                                # filtered at the bet-selection layer.
 
 DEFAULT_MARKET_OVERROUND = 1.20  # fallback if we can't derive from data
 

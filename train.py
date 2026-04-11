@@ -141,6 +141,12 @@ def score_runner(features: dict, context: dict) -> dict:
     W_IX_TB     = 0.02   # interaction 2
     # cond_track has its own internal weight (0.04 or 0.01)
 
+    # Structured-signal gain: raw adjustment max ≈ 0.18 is narrow relative to
+    # intra-race base gaps (median top1-top2 = 0.08), so structured terms rarely
+    # flip rankings. Doubling them brings max swing to ≈0.36 and lets structured
+    # influence ~10% of races without destabilizing the calibration layer.
+    STRUCTURED_GAIN = 2.0
+
     adjustment = (
         W_FIELD     * n_field
         + W_GRADE   * n_grade
@@ -154,7 +160,7 @@ def score_runner(features: dict, context: dict) -> dict:
         + cond_track
     )
 
-    final_prob = _clamp(base + adjustment, 0.02, 0.95)
+    final_prob = _clamp(base + STRUCTURED_GAIN * adjustment, 0.02, 0.95)
     return {"top_confidence": final_prob * 100.0}
 
 
