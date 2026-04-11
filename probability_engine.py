@@ -49,11 +49,12 @@ DIVERSITY_MAX_ODDS_MULTIPLE = 6.0  # no horse in S may exceed 6x the favorite's 
 #   adjusted_i    = base_prob_i * multiplier_i
 #   win_prob_i    = adjusted_i / sum(adjusted_j)        (renormalized)
 
-DEFAULT_CALIBRATION_K = 0.8     # max ±20% prob swing at max fact edge
-                                # exp(0.8 × 0.5) ≈ 1.49 (+49% mult)
-                                # exp(0.8 × -0.5) ≈ 0.67 (−33% mult)
-                                # For a typical edge of ±0.25, swing is ~±22%.
-                                # Bounded so odds dominate but facts can adjust.
+DEFAULT_CALIBRATION_K = 1.5     # applied to edge source:
+                                # - structured_edge (from score_runner): typical
+                                #   range [-0.05, +0.25] → swing ~[-7%, +45%]
+                                # - composite_condition-0.5 fallback: range
+                                #   [-0.5, +0.5] → swing ~[-53%, +112%] (larger;
+                                #   only used when structured_edge unavailable)
 
 DEFAULT_MARKET_OVERROUND = 1.20  # fallback if we can't derive from data
 
@@ -109,14 +110,23 @@ def assign_calibrated_probs(
         total_implied = 1.0
     base_probs = [i / total_implied for i in implied]
 
-    # Step 2 — fact edge per horse
-    # edge = composite_condition - 0.5  (neutral = 0)
-    # composite_condition already combines positive and negative consensed
-    # facts, so no need to add state-score penalties separately.
+    # Step 2 — fact edge per horse.
+    # PRIMARY source: structured_edge (score_runner's structured adjustment,
+    # computed by core_model_bridge.structured_edge_from_score). This
+    # routes the ORIGINAL normalized/nonlinear/interaction/conditional
+    # model directly into the probability layer without double-counting
+    # the odds base.
+    # FALLBACK: composite_condition - 0.5 (used by backtest harnesses
+    # that don't compute a structured edge).
     edges: list[float] = []
+    edge_source = "structured_edge"
     for h, _ in running:
-        comp = float(h.get("composite_condition", 0.5) or 0.5)
-        edges.append(comp - 0.5)
+        if "structured_edge" in h:
+            edges.append(float(h.get("structured_edge", 0) or 0))
+        else:
+            edge_source = "composite_condition"
+            comp = float(h.get("composite_condition", 0.5) or 0.5)
+            edges.append(comp - 0.5)
 
     # Step 3 — multiplicative adjustment
     multipliers = [math.exp(k * e) for e in edges]

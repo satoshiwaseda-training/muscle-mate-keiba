@@ -29,6 +29,7 @@ import fact_collectors as fc
 import fact_extractor as fe
 import fact_validator as fv
 import dual_mode_scoring as dm
+import core_model_bridge as bridge
 from train import score_runner
 from data_store import load_weights
 
@@ -259,8 +260,33 @@ def predict_live(
         venue=venue,
     )
     sf_horses = sf.get("horses") or {}
+
+    # ── CORE MODEL RECONNECTION ──
+    # feature_store reads raw shutuba entries, which lack jockey_win_rate,
+    # training_*, and paddock_*. Without this step, score_runner would
+    # see 5 of 9 structured signal channels as zero and collapse to
+    # essentially `(1/odds)/1.20 * 100`.
+    #
+    # The bridge fills those fields from:
+    #   - scraper disk cache for jockey stats (db.netkeiba → cached JSON)
+    #   - scraper oikiri page parse_training_critic for training signals
+    #   - per-horse fact category aggregation for paddock signals
+    bridge_diag = bridge.enrich_sf_horses_for_live(
+        sf_horses=sf_horses,
+        entries=entries_run,
+        race_id=race_id,
+        facts_by_horse=by_horse,
+    )
+    _log(
+        progress_cb,
+        f"bridge: jockey={bridge_diag['jockey_win_rate']} "
+        f"training={bridge_diag['training_critic']} "
+        f"paddock={bridge_diag['paddock_from_facts']} enriched",
+    )
+
     # Inject composite (minus negative-state penalty) into the bio
-    # pathway for horses without real paddock data.
+    # pathway as a FALLBACK for horses where the bridge couldn't fill
+    # paddock_* from facts (e.g. no per-horse fact coverage at all).
     #
     # Negative state scores (fatigue/stress/pain) subtract from the
     # composite BEFORE it's mapped into score_runner's [-1, 1] range,
@@ -340,23 +366,30 @@ def predict_live(
         }
         loose_flag, loose_reason = dm.trigger_loose_capped(loose_input)
 
-        # Tiebreaker: if score_runner returns near-identical scores (happens
-        # when odds=0 for all horses), add a tiny per-horse epsilon from
-        # jockey_win_rate. Only used by select_top3 / strict trigger logic,
-        # not by the calibrated win_prob calculation below.
+        # Tiebreaker for exactly-tied scores (rare after bridge reconnection).
         jwr = float(sf_horses[this_name].get("jockey_win_rate", 0) or 0)
         epsilon = jwr * 0.2
         final_score = decision["score"] + epsilon
 
+        # Recover score_runner's STRUCTURED adjustment (non-odds portion).
+        # This is the signal the calibrated probability layer consumes
+        # as the fact/model edge — NOT the raw score, which would double-
+        # count the odds base.
+        horse_odds = float(sf_horses[this_name].get("odds", 0) or 0)
+        struct_edge = bridge.structured_edge_from_score(
+            decision["odds_score"], horse_odds,
+        )
+
         # Enrich scored rows with the signals assign_calibrated_probs needs
         scored.append({
             "name": this_name,
-            "odds": sf_horses[this_name].get("odds", 0),
+            "odds": horse_odds,
             "score": final_score,
             "odds_score": decision["odds_score"],
             "fact_score": decision["fact_score"],
             "mode": decision["mode"],
-            # For market-anchored probability calculation
+            # Calibrated-prob inputs
+            "structured_edge": struct_edge,
             "composite_condition": composite,
             "consensus_count": consensus_count,
         })
@@ -440,6 +473,7 @@ def predict_live(
         "odds_status": odds_status,
         "calibration_warnings": calibration_issues,
         "calibration_k": pe.DEFAULT_CALIBRATION_K,
+        "bridge_diag": bridge_diag,
         "validation_dropped": len(drop_report),
         "scratched": sorted(scratched),
         "collection_log": [

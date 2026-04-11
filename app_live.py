@@ -345,6 +345,26 @@ elif batch and batch["results"]:
                 help=odds_st,
             )
 
+            # Core-model reconnection diagnostic
+            bridge_d = r.get("bridge_diag", {})
+            if bridge_d:
+                post = bridge_d.get("post_non_zero", {})
+                total = post.get("total_horses", 1) or 1
+                channels = [
+                    ("jockey_win_rate", "jockey"),
+                    ("training_acceleration", "training"),
+                    ("training_cardio_index", "cardio"),
+                    ("paddock_vascularity", "bio_v"),
+                    ("paddock_hindquarter", "bio_h"),
+                    ("paddock_gait", "bio_g"),
+                    ("horse_weight_delta", "weight"),
+                ]
+                channel_str = " · ".join(
+                    f"{label}={post.get(key, 0)}/{total}"
+                    for key, label in channels
+                )
+                st.caption(f"🔗 core-model channels: {channel_str}")
+
             # Collection-source badges
             src_badges = []
             for rec in r.get("collection_log", []):
@@ -404,7 +424,9 @@ elif batch and batch["results"]:
 
             # Full ranking with calibration breakdown
             if r.get("ranked"):
-                st.markdown("**📊 全頭ランキング (上位8) — 市場勝率 × ファクト調整**")
+                st.markdown(
+                    "**📊 全頭ランキング (上位8) — 市場 × 構造化モデル**"
+                )
                 fdf = pd.DataFrame([
                     {
                         "順位": i + 1,
@@ -414,23 +436,26 @@ elif batch and batch["results"]:
                             f"{h.get('base_market_prob', 0)*100:.1f}%"
                             if h.get("base_market_prob") is not None else "—"
                         ),
-                        "ファクト edge": (
-                            f"{h.get('fact_edge', 0):+.2f}"
-                            if h.get("fact_edge") is not None else "—"
+                        "構造化 edge": (
+                            f"{h.get('structured_edge', 0):+.3f}"
+                            if h.get("structured_edge") is not None else "—"
                         ),
                         "× multiplier": (
                             f"{h.get('fact_multiplier', 1.0):.2f}"
                             if h.get("fact_multiplier") is not None else "—"
                         ),
                         "最終勝率": f"{h.get('win_prob', 0)*100:.1f}%",
+                        "score_runner": f"{h.get('odds_score', 0):.1f}",
                         "mode": h.get("mode", "odds"),
                     }
                     for i, h in enumerate(r["ranked"][:8])
                 ])
                 st.dataframe(fdf, use_container_width=True, hide_index=True)
                 st.caption(
-                    f"calibrated by: base_prob × exp(k × fact_edge), "
-                    f"k = {r.get('calibration_k', 0.8):.1f}"
+                    f"構造化 edge = score_runner output − (1/odds)/1.20  "
+                    f"|  最終勝率 = 市場勝率 × exp(k × edge), k = "
+                    f"{r.get('calibration_k', 1.5):.1f}  |  "
+                    f"mode: fact-override = strict trigger fired"
                 )
 
     # ── Post-race: attach results button ──
