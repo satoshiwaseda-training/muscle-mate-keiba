@@ -908,6 +908,75 @@ def fetch_race_list_netkeiba(race_date: date) -> list[dict]:
 # 7. Race metadata — netkeiba shutuba
 # ═══════════════════════════════════════════════════════════
 
+def fetch_odds_netkeiba(race_id: str) -> dict:
+    """Fetch live 単勝 (win) odds from the dedicated odds page.
+
+    Used as a fallback when the shutuba page returns `--` for all odds
+    (common for upcoming races that haven't had odds published yet).
+
+    Returns {horse_name: odds_decimal}. Empty dict if unavailable.
+
+    URL pattern (as of 2026-04):
+      https://race.netkeiba.com/odds/index.html?race_id={id}&rf=race_submenu&type=b1
+      where type=b1 is 単勝.
+    """
+    url = (f"https://race.netkeiba.com/odds/index.html"
+           f"?race_id={race_id}&rf=race_submenu&type=b1")
+    soup = _get(url)
+    if soup is None:
+        return {}
+
+    out: dict[str, float] = {}
+
+    # Strategy 1: structured selectors (most reliable when page renders)
+    for row in soup.select("tr"):
+        name_tag = row.select_one(
+            ".HorseName a, .Horse_Name a, span.HorseName, a[href*='/horse/']"
+        )
+        if not name_tag:
+            continue
+        name = _clean_text(name_tag.get_text(strip=True))
+        if not name or len(name) < 2:
+            continue
+        # Find the odds cell in this row
+        odds_val = 0.0
+        for sel in ("span.Odds_Ninki", "td.Popular", "td.Odds",
+                    "td[class*='Odds']", "span[class*='Odds']"):
+            odds_tag = row.select_one(sel)
+            if not odds_tag:
+                continue
+            txt = odds_tag.get_text(strip=True).replace(",", "")
+            m = re.search(r"(\d+\.\d+)", txt)
+            if m:
+                try:
+                    v = float(m.group(1))
+                    if 1.0 < v < 10000.0:
+                        odds_val = v
+                        break
+                except ValueError:
+                    pass
+        if odds_val > 0 and name not in out:
+            out[name] = odds_val
+
+    # Strategy 2: regex scan on full page text if structured failed
+    if not out:
+        txt = soup.get_text(" ", strip=True)
+        # Pattern: horse name (3+ Japanese chars) + space + decimal odds
+        for m in re.finditer(
+            r"([\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]{3,}[\w・]{0,8})\s+(\d{1,3}\.\d)",
+            txt,
+        ):
+            name = m.group(1).strip()
+            try:
+                v = float(m.group(2))
+                if 1.0 < v < 10000.0 and name not in out:
+                    out[name] = v
+            except ValueError:
+                continue
+
+    return out
+
+
 def fetch_race_info_netkeiba(race_id: str) -> dict:
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     soup = _get(url)

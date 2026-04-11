@@ -52,6 +52,81 @@ def _is_today_or_recent(race_date: Optional[str], window_days: int = 1) -> bool:
     return abs((today - d).days) <= window_days
 
 
+def _parse_odds_safe(raw) -> float:
+    s = str(raw or "").strip().replace("---", "").replace("--", "").replace(",", "")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _inject_odds_if_missing(
+    entries: list[dict],
+    race_id: str,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> str:
+    """If ≥50% of entries have 0 odds, try to inject real odds.
+
+    Tries in order:
+      1. netkeiba result page (works for past races)
+      2. netkeiba live odds page (works for upcoming races)
+
+    Returns a status string used for UI display:
+      'ok'                              — no injection needed
+      'partial-kept'                    — few missing, probably scratches
+      'injected-from-result ({n})'      — result page filled n horses
+      'injected-from-live-odds ({n})'   — odds page filled n horses
+      'all-zero-no-source'              — both fallbacks failed
+    """
+    missing = [e for e in entries if _parse_odds_safe(e.get("odds", 0)) <= 0]
+    if not missing:
+        return "ok"
+    if len(missing) < len(entries) / 2:
+        # Probably just scratched horses showing `---` — leave alone
+        return f"partial-kept ({len(missing)})"
+
+    # Try result page first (past races)
+    _log(progress_cb, f"オッズ欠損検知 ({len(missing)}/{len(entries)}) — 結果ページから取得試行")
+    try:
+        result = scraper.fetch_result_netkeiba(race_id)
+        if result:
+            odds_map: dict[str, float] = {}
+            for h in result.get("finishing_order", []) or []:
+                nm = (h.get("name") or "").strip()
+                od = _parse_odds_safe(h.get("odds"))
+                if nm and od > 0 and nm not in odds_map:
+                    odds_map[nm] = od
+            if odds_map:
+                injected = 0
+                for e in entries:
+                    nm = (e.get("name") or "").strip()
+                    if _parse_odds_safe(e.get("odds", 0)) <= 0 and nm in odds_map:
+                        e["odds"] = str(odds_map[nm])
+                        injected += 1
+                if injected:
+                    return f"injected-from-result ({injected})"
+    except Exception as e:
+        _log(progress_cb, f"結果ページ取得失敗: {e}")
+
+    # Fallback: live odds page (upcoming races)
+    _log(progress_cb, "ライブオッズページから取得試行")
+    try:
+        live_odds = scraper.fetch_odds_netkeiba(race_id) or {}
+        if live_odds:
+            injected = 0
+            for e in entries:
+                nm = (e.get("name") or "").strip()
+                if _parse_odds_safe(e.get("odds", 0)) <= 0 and nm in live_odds:
+                    e["odds"] = str(live_odds[nm])
+                    injected += 1
+            if injected:
+                return f"injected-from-live-odds ({injected})"
+    except Exception as e:
+        _log(progress_cb, f"オッズページ取得失敗: {e}")
+
+    return f"all-zero-no-source ({len(missing)}/{len(entries)} missing)"
+
+
 # ── Main entry point ──────────────────────────────────
 
 def predict_live(
@@ -77,6 +152,10 @@ def predict_live(
     collection_log.append(jra)
 
     entries = scraper.fetch_entries_netkeiba(race_id, venue) or []
+    # Inject odds from result/live-odds page when shutuba shows 0/`---`.
+    # Without this, all horses would get score_runner's uniform 1/N base
+    # and the ranking would collapse to gate-number order.
+    odds_status = _inject_odds_if_missing(entries, race_id, progress_cb)
     horse_names = [(e.get("name") or "").strip() for e in entries if e.get("name")]
 
     # Scratches go out of the name list
@@ -261,10 +340,19 @@ def predict_live(
         }
         loose_flag, loose_reason = dm.trigger_loose_capped(loose_input)
 
+        # Tiebreaker: if score_runner returns near-identical scores (happens
+        # when odds=0 for all horses), add a tiny per-horse epsilon from
+        # jockey_win_rate so the ranking isn't frozen in gate-number order.
+        # Scale: max +0.05 points on a 2-95 score range. Cannot flip
+        # meaningful rank differences but breaks exact ties.
+        jwr = float(sf_horses[this_name].get("jockey_win_rate", 0) or 0)
+        epsilon = jwr * 0.2   # 0.20 → 0.04 pt boost for top jockey (25% win rate → 0.05)
+        final_score = decision["score"] + epsilon
+
         scored.append({
             "name": this_name,
             "odds": sf_horses[this_name].get("odds", 0),
-            "score": decision["score"],
+            "score": final_score,
             "odds_score": decision["odds_score"],
             "fact_score": decision["fact_score"],
             "mode": decision["mode"],
@@ -340,6 +428,7 @@ def predict_live(
         "loose_bet_summary": loose_bet_summary,
         "loose_rule_version": dm.LOOSE_RULE_VERSION,
         # Shared
+        "odds_status": odds_status,
         "validation_dropped": len(drop_report),
         "scratched": sorted(scratched),
         "collection_log": [

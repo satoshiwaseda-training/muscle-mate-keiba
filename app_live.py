@@ -214,6 +214,31 @@ elif batch and batch["results"]:
     b4.metric("🔥 Strict trigger", total_strict)
     b5.metric("所要時間", f"{batch['elapsed_s']:.0f}s")
 
+    # ── Odds-status health warning ──
+    # If a race had no odds on the shutuba page and injection failed,
+    # all horses end up with score_runner's uniform 1/N base and the
+    # ranking collapses to gate-number order. Surface this clearly.
+    odds_issues = [
+        r for r in ok_results
+        if str(r.get("odds_status", "ok")).startswith("all-zero")
+    ]
+    odds_recovered = [
+        r for r in ok_results
+        if str(r.get("odds_status", "ok")).startswith("injected")
+    ]
+    if odds_issues:
+        st.error(
+            f"⚠️ {len(odds_issues)} レースでオッズ情報が取得できませんでした。"
+            f"該当レースのランキングは **信頼できません** "
+            f"(全馬ほぼ同一スコア → 枠順で表示される可能性)。"
+            f"該当: {', '.join(r.get('race_name','?') for r in odds_issues[:5])}"
+        )
+    elif odds_recovered:
+        st.info(
+            f"ℹ️ {len(odds_recovered)} レースで shutuba ページにオッズが無かったため、"
+            f"結果ページ / ライブオッズページから自動補完しました。"
+        )
+
     # ── Consolidated LOOSE bets (the actionable table) ──
     st.markdown("### 🧪 本日の Loose Bet 候補（全レース統合）")
     st.caption(
@@ -290,10 +315,16 @@ elif batch and batch["results"]:
             f"({r.get('venue','?')}) — {badge}"
         ):
             # Top metrics
-            m1, m2, m3 = st.columns(3)
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric("P1 (winner ∈ Top3)", f"{r.get('p1',0)*100:.1f}%")
             m2.metric("P2 (1-2 ∈ Top3)", f"{r.get('p2',0)*100:.1f}%")
             m3.metric("取消・除外", len(r.get("scratched", [])))
+            odds_st = r.get("odds_status", "ok")
+            m4.metric(
+                "odds 状態",
+                "✅" if odds_st == "ok" else ("🔵" if "injected" in odds_st else "⚠"),
+                help=odds_st,
+            )
 
             # Collection-source badges
             src_badges = []
