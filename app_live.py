@@ -239,6 +239,25 @@ elif batch and batch["results"]:
             f"結果ページ / ライブオッズページから自動補完しました。"
         )
 
+    # ── Calibration warnings ──
+    # When the calibrated probability layer detects a suspiciously
+    # concentrated distribution (e.g. a 1.7-odds horse getting >85%),
+    # flag it. Under normal conditions with k=0.8 this should never fire.
+    cal_issues = [
+        (r, r.get("calibration_warnings", []))
+        for r in ok_results
+        if r.get("calibration_warnings")
+    ]
+    if cal_issues:
+        with st.expander(
+            f"⚠️ キャリブレーション警告 ({len(cal_issues)} レース)",
+            expanded=False,
+        ):
+            for r, warnings in cal_issues:
+                st.markdown(f"**{r.get('race_name','?')}**")
+                for w in warnings:
+                    st.caption(f"• {w}")
+
     # ── Consolidated LOOSE bets (the actionable table) ──
     st.markdown("### 🧪 本日の Loose Bet 候補（全レース統合）")
     st.caption(
@@ -383,20 +402,36 @@ elif batch and batch["results"]:
                 ])
                 st.dataframe(sel, use_container_width=True, hide_index=True)
 
-            # Full ranking (first 8)
+            # Full ranking with calibration breakdown
             if r.get("ranked"):
-                st.markdown("**📊 全頭ランキング (上位8)**")
+                st.markdown("**📊 全頭ランキング (上位8) — 市場勝率 × ファクト調整**")
                 fdf = pd.DataFrame([
                     {
                         "順位": i + 1,
                         "馬名": h["name"],
-                        "オッズ": f"{h['odds']:.1f}" if h["odds"] else "-",
-                        "勝率": f"{h['win_prob']*100:.1f}%",
+                        "オッズ": f"{h['odds']:.1f}" if h.get("odds") else "-",
+                        "市場勝率": (
+                            f"{h.get('base_market_prob', 0)*100:.1f}%"
+                            if h.get("base_market_prob") is not None else "—"
+                        ),
+                        "ファクト edge": (
+                            f"{h.get('fact_edge', 0):+.2f}"
+                            if h.get("fact_edge") is not None else "—"
+                        ),
+                        "× multiplier": (
+                            f"{h.get('fact_multiplier', 1.0):.2f}"
+                            if h.get("fact_multiplier") is not None else "—"
+                        ),
+                        "最終勝率": f"{h.get('win_prob', 0)*100:.1f}%",
                         "mode": h.get("mode", "odds"),
                     }
                     for i, h in enumerate(r["ranked"][:8])
                 ])
                 st.dataframe(fdf, use_container_width=True, hide_index=True)
+                st.caption(
+                    f"calibrated by: base_prob × exp(k × fact_edge), "
+                    f"k = {r.get('calibration_k', 0.8):.1f}"
+                )
 
     # ── Post-race: attach results button ──
     st.divider()

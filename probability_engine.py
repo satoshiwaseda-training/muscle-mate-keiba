@@ -26,16 +26,157 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 
-DEFAULT_TEMPERATURE = 5.0       # calibrated 2026-04 on 50-race enriched backtest
-                                # T=12 floored every horse at ~2% and triggered
-                                # longshot value bets; T=5 concentrates ~67% on
-                                # the top horse and floors longshots at ~0.2%,
-                                # removing the softmax-floor longshot bias.
+DEFAULT_TEMPERATURE = 5.0       # legacy: softmax-on-scores path (deprecated for live)
+                                # kept for backward compat with select_top3 / backtest
+                                # harnesses that use raw score_runner outputs
 DEFAULT_ALPHA = 0.5             # weight on P1 (winner in set)   -- tuned 2026-04
 DEFAULT_BETA = 0.5              # weight on P2 (top-2 pair in set) -- tuned 2026-04
 DEFAULT_EDGE_THRESHOLD = 0.02   # override edge (was 0.04)        -- relaxed 2026-04
 DEFAULT_COVERAGE_THRESHOLD = 0.5
 DIVERSITY_MAX_ODDS_MULTIPLE = 6.0  # no horse in S may exceed 6x the favorite's odds
+
+# ── Calibrated probability layer ─────────────────────
+# Market-anchored: market-implied prob is the BASE, fact edge is a
+# bounded multiplicative adjustment. This replaces softmax(score) for
+# live display since softmax on score_runner's 0-100 output with any
+# reasonable temperature produces 95%+ concentration on the top horse.
+#
+# Formula per horse i:
+#   implied_i     = 1 / odds_i
+#   base_prob_i   = implied_i / sum(implied_j)          (overround stripped)
+#   fact_edge_i   = composite_condition_i - 0.5         (in roughly [-0.5, +0.5])
+#   multiplier_i  = exp(CALIBRATION_K * fact_edge_i)
+#   adjusted_i    = base_prob_i * multiplier_i
+#   win_prob_i    = adjusted_i / sum(adjusted_j)        (renormalized)
+
+DEFAULT_CALIBRATION_K = 0.8     # max ±20% prob swing at max fact edge
+                                # exp(0.8 × 0.5) ≈ 1.49 (+49% mult)
+                                # exp(0.8 × -0.5) ≈ 0.67 (−33% mult)
+                                # For a typical edge of ±0.25, swing is ~±22%.
+                                # Bounded so odds dominate but facts can adjust.
+
+DEFAULT_MARKET_OVERROUND = 1.20  # fallback if we can't derive from data
+
+
+def assign_calibrated_probs(
+    scored: list[dict],
+    k: float = DEFAULT_CALIBRATION_K,
+) -> list[dict]:
+    """Market-anchored win probability calculation.
+
+    Input: `scored` list with at minimum `name`, `odds`, and optionally
+           `composite_condition` per horse.
+    Output: new list, sorted by win_prob descending, with added fields:
+              - base_market_prob   : overround-stripped implied prob
+              - fact_edge          : composite_condition - 0.5
+              - fact_multiplier    : exp(k × fact_edge)
+              - win_prob           : final calibrated probability
+
+    Horses with odds <= 1.0 (scratched or missing) get base_market_prob=0
+    and do not receive any fact adjustment.
+    """
+    if not scored:
+        return []
+
+    # Step 1 — implied probs from odds (overround-stripped)
+    running = []
+    non_running = []
+    for h in scored:
+        odds = float(h.get("odds", 0) or 0)
+        if odds > 1.0:
+            running.append((h, odds))
+        else:
+            non_running.append(h)
+
+    out: list[dict] = []
+
+    if not running:
+        # Degenerate: no valid odds — fall back to uniform across the field
+        n = max(len(scored), 1)
+        for h in scored:
+            out.append({
+                **h,
+                "base_market_prob": 1.0 / n,
+                "fact_edge": 0.0,
+                "fact_multiplier": 1.0,
+                "win_prob": 1.0 / n,
+            })
+        return out
+
+    implied = [1.0 / odds for _, odds in running]
+    total_implied = sum(implied)
+    if total_implied <= 0:
+        total_implied = 1.0
+    base_probs = [i / total_implied for i in implied]
+
+    # Step 2 — fact edge per horse
+    # edge = composite_condition - 0.5  (neutral = 0)
+    # composite_condition already combines positive and negative consensed
+    # facts, so no need to add state-score penalties separately.
+    edges: list[float] = []
+    for h, _ in running:
+        comp = float(h.get("composite_condition", 0.5) or 0.5)
+        edges.append(comp - 0.5)
+
+    # Step 3 — multiplicative adjustment
+    multipliers = [math.exp(k * e) for e in edges]
+    adjusted = [bp * m for bp, m in zip(base_probs, multipliers)]
+    total_adj = sum(adjusted) or 1.0
+    final = [a / total_adj for a in adjusted]
+
+    # Step 4 — assemble output for running horses
+    for (h, odds), base_p, edge, mult, win_p in zip(
+        running, base_probs, edges, multipliers, final
+    ):
+        out.append({
+            **h,
+            "base_market_prob": round(base_p, 4),
+            "fact_edge": round(edge, 4),
+            "fact_multiplier": round(mult, 4),
+            "win_prob": round(win_p, 4),
+        })
+
+    # Scratched / missing-odds horses — zero everything
+    for h in non_running:
+        out.append({
+            **h,
+            "base_market_prob": 0.0,
+            "fact_edge": 0.0,
+            "fact_multiplier": 1.0,
+            "win_prob": 0.0,
+        })
+
+    out.sort(key=lambda r: r["win_prob"], reverse=True)
+    return out
+
+
+def calibration_warnings(ranked: list[dict]) -> list[str]:
+    """Return a list of plain-Japanese warning strings when the
+    calibrated probabilities look suspicious.
+
+    Triggers:
+      - Any horse with odds ≥ 1.5 ending up with win_prob > 0.85
+      - In a full field (≥ 5 running), top horse > 0.90
+    """
+    warnings: list[str] = []
+    running = [r for r in ranked if r.get("odds", 0) > 1.0]
+    for r in running:
+        odds = float(r["odds"])
+        p = float(r.get("win_prob", 0))
+        if odds >= 1.5 and p > 0.85:
+            warnings.append(
+                f"{r['name']} (odds {odds:.1f}) → win_prob {p*100:.1f}% "
+                f"— オッズに対して高すぎる可能性"
+            )
+    if len(running) >= 5 and running:
+        top = max(running, key=lambda r: r.get("win_prob", 0))
+        top_p = float(top.get("win_prob", 0))
+        if top_p > 0.90:
+            warnings.append(
+                f"トップ {top['name']} が {top_p*100:.1f}% "
+                f"— フルフィールドで 90%+ は異常値の可能性"
+            )
+    return warnings
 
 CONFIG_FILE = Path(__file__).parent / "data" / "probability_config.json"
 

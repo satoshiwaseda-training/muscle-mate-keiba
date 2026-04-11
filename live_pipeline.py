@@ -342,13 +342,13 @@ def predict_live(
 
         # Tiebreaker: if score_runner returns near-identical scores (happens
         # when odds=0 for all horses), add a tiny per-horse epsilon from
-        # jockey_win_rate so the ranking isn't frozen in gate-number order.
-        # Scale: max +0.05 points on a 2-95 score range. Cannot flip
-        # meaningful rank differences but breaks exact ties.
+        # jockey_win_rate. Only used by select_top3 / strict trigger logic,
+        # not by the calibrated win_prob calculation below.
         jwr = float(sf_horses[this_name].get("jockey_win_rate", 0) or 0)
-        epsilon = jwr * 0.2   # 0.20 → 0.04 pt boost for top jockey (25% win rate → 0.05)
+        epsilon = jwr * 0.2
         final_score = decision["score"] + epsilon
 
+        # Enrich scored rows with the signals assign_calibrated_probs needs
         scored.append({
             "name": this_name,
             "odds": sf_horses[this_name].get("odds", 0),
@@ -356,6 +356,9 @@ def predict_live(
             "odds_score": decision["odds_score"],
             "fact_score": decision["fact_score"],
             "mode": decision["mode"],
+            # For market-anchored probability calculation
+            "composite_condition": composite,
+            "consensus_count": consensus_count,
         })
 
         # Track triggers explicitly
@@ -395,7 +398,13 @@ def predict_live(
             "pain_risk":       states.get("pain_risk", 0.0),
         })
 
-    ranked = pe.assign_win_probs(scored, temperature=pe.DEFAULT_TEMPERATURE)
+    # Market-anchored calibrated probability layer — replaces softmax(score)
+    # for live display. score_runner's output was producing 95%+ concentration
+    # on the top horse because a 35-point score gap under T=5 softmax collapses
+    # to winner-takes-all. The calibrated formula uses market_prob * exp(k*edge)
+    # with bounded k=0.8.
+    ranked = pe.assign_calibrated_probs(scored, k=pe.DEFAULT_CALIBRATION_K)
+    calibration_issues = pe.calibration_warnings(ranked)
     sel = pe.select_top3(ranked, alpha=pe.DEFAULT_ALPHA, beta=pe.DEFAULT_BETA)
 
     triggers = [t for t in trigger_info if t["trigger_flag"]]
@@ -429,6 +438,8 @@ def predict_live(
         "loose_rule_version": dm.LOOSE_RULE_VERSION,
         # Shared
         "odds_status": odds_status,
+        "calibration_warnings": calibration_issues,
+        "calibration_k": pe.DEFAULT_CALIBRATION_K,
         "validation_dropped": len(drop_report),
         "scratched": sorted(scratched),
         "collection_log": [
