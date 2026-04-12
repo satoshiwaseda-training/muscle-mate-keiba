@@ -1659,7 +1659,11 @@ def fetch_entries_netkeiba(race_id: str, venue: str = "") -> list[dict]:
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     soup = _get(url)
     if soup is None:
-        return _mock_entries(race_id)
+        # Desktop failed — try SP (smartphone) version before giving up
+        sp_url = f"https://race.sp.netkeiba.com/race/shutuba.html?race_id={race_id}"
+        soup = _get(sp_url)
+    if soup is None:
+        return []
 
     horses = []
     for row in soup.select("tr.HorseList"):
@@ -1772,7 +1776,7 @@ def fetch_entries_netkeiba(race_id: str, venue: str = "") -> list[dict]:
         except Exception:
             continue
 
-    return horses if horses else _mock_entries(race_id)
+    return horses
 
 
 def _cached_horse_detail(horse_id: str) -> dict:
@@ -2674,8 +2678,7 @@ def fetch_past_g_races(n_weeks: int = 4) -> list[dict]:
 
 
 def fetch_entries(race_id: str, venue: str = "") -> list[dict]:
-    entries = fetch_entries_netkeiba(race_id, venue)
-    return entries if entries else _mock_entries(race_id)
+    return fetch_entries_netkeiba(race_id, venue)
 
 
 def fetch_race_info(race_id: str) -> dict:
