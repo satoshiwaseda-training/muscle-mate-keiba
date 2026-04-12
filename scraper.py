@@ -824,10 +824,38 @@ def get_this_week_race_dates() -> tuple["date", "date"]:
     return saturday, sunday
 
 
-def fetch_race_list_netkeiba(race_date: date) -> list[dict]:
+def fetch_race_list_netkeiba(
+    race_date: date,
+    graded_only: bool = True,
+) -> list[dict]:
     """
-    race_list_sub.html (AJAXエンドポイント) から G1/G2/G3 を取得。
-    Icon_GradeType1=G1, Icon_GradeType2=G2, Icon_GradeType3=G3
+    race_list_sub.html (AJAX endpoint) からその日のレース一覧を取得。
+
+    Args:
+        race_date:   target date
+        graded_only: True (default) → G1/G2/G3 のみ返す。legacy contract
+                     preserved for fetch_past_g_races / fetch_this_week_races
+                     which are historical-graded analyses.
+                     False → その日の全 JRA レース (通常 30〜36 件) を返す。
+                     Used by the live weekend batch (fetch_race_list).
+
+    Bug history (fixed 2026-04-12):
+      1. Earlier revisions hard-skipped every race without an
+         Icon_GradeType1/2/3 class, which returned only 1 race on a
+         typical G1 Sunday (桜花賞) and 0 on most weekends. The filter
+         is now parameterised.
+      2. Earlier revisions computed venue_map by picking the FIRST
+         .RaceList_DataTitle found inside the single .RaceList_Box and
+         mapping every li.RaceList_DataItem in that box to it — so all
+         36 races got tagged with the first venue (e.g. all tagged 中山
+         even when actually at 阪神/福島). The fix pairs each
+         .RaceList_DataList with its own .RaceList_DataTitle by
+         document-order index, because the real DOM is:
+             DataList[0] (venue A)   Title[0] "N回 A X日目"
+             DataList[1] (venue B)   Title[1] "N回 B X日目"
+             DataList[2] (venue C)   Title[2] "N回 C X日目"
+         i.e. each title appears IMMEDIATELY AFTER the DataList it
+         describes, not before.
     """
     date_str = race_date.strftime("%Y%m%d")
     soup = _get(
@@ -837,15 +865,18 @@ def fetch_race_list_netkeiba(race_date: date) -> list[dict]:
     if soup is None:
         return []
 
-    # 会場名を先に収集: .RaceList_DataTitle の直後のリストが同会場
-    # 構造: RaceList_Box > RaceList_DataTitle + RaceList_DataList > li.RaceList_DataItem
+    # ── Venue mapping (fix #2) ────────────────────────────────
+    # Pair DataList[i] ↔ DataTitle[i] by document-order index.
     venue_map: dict[str, str] = {}
-    for box in soup.select(".RaceList_Box"):
-        venue_tag = box.select_one(".RaceList_DataTitle")
-        venue_text = venue_tag.get_text(strip=True) if venue_tag else ""
-        # 「2回中山4日目」→ 「中山」を抽出
-        venue_short = re.sub(r"\d+回|\d+日目", "", venue_text).strip()
-        for li in box.select("li.RaceList_DataItem"):
+    dls    = soup.find_all(class_="RaceList_DataList")
+    titles = soup.find_all(class_="RaceList_DataTitle")
+    for i, dl in enumerate(dls):
+        if i >= len(titles):
+            break
+        title_text = titles[i].get_text(strip=True)
+        # "3回中山6日目" → "中山"
+        venue_short = re.sub(r"\d+回|\d+日目", "", title_text).strip()
+        for li in dl.select("li.RaceList_DataItem"):
             a = li.select_one("a[href*='race_id']")
             if not a:
                 continue
@@ -855,7 +886,7 @@ def fetch_race_list_netkeiba(race_date: date) -> list[dict]:
 
     races = []
     for li in soup.select("li.RaceList_DataItem"):
-        # ── グレード判定 (Type1=G1, Type2=G2, Type3=G3) ────
+        # ── grade 判定 ────
         grade = ""
         for tag in li.select(".Icon_GradeType"):
             for cls in tag.get("class", []):
@@ -865,10 +896,11 @@ def fetch_race_list_netkeiba(race_date: date) -> list[dict]:
                     grade = "G2"
                 elif cls == "Icon_GradeType3":
                     grade = "G3"
-        if not grade:
+        # Fix #1: only skip non-graded races when explicitly asked to.
+        if graded_only and not grade:
             continue
 
-        # ── race_id ─────────────────────────────────────────
+        # ── race_id ────
         a = li.select_one("a[href*='race_id']")
         if not a:
             continue
@@ -877,20 +909,24 @@ def fetch_race_list_netkeiba(race_date: date) -> list[dict]:
             continue
         race_id = m.group(1)
 
-        # ── レース名 ────────────────────────────────────────
+        # ── レース名 ────
         name_tag = li.select_one(".ItemTitle")
         race_name = name_tag.get_text(strip=True) if name_tag else "不明"
 
-        # ── 発走時刻 ────────────────────────────────────────
+        # ── 発走時刻 ────
         time_tag = li.select_one(".RaceList_Itemtime")
         race_time = time_tag.get_text(strip=True) if time_tag else ""
 
-        # ── 会場 ────────────────────────────────────────────
+        # ── 会場 ────
         venue = venue_map.get(race_id, "")
+
+        # Append the grade suffix only when the race is actually graded;
+        # otherwise the display name is the raw class name ("3歳未勝利" etc).
+        display_name = f"{race_name} ({grade})" if grade else race_name
 
         races.append({
             "race_id": race_id,
-            "race_name": f"{race_name} ({grade})",
+            "race_name": display_name,
             "grade": grade,
             "venue": venue,
             "time": race_time,
@@ -2029,7 +2065,12 @@ def _scrape_keibago_paddock(race_id: str, horse_names: list, reports: dict):
 # ═══════════════════════════════════════════════════════════
 
 def fetch_race_list(race_date: date) -> list[dict]:
-    races = fetch_race_list_netkeiba(race_date)
+    """Return EVERY JRA race on `race_date` (typically 30-36 for a
+    normal weekend). Used by the live weekend batch and app_live's
+    one-button auto-analysis. Distinct from fetch_this_week_races
+    and fetch_past_g_races, which intentionally filter to graded races.
+    """
+    races = fetch_race_list_netkeiba(race_date, graded_only=False)
     if not races:
         races = fetch_race_list_jra(race_date)
     return races if races else []
