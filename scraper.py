@@ -1377,24 +1377,23 @@ def fetch_odds_from_yahoo(race_id: str) -> dict[int, float]:
 
 
 def fetch_odds_from_netkeiba_top(race_id: str, race_date: str = "") -> dict[int, float]:
-    """Scrape odds from the netkeiba race-list top page.
+    """Try multiple aggressive approaches to extract odds from netkeiba/JRA.
 
-    The top page race list sub-HTML (the same endpoint used by
-    fetch_race_list_netkeiba) sometimes includes abbreviated odds
-    info per race. For a specific race_id, we try the dedicated
-    shutuba page with pandas read_html as a different parsing strategy.
+    This is the last-resort function that tries everything including:
+    1. pandas read_html on shutuba/odds pages
+    2. SP odds page HTML
+    3. Raw HTML body regex scan for odds-like decimal numbers
+    4. JRA official website odds page
     """
+    result: dict[int, float] = {}
+
     # Strategy 1: pandas read_html on the shutuba page.
-    # pd.read_html extracts all <table> elements and can sometimes
-    # capture JS-rendered content that BeautifulSoup misses (when
-    # the content is in <noscript> or in a different table).
     try:
         import pandas as pd
         url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
         dfs = pd.read_html(url, header=0, encoding="euc-jp")
         for df in dfs:
             cols = [str(c) for c in df.columns]
-            # Find odds-like column
             odds_col = None
             num_col = None
             for c in cols:
@@ -1406,7 +1405,6 @@ def fetch_odds_from_netkeiba_top(race_id: str, race_date: str = "") -> dict[int,
             if odds_col is None:
                 continue
             if num_col is None:
-                # Try first column that looks like horse numbers
                 for c in cols:
                     try:
                         sample = df[c].dropna().iloc[0]
@@ -1417,7 +1415,6 @@ def fetch_odds_from_netkeiba_top(race_id: str, race_date: str = "") -> dict[int,
                         continue
             if num_col is None:
                 continue
-            result: dict[int, float] = {}
             for _, row in df.iterrows():
                 try:
                     um = int(row[num_col])
@@ -1431,12 +1428,11 @@ def fetch_odds_from_netkeiba_top(race_id: str, race_date: str = "") -> dict[int,
     except Exception:
         pass
 
-    # Strategy 2: try the SP odds page (different from SP shutuba)
+    # Strategy 2: SP odds page
     try:
         sp_url = f"https://race.sp.netkeiba.com/odds/index.html?race_id={race_id}&rf=race_submenu&type=b1"
         soup = _get(sp_url)
         if soup:
-            result = {}
             for span in soup.select('span[id^="odds-"]'):
                 text = re.sub(r"[^0-9.]", "", span.get_text(strip=True))
                 if not text:
@@ -1456,7 +1452,179 @@ def fetch_odds_from_netkeiba_top(race_id: str, race_date: str = "") -> dict[int,
     except Exception:
         pass
 
+    # Strategy 3: Aggressive raw HTML body scan on desktop shutuba page.
+    # Look for odds data embedded in ANY form: data attributes, inline JS,
+    # or even just numeric patterns near horse-number patterns.
+    try:
+        resp = requests.get(
+            f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}",
+            headers=HEADERS, timeout=15,
+        )
+        if resp.status_code == 200:
+            body = resp.text
+            # Look for inline JSON containing odds
+            for m in re.finditer(
+                r'"(\d{1,2})"\s*:\s*\[\s*"(\d+\.?\d*)"\s*,',
+                body,
+            ):
+                try:
+                    um = int(m.group(1).lstrip("0") or "0")
+                    v = float(m.group(2))
+                    if um > 0 and 1.0 < v < 10000.0:
+                        result[um] = v
+                except (ValueError, TypeError):
+                    continue
+            if result:
+                return result
+            # Look for data-odds attributes
+            for m in re.finditer(r'data-odds="(\d+\.?\d*)"', body):
+                # Find nearest horse number
+                pass  # data-odds approach incomplete without context
+    except Exception:
+        pass
+
+    # Strategy 4: JRA official odds page.
+    # JRA uses accessO.html with POST CNAME param.
+    # First get race links from JRA's thisweek page, then follow to odds.
+    try:
+        result = _fetch_jra_official_odds(race_id)
+        if result:
+            return result
+    except Exception:
+        pass
+
     return {}
+
+
+# ── JRA race_id <=> venue mapping ──
+# netkeiba race_id format: YYYYVVKKDDRRR (year, venue, kai, day, race)
+# JRA venue codes (2-digit):
+#   01=札幌 02=函館 03=福島 04=新潟 05=東京
+#   06=中山 07=中京 08=京都 09=阪神 10=小倉
+_NETKEIBA_VENUE_TO_JRA_NAME = {
+    "01": "札幌", "02": "函館", "03": "福島", "04": "新潟", "05": "東京",
+    "06": "中山", "07": "中京", "08": "京都", "09": "阪神", "10": "小倉",
+}
+
+
+def _fetch_jra_official_odds(race_id: str) -> dict[int, float]:
+    """Try to get odds from JRA's official website.
+
+    JRA serves odds via POST to /JRADB/accessO.html with an encoded CNAME
+    parameter. We find the CNAME by:
+    1. Fetching JRA's thisweek or race calendar page
+    2. Following links that match our race
+    3. Extracting the odds CNAME from the race detail page
+    4. POSTing to accessO.html and parsing the response table
+    """
+    # Parse race_id into components
+    if len(race_id) < 12:
+        return {}
+    year = race_id[:4]
+    venue_code = race_id[4:6]
+    kai = race_id[6:8]
+    day = race_id[8:10]
+    race_num = race_id[10:12]
+
+    venue_name = _NETKEIBA_VENUE_TO_JRA_NAME.get(venue_code, "")
+    venue_key = JRA_VENUE_CODES.get(venue_name, "")
+    if not venue_key:
+        return {}
+
+    # Try JRA's race-specific page to find odds links
+    # JRA race page pattern: /keiba/thisweek/{venue_key}/{kai}{day}/
+    base_urls = [
+        f"https://www.jra.go.jp/keiba/thisweek/{venue_key}/{kai}{day}/",
+        f"https://www.jra.go.jp/keiba/thisweek/{venue_key}/",
+    ]
+
+    for base_url in base_urls:
+        try:
+            resp = requests.get(base_url, headers=_JRA_HEADERS, timeout=10)
+            if resp.status_code != 200:
+                continue
+            soup = BeautifulSoup(resp.content, "html.parser")
+
+            # Find links to odds pages (accessO.html)
+            for link in soup.select("a"):
+                href = link.get("href", "")
+                onclick = link.get("onclick", "")
+                text = link.get_text(strip=True)
+
+                # Look for odds links in onclick handlers
+                # Pattern: doAction('/JRADB/accessO.html','cname=...')
+                cname_match = re.search(
+                    r"accessO\.html[^']*'[^']*cname=([^'\"&]+)",
+                    onclick + href,
+                )
+                if not cname_match:
+                    continue
+
+                cname = cname_match.group(1)
+                # Check if this link is for our race number
+                race_num_int = int(race_num)
+                if (
+                    f"R{race_num_int}" in text
+                    or f"{race_num_int}R" in text
+                    or f"第{race_num_int}レース" in text
+                    or str(race_num_int) in text
+                ):
+                    odds = _parse_jra_odds_page(cname)
+                    if odds:
+                        return odds
+        except Exception:
+            continue
+
+    return {}
+
+
+def _parse_jra_odds_page(cname: str) -> dict[int, float]:
+    """POST to JRA accessO.html and parse the odds table."""
+    url = "https://www.jra.go.jp/JRADB/accessO.html"
+    try:
+        resp = requests.post(
+            url,
+            data={"CNAME": cname},
+            headers={**_JRA_HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return {}
+    except Exception:
+        return {}
+
+    soup = BeautifulSoup(resp.content, "html.parser", from_encoding="euc-jp")
+    result: dict[int, float] = {}
+
+    # JRA odds tables typically have rows with 馬番 and odds values
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        for row in rows:
+            cells = row.find_all("td")
+            if len(cells) < 2:
+                continue
+            # Try to find a horse number + odds pair
+            for i, cell in enumerate(cells):
+                cell_text = cell.get_text(strip=True)
+                if not cell_text.isdigit():
+                    continue
+                um = int(cell_text)
+                if um < 1 or um > 30:
+                    continue
+                # Look for decimal odds in adjacent cells
+                for j in range(i + 1, min(i + 4, len(cells))):
+                    odds_text = cells[j].get_text(strip=True).replace(",", "")
+                    m = re.match(r"^(\d+\.?\d*)$", odds_text)
+                    if m:
+                        try:
+                            v = float(m.group(1))
+                            if 1.0 < v < 10000.0:
+                                result[um] = v
+                                break
+                        except ValueError:
+                            continue
+
+    return result
 
 
 def fetch_race_info_netkeiba(race_id: str) -> dict:
