@@ -827,17 +827,21 @@ def get_this_week_race_dates() -> tuple["date", "date"]:
 def fetch_race_list_netkeiba(
     race_date: date,
     graded_only: bool = True,
+    grades: tuple = ("G1", "G2", "G3"),
 ) -> list[dict]:
     """
     race_list_sub.html (AJAX endpoint) からその日のレース一覧を取得。
 
     Args:
         race_date:   target date
-        graded_only: True (default) → G1/G2/G3 のみ返す。legacy contract
-                     preserved for fetch_past_g_races / fetch_this_week_races
-                     which are historical-graded analyses.
-                     False → その日の全 JRA レース (通常 30〜36 件) を返す。
-                     Used by the live weekend batch (fetch_race_list).
+        graded_only: True (default) → only races whose Icon_GradeType
+                     matches one of `grades` are returned.
+                     False → all JRA races for the day (≈30-36).
+        grades:      Which grades to include when graded_only=True.
+                     Default ("G1","G2","G3") preserves the legacy
+                     contract of fetch_past_g_races /
+                     fetch_this_week_races. The live batch uses
+                     ("G1","G2") only (see LIVE_GRADE_FILTER).
 
     Bug history (fixed 2026-04-12):
       1. Earlier revisions hard-skipped every race without an
@@ -897,8 +901,11 @@ def fetch_race_list_netkeiba(
                 elif cls == "Icon_GradeType3":
                     grade = "G3"
         # Fix #1: only skip non-graded races when explicitly asked to.
-        if graded_only and not grade:
-            continue
+        # Also honour the `grades` tuple so callers can restrict to a
+        # subset (e.g. ("G1","G2") for the live weekend batch).
+        if graded_only:
+            if not grade or grade not in grades:
+                continue
 
         # ── race_id ────
         a = li.select_one("a[href*='race_id']")
@@ -2064,13 +2071,42 @@ def _scrape_keibago_paddock(race_id: str, horse_names: list, reports: dict):
 # Unified public API
 # ═══════════════════════════════════════════════════════════
 
+# ─────────────────────────────────────────────────────────────
+# LIVE_GRADE_FILTER — operational knob for the weekend batch.
+#
+# Current policy (2026-04-12): G1 + G2 only. Rationale:
+#   - The full card (36 races) takes ≈55 min to process with the
+#     current fact-collector stack, which exceeds the cron budget and
+#     leaves no headroom for retries.
+#   - G3 was the worst-performing grade in the 121-race audit
+#     (win% 20.0, ROI -38.8%) so deferring it costs no known value.
+#   - G1 was the only profitable tier (+19.6% ROI), G2 sits between.
+#
+# To include more grades later, widen the tuple. To process every race
+# (regardless of grade), set the constant to None.
+#
+#   ("G1",)              → G1 only (1-2 races/day)
+#   ("G1", "G2")         → CURRENT (2-5 races/day)
+#   ("G1", "G2", "G3")   → all graded races (5-10/day)
+#   None                 → all JRA races on the card (30-36/day)
+LIVE_GRADE_FILTER: tuple | None = ("G1", "G2")
+
+
 def fetch_race_list(race_date: date) -> list[dict]:
-    """Return EVERY JRA race on `race_date` (typically 30-36 for a
-    normal weekend). Used by the live weekend batch and app_live's
-    one-button auto-analysis. Distinct from fetch_this_week_races
-    and fetch_past_g_races, which intentionally filter to graded races.
+    """Return the races to process in the live weekend batch.
+
+    The grade filter is controlled by the LIVE_GRADE_FILTER module
+    constant. Currently G1+G2 only — see the constant's docstring for
+    the rationale and the instructions for widening.
     """
-    races = fetch_race_list_netkeiba(race_date, graded_only=False)
+    if LIVE_GRADE_FILTER is None:
+        races = fetch_race_list_netkeiba(race_date, graded_only=False)
+    else:
+        races = fetch_race_list_netkeiba(
+            race_date,
+            graded_only=True,
+            grades=LIVE_GRADE_FILTER,
+        )
     if not races:
         races = fetch_race_list_jra(race_date)
     return races if races else []
@@ -2078,11 +2114,16 @@ def fetch_race_list(race_date: date) -> list[dict]:
 
 def fetch_this_week_races() -> list[dict]:
     """
-    今週の土曜・日曜両日のG1/G2/G3レースをまとめて取得する。
+    今週の土曜・日曜両日の対象グレードレースをまとめて取得する。
+
+    Uses the same LIVE_GRADE_FILTER as fetch_race_list — currently
+    G1+G2 only. To include G3 or all races, widen LIVE_GRADE_FILTER.
     """
     saturday, sunday = get_this_week_race_dates()
     races = []
     for d in (saturday, sunday):
+        # fetch_race_list honours LIVE_GRADE_FILTER, so the grade
+        # restriction is applied here transparently.
         day_races = fetch_race_list(d)
         races.extend(day_races)
     return races
@@ -2090,8 +2131,13 @@ def fetch_this_week_races() -> list[dict]:
 
 def fetch_past_g_races(n_weeks: int = 4) -> list[dict]:
     """
-    直近N週分の終了済みG1/G2/G3レース一覧を取得する。
+    直近N週分の終了済み対象グレードレース一覧を取得する。
     土曜・日曜の両日を対象に、今日より前の開催分のみ返す。
+
+    Uses the same LIVE_GRADE_FILTER as fetch_race_list — currently
+    G1+G2 only. This keeps PDCA reflection data aligned with what
+    the live system actually predicts. To include G3 historical
+    data, widen LIVE_GRADE_FILTER.
 
     Returns:
         list of race dicts (race_id, race_name, grade, venue, race_date, ...)
@@ -2107,6 +2153,14 @@ def fetch_past_g_races(n_weeks: int = 4) -> list[dict]:
     races: list[dict] = []
     seen: set = set()
 
+    # Resolve the grade restriction once.
+    if LIVE_GRADE_FILTER is None:
+        graded_only = False
+        grades: tuple = ("G1", "G2", "G3")
+    else:
+        graded_only = True
+        grades = LIVE_GRADE_FILTER
+
     for w in range(n_weeks):
         for day_delta in (0, 1):  # 土=0, 日=1
             target = last_sat - _td(weeks=w) + _td(days=day_delta)
@@ -2114,7 +2168,11 @@ def fetch_past_g_races(n_weeks: int = 4) -> list[dict]:
             if target >= today:
                 continue
             try:
-                day_races = fetch_race_list_netkeiba(target)
+                day_races = fetch_race_list_netkeiba(
+                    target,
+                    graded_only=graded_only,
+                    grades=grades,
+                )
             except Exception:
                 day_races = []
             for r in day_races:

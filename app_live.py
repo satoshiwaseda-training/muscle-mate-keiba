@@ -32,12 +32,20 @@ from tools._autolog_utils import last_weekend
 
 
 st.set_page_config(
-    page_title="理論予想 Live — 本日の自動分析",
+    page_title="理論予想 Live — G1/G2 自動分析",
     page_icon="🎯",
     layout="wide",
 )
 
-st.title("🎯 理論予想 Live")
+# Keep this source-of-truth display in sync with scraper.LIVE_GRADE_FILTER.
+_filter = scraper.LIVE_GRADE_FILTER
+_filter_label = "ALL races" if _filter is None else " + ".join(_filter)
+
+st.title(f"🎯 理論予想 Live — {_filter_label}")
+st.caption(
+    f"対象: **{_filter_label} のみ** (scraper.LIVE_GRADE_FILTER). "
+    f"G3 / 非グレードレースは現在処理対象外。"
+)
 st.caption(
     "JRA + netkeiba + KeibaLab + Hochi + Sanspo + Daily (live) + oikiri "
     "editorial → fact merge → dual-mode scoring → LOOSE betting rule"
@@ -204,10 +212,11 @@ st.markdown("")
 
 # THE button
 run = st.button(
-    "🚀 本日のレースを自動分析",
+    f"🚀 本日の {_filter_label} を自動分析",
     type="primary",
     use_container_width=True,
-    help="レース一覧の取得から全レースの理論予想まで自動で実行します。",
+    help=f"レース一覧の取得から {_filter_label} の理論予想まで自動で実行します。"
+         f"G3 / 非グレードレースはスキップされます。",
 )
 
 # Keep analysis results in session state so the page stays responsive
@@ -229,7 +238,7 @@ def _run_auto_analysis(race_date_iso: str) -> dict:
             "races_found": 0,
             "results": [],
             "elapsed_s": round(time.time() - started_at, 1),
-            "error": "この日付のレースが見つかりませんでした。",
+            "error": f"この日付の {_filter_label} レースが見つかりませんでした。",
         }
 
     # 2. Run predict_live on every race sequentially
@@ -284,7 +293,10 @@ batch = st.session_state.auto_analysis
 if batch and batch.get("error"):
     st.warning(batch["error"])
 elif batch and batch["races_found"] == 0:
-    st.info("レースが見つかりませんでした。別の日付を試してください。")
+    st.info(
+        f"{_filter_label} レースが見つかりませんでした。"
+        f"G3 や平場レースは `scraper.LIVE_GRADE_FILTER` で意図的に除外しています。"
+    )
 elif batch and batch["results"]:
     results = batch["results"]
     ok_results = [r for r in results if not r.get("error")]
@@ -375,8 +387,8 @@ elif batch and batch["results"]:
         st.dataframe(pd.DataFrame(rows),
                      use_container_width=True, hide_index=True)
         st.caption(
-            "推奨再取得時刻になったら `🚀 本日のレースを自動分析` を再度押してください。"
-            "同じ race_id は上書きされますが、過去版は `history` に保全されます。"
+            f"推奨再取得時刻になったら `🚀 本日の {_filter_label} を自動分析` を再度押してください。"
+            f"同じ race_id は上書きされますが、過去版は `history` に保全されます。"
         )
     if odds_failed:
         st.error(
