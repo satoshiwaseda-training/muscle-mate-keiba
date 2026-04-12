@@ -183,6 +183,7 @@ def _inject_odds_if_missing(
 
     api_status = str(live.get("status") or "error")
     by_number = live.get("by_number") or {}
+    api_not_published = False
     if api_status == "result" and by_number:
         injected = 0
         for e in entries:
@@ -202,11 +203,13 @@ def _inject_odds_if_missing(
     elif api_status == "not-published":
         _log(
             progress_cb,
-            f"netkeiba オッズ API: まだ公開前 "
-            f"(status=middle, schema={meta['api_schema_version']})",
+            f"netkeiba オッズ API: 公式オッズ未公開 "
+            f"(status=middle, schema={meta['api_schema_version']}) "
+            f"— 前日オッズ / 暫定オッズを他ソースから取得試行",
         )
-        meta["odds_source"] = "api-not-published"
-        return "not-published-yet", meta
+        api_not_published = True
+        # Do NOT return here — fall through to try other sources
+        # that may have preliminary / previous-day odds.
 
     # Fallback: SP (smartphone) shutuba page — odds may be in the HTML
     # directly, unlike the desktop version which relies on JS.
@@ -275,6 +278,10 @@ def _inject_odds_if_missing(
     except Exception as e:
         _log(progress_cb, f"netkeiba alternative取得失敗: {e}")
 
+    # All fallbacks exhausted.
+    if api_not_published:
+        meta["odds_source"] = "api-not-published"
+        return "not-published-yet", meta
     meta["odds_source"] = "none"
     return f"all-zero-no-source ({len(missing)}/{len(entries)} missing)", meta
 
