@@ -214,7 +214,7 @@ st.markdown("")
 run = st.button(
     f"🚀 本日の {_filter_label} を自動分析",
     type="primary",
-    use_container_width=True,
+    width="stretch",
     help=f"レース一覧の取得から {_filter_label} の理論予想まで自動で実行します。"
          f"G3 / 非グレードレースはスキップされます。",
 )
@@ -385,7 +385,7 @@ elif batch and batch["results"]:
             f"ROI 集計からは分離されます (history に保全)。"
         )
         st.dataframe(pd.DataFrame(rows),
-                     use_container_width=True, hide_index=True)
+                     width="stretch", hide_index=True)
         st.caption(
             f"推奨再取得時刻になったら `🚀 本日の {_filter_label} を自動分析` を再度押してください。"
             f"同じ race_id は上書きされますが、過去版は `history` に保全されます。"
@@ -399,9 +399,27 @@ elif batch and batch["results"]:
             f"該当: {', '.join(r.get('race_name','?') for r in odds_failed[:5])}"
         )
     if odds_recovered and not odds_not_pub:
+        sources = set()
+        for r in odds_recovered:
+            s = str(r.get("odds_status", ""))
+            if "result" in s:
+                sources.add("結果ページ")
+            elif "live-odds" in s:
+                sources.add("ライブオッズAPI")
+            elif "sp-shutuba" in s:
+                sources.add("SP版出馬表")
+            elif "odds-page" in s:
+                sources.add("オッズページ")
+            elif "yahoo" in s:
+                sources.add("Yahoo Sports")
+            elif "netkeiba-alt" in s:
+                sources.add("netkeiba (代替)")
+            else:
+                sources.add("フォールバック")
+        src_str = " / ".join(sorted(sources)) or "フォールバック"
         st.info(
             f"ℹ️ {len(odds_recovered)} レースで shutuba ページにオッズが無かったため、"
-            f"ライブオッズAPI / 結果ページから自動補完しました。"
+            f"**{src_str}** から自動補完しました。"
         )
 
     # ── Calibration warnings ──
@@ -448,7 +466,7 @@ elif batch and batch["results"]:
             })
     if loose_rows:
         st.dataframe(pd.DataFrame(loose_rows),
-                     use_container_width=True, hide_index=True)
+                     width="stretch", hide_index=True)
         st.success(
             f"💰 **{total_loose}** horses across **{n_races_with_loose}** races "
             f"pass the loose rule. Expected cost: **{total_loose * 100:,}¥** "
@@ -477,7 +495,7 @@ elif batch and batch["results"]:
                 })
         if strict_rows:
             st.dataframe(pd.DataFrame(strict_rows),
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
 
     # ── Per-race drill-down ──
     st.markdown("### 📋 レース別詳細（クリックで展開）")
@@ -597,7 +615,7 @@ elif batch and batch["results"]:
                     }
                     for lb in r["loose_bets"]
                 ])
-                st.dataframe(ldf, use_container_width=True, hide_index=True)
+                st.dataframe(ldf, width="stretch", hide_index=True)
 
             # Strict triggers for this race
             if r.get("triggers"):
@@ -612,7 +630,7 @@ elif batch and batch["results"]:
                     }
                     for t in r["triggers"]
                 ])
-                st.dataframe(tdf, use_container_width=True, hide_index=True)
+                st.dataframe(tdf, width="stretch", hide_index=True)
 
             # Selected top-3
             if r.get("selected_top3"):
@@ -626,7 +644,7 @@ elif batch and batch["results"]:
                     }
                     for i, h in enumerate(r["selected_top3"])
                 ])
-                st.dataframe(sel, use_container_width=True, hide_index=True)
+                st.dataframe(sel, width="stretch", hide_index=True)
 
             # Full ranking with calibration breakdown
             if r.get("ranked"):
@@ -656,7 +674,7 @@ elif batch and batch["results"]:
                     }
                     for i, h in enumerate(r["ranked"][:8])
                 ])
-                st.dataframe(fdf, use_container_width=True, hide_index=True)
+                st.dataframe(fdf, width="stretch", hide_index=True)
                 st.caption(
                     f"構造化 edge = score_runner output − (1/odds)/1.20  "
                     f"|  最終勝率 = 市場勝率 × exp(k × edge), k = "
@@ -668,7 +686,7 @@ elif batch and batch["results"]:
     st.divider()
     st.markdown("### 📥 結果を取得して KPI を更新")
     st.caption("レース終了後に押してください。各レースの結果を一括取得します。")
-    if st.button("全レースの結果を取得", use_container_width=True):
+    if st.button("全レースの結果を取得", width="stretch"):
         updated = 0
         prog = st.progress(0.0)
         status = st.empty()
@@ -705,7 +723,7 @@ if loose_history:
     ]
     cols = [c for c in preferred if c in ldf.columns] + \
            [c for c in ldf.columns if c not in preferred]
-    st.dataframe(ldf[cols], use_container_width=True, hide_index=True)
+    st.dataframe(ldf[cols], width="stretch", hide_index=True)
 else:
     st.caption("まだ loose bet の記録がありません。")
 
@@ -713,7 +731,7 @@ with st.expander("📜 最近の Strict Trigger 履歴 (監査用)"):
     history = plog.recent_trigger_table(limit=20)
     if history:
         st.dataframe(pd.DataFrame(history),
-                     use_container_width=True, hide_index=True)
+                     width="stretch", hide_index=True)
     else:
         st.caption("まだ strict trigger の記録がありません。")
 

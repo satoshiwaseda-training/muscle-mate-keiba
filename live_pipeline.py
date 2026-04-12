@@ -71,6 +71,22 @@ def _parse_odds_safe(raw) -> float:
         return 0.0
 
 
+def _inject_from_umaban_map(entries: list[dict], odds_map: dict[int, float]) -> int:
+    """Inject odds from a {馬番: odds} dict into entries. Returns count."""
+    injected = 0
+    for e in entries:
+        if _parse_odds_safe(e.get("odds", 0)) > 0:
+            continue
+        try:
+            um = int(str(e.get("number", "")).strip() or 0)
+        except ValueError:
+            um = 0
+        if um in odds_map:
+            e["odds"] = str(odds_map[um])
+            injected += 1
+    return injected
+
+
 def _inject_odds_if_missing(
     entries: list[dict],
     race_id: str,
@@ -167,6 +183,7 @@ def _inject_odds_if_missing(
 
     api_status = str(live.get("status") or "error")
     by_number = live.get("by_number") or {}
+    api_not_published = False
     if api_status == "result" and by_number:
         injected = 0
         for e in entries:
@@ -186,12 +203,85 @@ def _inject_odds_if_missing(
     elif api_status == "not-published":
         _log(
             progress_cb,
-            f"netkeiba オッズ API: まだ公開前 "
-            f"(status=middle, schema={meta['api_schema_version']})",
+            f"netkeiba オッズ API: 公式オッズ未公開 "
+            f"(status=middle, schema={meta['api_schema_version']}) "
+            f"— 前日オッズ / 暫定オッズを他ソースから取得試行",
         )
+        api_not_published = True
+        # Do NOT return here — fall through to try other sources
+        # that may have preliminary / previous-day odds.
+
+    # Fallback: SP (smartphone) shutuba page — odds may be in the HTML
+    # directly, unlike the desktop version which relies on JS.
+    _log(progress_cb, "SP版出馬表からオッズ取得試行")
+    try:
+        sp_odds = scraper.fetch_odds_from_sp_shutuba(race_id)
+        if sp_odds:
+            injected = 0
+            for e in entries:
+                if _parse_odds_safe(e.get("odds", 0)) > 0:
+                    continue
+                nm = (e.get("name") or "").strip()
+                try:
+                    um = int(str(e.get("number", "")).strip() or 0)
+                except ValueError:
+                    um = 0
+                if um in sp_odds:
+                    e["odds"] = str(sp_odds[um])
+                    injected += 1
+                elif nm in sp_odds:
+                    e["odds"] = str(sp_odds[nm])
+                    injected += 1
+            if injected:
+                meta["odds_source"] = "sp-shutuba"
+                meta["injected_count"] = injected
+                return f"injected-from-sp-shutuba ({injected})", meta
+    except Exception as e:
+        _log(progress_cb, f"SP版出馬表取得失敗: {e}")
+
+    # Fallback: netkeiba odds HTML page — parse inline <script> data
+    _log(progress_cb, "netkeiba オッズページ (inline script) から取得試行")
+    try:
+        page_odds = scraper.fetch_odds_from_odds_page(race_id)
+        if page_odds:
+            injected = _inject_from_umaban_map(entries, page_odds)
+            if injected:
+                meta["odds_source"] = "odds-page-script"
+                meta["injected_count"] = injected
+                return f"injected-from-odds-page ({injected})", meta
+    except Exception as e:
+        _log(progress_cb, f"オッズページ取得失敗: {e}")
+
+    # Fallback: Yahoo Sports Keiba — independent source
+    _log(progress_cb, "Yahoo Sports Keiba からオッズ取得試行")
+    try:
+        yahoo_odds = scraper.fetch_odds_from_yahoo(race_id)
+        if yahoo_odds:
+            injected = _inject_from_umaban_map(entries, yahoo_odds)
+            if injected:
+                meta["odds_source"] = "yahoo-keiba"
+                meta["injected_count"] = injected
+                return f"injected-from-yahoo ({injected})", meta
+    except Exception as e:
+        _log(progress_cb, f"Yahoo Keiba取得失敗: {e}")
+
+    # Fallback: pandas read_html / SP odds page
+    _log(progress_cb, "netkeiba (pd.read_html / SP odds) から取得試行")
+    try:
+        top_odds = scraper.fetch_odds_from_netkeiba_top(race_id)
+        if top_odds:
+            injected = _inject_from_umaban_map(entries, top_odds)
+            if injected:
+                meta["odds_source"] = "netkeiba-top-pandas"
+                meta["injected_count"] = injected
+                return f"injected-from-netkeiba-alt ({injected})", meta
+    except Exception as e:
+        _log(progress_cb, f"netkeiba alternative取得失敗: {e}")
+
+    # All fallbacks exhausted.
+    if api_not_published:
         meta["odds_source"] = "api-not-published"
         return "not-published-yet", meta
-
     meta["odds_source"] = "none"
     return f"all-zero-no-source ({len(missing)}/{len(entries)} missing)", meta
 
