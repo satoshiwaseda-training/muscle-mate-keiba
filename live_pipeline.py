@@ -36,6 +36,16 @@ from data_store import load_weights
 import prediction_log
 
 
+# Monotonic version tag that MUST be bumped whenever any of these change:
+#   - score_runner coefficients in train.py
+#   - DEFAULT_CALIBRATION_K in probability_engine.py
+#   - the composition of features passed to score_runner
+#   - the loose-rule definition in dual_mode_scoring.py
+# Persisted with every prediction so a later audit can diff predictions
+# that were produced under different model states.
+DATA_SOURCE_VERSION = "live-v1.2-scale-fix-2026-04"
+
+
 def _log(cb: Optional[Callable[[str], None]], msg: str) -> None:
     if cb:
         cb(msg)
@@ -65,26 +75,47 @@ def _inject_odds_if_missing(
     entries: list[dict],
     race_id: str,
     progress_cb: Optional[Callable[[str], None]] = None,
-) -> str:
+) -> tuple[str, dict]:
     """If ≥50% of entries have 0 odds, try to inject real odds.
 
-    Tries in order:
-      1. netkeiba result page (works for past races)
-      2. netkeiba live odds page (works for upcoming races)
+    Returns (status_str, meta_dict).
 
-    Returns a status string used for UI display:
+    status_str values:
       'ok'                              — no injection needed
-      'partial-kept'                    — few missing, probably scratches
+      'partial-kept ({n})'              — few missing, probably scratches
       'injected-from-result ({n})'      — result page filled n horses
-      'injected-from-live-odds ({n})'   — odds page filled n horses
-      'all-zero-no-source'              — both fallbacks failed
+      'injected-from-live-odds ({n})'   — odds API filled n horses
+      'not-published-yet'               — netkeiba returned status:middle
+                                          (race too early; not a bug)
+      'all-zero-no-source ({n}/{m})'    — true fetch failure
+
+    meta_dict carries the defensive fields from scraper.fetch_odds_netkeiba
+    (http_status, response_url, raw_reason, parse_error,
+     schema_version_guess, fetched_at, update_count, official_time) so the
+    caller can persist them on the prediction record for audit. The dict
+    is always returned with the same keys — missing values are None.
     """
+    meta: dict = {
+        "odds_source":           None,
+        "api_http_status":       None,
+        "api_response_url":      None,
+        "api_raw_reason":        None,
+        "api_parse_error":       None,
+        "api_schema_version":    None,
+        "api_fetched_at":        None,
+        "api_update_count":      None,
+        "api_official_time":     None,
+        "injected_count":        0,
+    }
+
     missing = [e for e in entries if _parse_odds_safe(e.get("odds", 0)) <= 0]
     if not missing:
-        return "ok"
+        meta["odds_source"] = "shutuba"
+        return "ok", meta
     if len(missing) < len(entries) / 2:
         # Probably just scratched horses showing `---` — leave alone
-        return f"partial-kept ({len(missing)})"
+        meta["odds_source"] = "shutuba-partial"
+        return f"partial-kept ({len(missing)})", meta
 
     # Try result page first (past races)
     _log(progress_cb, f"オッズ欠損検知 ({len(missing)}/{len(entries)}) — 結果ページから取得試行")
@@ -105,27 +136,64 @@ def _inject_odds_if_missing(
                         e["odds"] = str(odds_map[nm])
                         injected += 1
                 if injected:
-                    return f"injected-from-result ({injected})"
+                    meta["odds_source"] = "result-page"
+                    meta["injected_count"] = injected
+                    return f"injected-from-result ({injected})", meta
     except Exception as e:
         _log(progress_cb, f"結果ページ取得失敗: {e}")
 
-    # Fallback: live odds page (upcoming races)
-    _log(progress_cb, "ライブオッズページから取得試行")
+    # Fallback: live odds JSON API (upcoming races).
+    # Joins by 馬番 (stable key) rather than name.
+    _log(progress_cb, "ライブオッズAPI から取得試行")
+    live: dict = {}
     try:
-        live_odds = scraper.fetch_odds_netkeiba(race_id) or {}
-        if live_odds:
-            injected = 0
-            for e in entries:
-                nm = (e.get("name") or "").strip()
-                if _parse_odds_safe(e.get("odds", 0)) <= 0 and nm in live_odds:
-                    e["odds"] = str(live_odds[nm])
-                    injected += 1
-            if injected:
-                return f"injected-from-live-odds ({injected})"
+        live = scraper.fetch_odds_netkeiba(race_id) or {}
     except Exception as e:
-        _log(progress_cb, f"オッズページ取得失敗: {e}")
+        _log(progress_cb, f"オッズAPI取得失敗: {e}")
+        meta["api_raw_reason"] = f"exception: {e.__class__.__name__}: {e}"
 
-    return f"all-zero-no-source ({len(missing)}/{len(entries)} missing)"
+    # Always populate meta from whatever we got back so an audit trail
+    # exists even when the call returned "not-published".
+    meta.update({
+        "api_http_status":    live.get("http_status"),
+        "api_response_url":   live.get("response_url"),
+        "api_raw_reason":     live.get("raw_reason") or meta["api_raw_reason"],
+        "api_parse_error":    live.get("parse_error"),
+        "api_schema_version": live.get("schema_version_guess"),
+        "api_fetched_at":     live.get("fetched_at"),
+        "api_update_count":   live.get("update_count"),
+        "api_official_time":  live.get("official_time"),
+    })
+
+    api_status = str(live.get("status") or "error")
+    by_number = live.get("by_number") or {}
+    if api_status == "result" and by_number:
+        injected = 0
+        for e in entries:
+            if _parse_odds_safe(e.get("odds", 0)) > 0:
+                continue
+            try:
+                um = int(str(e.get("number", "")).strip() or 0)
+            except ValueError:
+                um = 0
+            if um in by_number:
+                e["odds"] = str(by_number[um])
+                injected += 1
+        if injected:
+            meta["odds_source"] = "live-odds-api"
+            meta["injected_count"] = injected
+            return f"injected-from-live-odds ({injected})", meta
+    elif api_status == "not-published":
+        _log(
+            progress_cb,
+            f"netkeiba オッズ API: まだ公開前 "
+            f"(status=middle, schema={meta['api_schema_version']})",
+        )
+        meta["odds_source"] = "api-not-published"
+        return "not-published-yet", meta
+
+    meta["odds_source"] = "none"
+    return f"all-zero-no-source ({len(missing)}/{len(entries)} missing)", meta
 
 
 # ── Main entry point ──────────────────────────────────
@@ -156,7 +224,7 @@ def predict_live(
     # Inject odds from result/live-odds page when shutuba shows 0/`---`.
     # Without this, all horses would get score_runner's uniform 1/N base
     # and the ranking would collapse to gate-number order.
-    odds_status = _inject_odds_if_missing(entries, race_id, progress_cb)
+    odds_status, odds_meta = _inject_odds_if_missing(entries, race_id, progress_cb)
     horse_names = [(e.get("name") or "").strip() for e in entries if e.get("name")]
 
     # Scratches go out of the name list
@@ -449,6 +517,20 @@ def predict_live(
         for t in loose_bets
     ]
 
+    # ── Prediction stage decision ──
+    # "final" = we have trustworthy odds (scraped OK, partially kept,
+    #           or successfully injected from result / live-odds API).
+    # "early" = we do NOT have trustworthy odds (pre-publication or
+    #           genuine fetch failure). These predictions exist so the
+    #           fact layer + gate/field signals can still be reviewed
+    #           BUT must never be mixed with final predictions in ROI
+    #           aggregation — see weekly_report.by_stage.
+    if odds_status.startswith(("ok", "partial-kept", "injected")):
+        prediction_stage = "final"
+    else:
+        prediction_stage = "early"
+
+    created_at = datetime.now().isoformat(timespec="seconds")
     result = {
         "race_id": race_id,
         "race_name": race_name,
@@ -484,7 +566,23 @@ def predict_live(
             rec["source"]: len(rec.get("facts", []))
             for rec in collection_log
         },
-        "created_at": datetime.now().isoformat(),
+        # ── Audit metadata (ADDED 2026-04 for history preservation) ──
+        # These fields define what version of the system produced this
+        # prediction and what state the odds were in at that moment.
+        # store_prediction() uses them to snapshot into the history list.
+        "data_source_version":         DATA_SOURCE_VERSION,
+        "prediction_stage":            prediction_stage,
+        "prediction_created_at":       created_at,
+        "odds_status_at_prediction":   odds_status,
+        "odds_updated_at":             (
+            odds_meta.get("api_fetched_at")
+            if prediction_stage == "final" and
+               odds_meta.get("odds_source") == "live-odds-api"
+            else None
+        ),
+        "odds_api_meta":               odds_meta,
+        # Legacy alias retained for backward compat with KPI consumers
+        "created_at": created_at,
     }
 
     if auto_log:

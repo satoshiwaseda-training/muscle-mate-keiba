@@ -10,6 +10,7 @@ and payouts. KPIs are computed on demand.
 from __future__ import annotations
 
 import json
+import os
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -29,27 +30,132 @@ def _load() -> dict:
 
 
 def _save(data: dict) -> None:
+    """Atomically persist the prediction log.
+
+    Writes to a sibling `.tmp` file first, fsyncs it, then uses
+    `os.replace` to swap it into place. `os.replace` is atomic on both
+    POSIX and Windows (Python 3.3+), so readers either see the previous
+    complete file or the new complete file — never a truncated one.
+
+    This matters because store_prediction is called inside a per-race
+    loop that may be killed (Task Scheduler timeout, Ctrl-C, power loss).
+    Without atomic write, a kill mid-save would leave the file as the
+    partially-written new bytes and every subsequent run would fail to
+    decode it — losing the whole week of logs.
+    """
     LIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    LIVE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2),
-                         encoding="utf-8")
+    tmp_path = LIVE_FILE.with_name(LIVE_FILE.name + ".tmp")
+    # Serialize first so a JSON encoding error doesn't even touch disk
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    # Write + fsync so the bytes actually reach the platter/SSD before
+    # we rename. On Windows this is also honoured by os.fsync.
+    with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(payload)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except (OSError, AttributeError):
+            pass  # some filesystems (network, OneDrive) don't support fsync
+    os.replace(tmp_path, LIVE_FILE)
 
 
 # ── Public API ────────────────────────────────────────
 
+_HISTORY_CAP = 20
+
+
+def _snapshot_of(entry: dict) -> dict:
+    """Compact snapshot of a prior prediction for audit history.
+
+    Intentionally lightweight so the live_predictions.json file does
+    not blow up when a race is re-predicted many times during the day
+    (e.g. 09:00 early → 11:00 early → 13:30 final, plus recovery runs).
+    Everything here must be interpretable on its own without needing
+    to look up a separate file.
+    """
+    ranked = entry.get("ranked") or []
+    loose = entry.get("loose_bets") or []
+    return {
+        "snapshot_at":               entry.get("snapshot_at"),
+        "prediction_created_at":     entry.get("prediction_created_at"),
+        "prediction_stage":          entry.get("prediction_stage"),
+        "odds_status":               entry.get("odds_status"),
+        "odds_status_at_prediction": entry.get("odds_status_at_prediction"),
+        "odds_updated_at":           entry.get("odds_updated_at"),
+        "data_source_version":       entry.get("data_source_version"),
+        "calibration_k":             entry.get("calibration_k"),
+        # Top-5 ranking digest — enough to diff two versions without
+        # carrying 18-horse payloads per snapshot
+        "top5": [
+            {
+                "name":     r.get("name"),
+                "odds":     r.get("odds"),
+                "win_prob": r.get("win_prob"),
+                "fact_edge": r.get("fact_edge"),
+            }
+            for r in ranked[:5]
+        ],
+        "loose_bet_names": [b.get("name") for b in loose],
+        "loose_bet_count": len(loose),
+        "triggers_count":  len(entry.get("triggers") or []),
+        "odds_api_meta":   entry.get("odds_api_meta"),
+    }
+
+
 def store_prediction(prediction: dict) -> None:
-    """Persist a prediction keyed by race_id. Does not overwrite the
-    `result` block if one is already attached (so re-running prediction
-    after result is known doesn't drop the ground truth)."""
+    """Persist a prediction keyed by race_id.
+
+    History preservation (ADDED 2026-04):
+      - `first_predicted_at` is copied from the earliest save and
+        never overwritten, so audits can tell when the race was first
+        analysed regardless of how many re-runs happened afterwards.
+      - A compact snapshot of the PREVIOUS version is appended to
+        `history` before overwriting. This means the first re-run
+        after initial save produces history=[initial_snapshot], the
+        second produces history=[initial, first-rerun], etc.
+      - `history` is capped at `_HISTORY_CAP` entries (oldest dropped).
+      - Cross-run invariants: `result` (ground truth), `first_predicted_at`,
+        and `history` are NEVER dropped by a re-save of the same race_id.
+    """
     if not prediction or "race_id" not in prediction:
         return
     data = _load()
     rid = prediction["race_id"]
-    existing_result = data.get(rid, {}).get("result")
+    existing = data.get(rid) or {}
+    existing_result = existing.get("result")
+
     entry = dict(prediction)
+
+    # Preserve the earliest timestamp across re-runs
+    first_seen = existing.get("first_predicted_at") or entry.get("prediction_created_at")
+    if first_seen:
+        entry["first_predicted_at"] = first_seen
+
+    # Snapshot the previous version into history BEFORE we overwrite.
+    history = list(existing.get("history") or [])
+    if existing.get("prediction_created_at") or existing.get("created_at"):
+        # Make sure the existing entry has a snapshot_at for clarity
+        if "snapshot_at" not in existing:
+            existing["snapshot_at"] = (
+                existing.get("prediction_created_at")
+                or existing.get("created_at")
+            )
+        history.append(_snapshot_of(existing))
+        if len(history) > _HISTORY_CAP:
+            history = history[-_HISTORY_CAP:]
+    entry["history"] = history
+
+    # `snapshot_at` marks when THIS record was saved (distinct from
+    # prediction_created_at which marks when it was computed — typically
+    # the same but we keep the distinction for future async workflows).
+    entry["snapshot_at"] = datetime.now().isoformat(timespec="seconds")
+
+    # Never drop an attached result on re-save
     if existing_result:
         entry["result"] = existing_result
     else:
         entry.setdefault("result", None)
+
     data[rid] = entry
     _save(data)
 

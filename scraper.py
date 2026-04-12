@@ -909,72 +909,206 @@ def fetch_race_list_netkeiba(race_date: date) -> list[dict]:
 # ═══════════════════════════════════════════════════════════
 
 def fetch_odds_netkeiba(race_id: str) -> dict:
-    """Fetch live 単勝 (win) odds from the dedicated odds page.
+    """Fetch 単勝 (win) odds from netkeiba's JSON API.
 
-    Used as a fallback when the shutuba page returns `--` for all odds
-    (common for upcoming races that haven't had odds published yet).
+    The HTML odds page (`/odds/index.html?...`) is a JavaScript SPA and
+    its raw HTML only contains `---.-` placeholders. The real odds are
+    served by an XHR endpoint that netkeiba itself uses to populate the
+    page:
 
-    Returns {horse_name: odds_decimal}. Empty dict if unavailable.
+      GET https://race.netkeiba.com/api/api_get_jra_odds.html
+          ?type=1&locale=ja&race_id={race_id}
 
-    URL pattern (as of 2026-04):
-      https://race.netkeiba.com/odds/index.html?race_id={id}&rf=race_submenu&type=b1
-      where type=b1 is 単勝.
+    Response shape (confirmed against past and current races, 2026-04):
+      {
+        "status": "result" | "middle" | ...,
+        "update_count": "<int>",
+        "reason": "",
+        "data": {
+          "official_datetime": "2026-04-05 15:48:34",
+          "odds": {
+            "1": {                       # type 1 = 単勝
+              "01": ["336.7", "", "15"], # 馬番 → [単勝odds, blank, popularity]
+              ...
+            },
+            "2": { ... }                 # type 2 = 複勝 (not used here)
+          }
+        }
+      }
+
+    Status semantics:
+      - "result" : odds are available (current or past race)
+      - "middle" : netkeiba has not yet published odds for this race
+                   (normal for races >3h before post time); caller must
+                   distinguish this from a fetch failure.
+
+    Returns a defensive dict shaped so that "netkeiba is just not ready"
+    can be cleanly distinguished from "the API shape has changed and we
+    cannot parse it anymore". Every failure mode populates the same keys
+    so the caller does not need try/except:
+      {
+        "status":               "result" | "not-published" | "error",
+        "by_number":            {umaban_int: odds_float},  # {} unless "result"
+        "official_time":        str | None,
+        "update_count":         int,
+        "raw_reason":           str,       # netkeiba's own reason field
+        # ── defensive metadata (ADDED 2026-04) ──
+        "http_status":          int,       # 0 if no HTTP response was read
+        "response_url":         str,       # final URL after any redirect
+        "parse_error":          str | None,  # set only on JSON parse failure
+        "schema_version_guess": str,       # "v1-jra-odds-2026" | "unknown-*"
+        "fetched_at":           str,       # ISO local time of the fetch
+      }
+
+    The 馬番→odds keying is intentional because the netkeiba API is keyed
+    by 馬番 (stable) and not by name. Callers join with shutuba entries
+    via `entry["number"]`.
+
+    schema_version_guess semantics:
+      "v1-jra-odds-2026"       — top-level has (status, data, update_count,
+                                 reason) and data.odds.1 values are 3-element
+                                 lists. Current (2026-04) schema.
+      "v1-empty-odds"          — correct shape but odds dict is empty
+                                 (netkeiba in middle state)
+      "v1-empty-data"          — correct top-level but data is "" or None
+                                 (netkeiba in middle state)
+      "unknown-top:..."        — top-level key set differs from expected
+                                 → SUSPECT API CHANGE, investigate
+      "unknown-inner-shape"    — odds dict exists but inner list shape is
+                                 wrong → SUSPECT API CHANGE
+      "unknown-data-shape"     — data exists but has no "odds" key
+                                 → SUSPECT API CHANGE
+      "unknown-no-json"        — we never got a JSON body (HTTP error,
+                                 network error, parse error)
     """
-    url = (f"https://race.netkeiba.com/odds/index.html"
-           f"?race_id={race_id}&rf=race_submenu&type=b1")
-    soup = _get(url)
-    if soup is None:
-        return {}
+    import datetime as _dt
+    import json as _json
+    import urllib.error as _err
+    import urllib.request as _req
 
-    out: dict[str, float] = {}
+    url = (f"https://race.netkeiba.com/api/api_get_jra_odds.html"
+           f"?type=1&locale=ja&race_id={race_id}")
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/128.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": (
+            f"https://race.netkeiba.com/odds/index.html"
+            f"?race_id={race_id}&rf=race_submenu&type=b1"
+        ),
+    }
+    result: dict = {
+        "status": "error",
+        "by_number": {},
+        "official_time": None,
+        "update_count": 0,
+        "raw_reason": "",
+        "http_status": 0,
+        "response_url": url,
+        "parse_error": None,
+        "schema_version_guess": "unknown-no-json",
+        "fetched_at": _dt.datetime.now().isoformat(timespec="seconds"),
+    }
 
-    # Strategy 1: structured selectors (most reliable when page renders)
-    for row in soup.select("tr"):
-        name_tag = row.select_one(
-            ".HorseName a, .Horse_Name a, span.HorseName, a[href*='/horse/']"
+    body: str = ""
+    try:
+        req = _req.Request(url, headers=headers)
+        with _req.urlopen(req, timeout=10) as resp:
+            result["http_status"] = getattr(resp, "status", 200)
+            result["response_url"] = getattr(resp, "url", url) or url
+            body = resp.read().decode("utf-8", errors="replace")
+    except _err.HTTPError as e:
+        result["http_status"] = int(getattr(e, "code", 0) or 0)
+        result["raw_reason"] = f"http-error: {e.code} {getattr(e, 'reason', '')}"
+        return result
+    except Exception as e:
+        result["raw_reason"] = f"fetch-failed: {e.__class__.__name__}: {e}"
+        return result
+
+    try:
+        payload = _json.loads(body)
+    except Exception as e:
+        result["parse_error"] = f"json-parse-failed: {e.__class__.__name__}: {e}"
+        result["raw_reason"] = result["parse_error"]
+        return result
+
+    if not isinstance(payload, dict):
+        result["schema_version_guess"] = f"unknown-top-type:{type(payload).__name__}"
+        result["raw_reason"] = "payload not a dict"
+        return result
+
+    # Schema detection — must run before status decoding so we can flag
+    # API shape changes even when the endpoint returns a 200 with data.
+    top_keys = set(payload.keys())
+    expected_top = {"status", "data", "update_count", "reason"}
+    if expected_top.issubset(top_keys):
+        data_for_schema = payload.get("data")
+        if isinstance(data_for_schema, dict) and "odds" in data_for_schema:
+            odds_block_for_schema = (data_for_schema.get("odds") or {}).get("1") or {}
+            if isinstance(odds_block_for_schema, dict) and odds_block_for_schema:
+                sample = next(iter(odds_block_for_schema.values()), None)
+                if isinstance(sample, list) and len(sample) >= 3:
+                    result["schema_version_guess"] = "v1-jra-odds-2026"
+                else:
+                    result["schema_version_guess"] = "unknown-inner-shape"
+            elif isinstance(odds_block_for_schema, dict):
+                result["schema_version_guess"] = "v1-empty-odds"
+            else:
+                result["schema_version_guess"] = "unknown-data-shape"
+        elif data_for_schema in ("", None):
+            result["schema_version_guess"] = "v1-empty-data"
+        else:
+            result["schema_version_guess"] = "unknown-data-shape"
+    else:
+        # Sort so the string is deterministic for monitoring / alerting
+        result["schema_version_guess"] = (
+            "unknown-top:" + ",".join(sorted(top_keys))[:80]
         )
-        if not name_tag:
-            continue
-        name = _clean_text(name_tag.get_text(strip=True))
-        if not name or len(name) < 2:
-            continue
-        # Find the odds cell in this row
-        odds_val = 0.0
-        for sel in ("span.Odds_Ninki", "td.Popular", "td.Odds",
-                    "td[class*='Odds']", "span[class*='Odds']"):
-            odds_tag = row.select_one(sel)
-            if not odds_tag:
-                continue
-            txt = odds_tag.get_text(strip=True).replace(",", "")
-            m = re.search(r"(\d+\.\d+)", txt)
-            if m:
-                try:
-                    v = float(m.group(1))
-                    if 1.0 < v < 10000.0:
-                        odds_val = v
-                        break
-                except ValueError:
-                    pass
-        if odds_val > 0 and name not in out:
-            out[name] = odds_val
 
-    # Strategy 2: regex scan on full page text if structured failed
-    if not out:
-        txt = soup.get_text(" ", strip=True)
-        # Pattern: horse name (3+ Japanese chars) + space + decimal odds
-        for m in re.finditer(
-            r"([\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]{3,}[\w・]{0,8})\s+(\d{1,3}\.\d)",
-            txt,
-        ):
-            name = m.group(1).strip()
-            try:
-                v = float(m.group(2))
-                if 1.0 < v < 10000.0 and name not in out:
-                    out[name] = v
-            except ValueError:
-                continue
+    raw_status = (payload.get("status") or "").strip()
+    # netkeiba's own reason wins over whatever we put earlier
+    if payload.get("reason"):
+        result["raw_reason"] = payload.get("reason")
+    try:
+        result["update_count"] = int(payload.get("update_count") or 0)
+    except (TypeError, ValueError):
+        result["update_count"] = 0
 
-    return out
+    data = payload.get("data")
+    # netkeiba returns "" (empty string) for `data` when odds are not
+    # yet published — that's the "middle" state.
+    if not isinstance(data, dict) or not data:
+        result["status"] = (
+            "not-published" if raw_status in ("middle", "before", "") else "error"
+        )
+        return result
+
+    result["official_time"] = data.get("official_datetime")
+    odds_block = (data.get("odds") or {}).get("1") or {}
+    parsed: dict[int, float] = {}
+    for umaban_str, arr in odds_block.items():
+        if not isinstance(arr, (list, tuple)) or not arr:
+            continue
+        try:
+            um = int(str(umaban_str).lstrip("0") or "0")
+            v = float(str(arr[0]).replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        if um > 0 and 1.0 < v < 10000.0:
+            parsed[um] = v
+
+    if parsed:
+        result["status"] = "result"
+        result["by_number"] = parsed
+    else:
+        result["status"] = (
+            "not-published" if raw_status in ("middle", "before", "") else "error"
+        )
+    return result
 
 
 def fetch_race_info_netkeiba(race_id: str) -> dict:
