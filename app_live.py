@@ -18,6 +18,7 @@ Governed by docs/trading_constitution.md §2-3.
 
 from __future__ import annotations
 
+import datetime as dt
 import time
 from datetime import date
 
@@ -27,6 +28,7 @@ import pandas as pd
 import scraper
 import live_pipeline as lp
 import prediction_log as plog
+from tools._autolog_utils import last_weekend
 
 
 st.set_page_config(
@@ -40,6 +42,90 @@ st.caption(
     "JRA + netkeiba + KeibaLab + Hochi + Sanspo + Daily (live) + oikiri "
     "editorial → fact merge → dual-mode scoring → LOOSE betting rule"
 )
+
+
+# ── Weekly data-health banner (TOP-OF-PAGE, highest priority) ──
+# The single most important question is "does yesterday / this weekend's
+# data actually exist?". Everything else is meaningless if the answer is
+# no, so we surface the volume counts above anything else.
+
+def _weekly_status() -> dict:
+    sat, sun = last_weekend(dt.date.today())
+    all_preds = plog.list_predictions(only_live=True)
+    sat_iso, sun_iso = sat.isoformat(), sun.isoformat()
+    scoped = [
+        e for e in all_preds
+        if sat_iso <= (e.get("race_date") or "") <= sun_iso
+    ]
+    with_result = [e for e in scoped if (e.get("result") or {}).get("finishing_order")]
+    wins, cost, payout = 0, 0.0, 0.0
+    for e in with_result:
+        ranked = e.get("ranked") or []
+        if not ranked:
+            continue
+        top1 = (ranked[0].get("name") or "").strip()
+        res = e.get("result") or {}
+        fo = res.get("finishing_order") or []
+        winner = None
+        for h in fo:
+            try:
+                if int(h.get("rank", 0) or 0) == 1:
+                    winner = (h.get("name") or "").strip()
+                    break
+            except ValueError:
+                pass
+        if not winner:
+            continue
+        cost += 100.0
+        if top1 == winner:
+            wins += 1
+            try:
+                payout += float(str((res.get("payouts") or {}).get("単勝", 0)).replace(",", ""))
+            except Exception:
+                pass
+    return {
+        "sat": sat_iso,
+        "sun": sun_iso,
+        "n_preds": len(scoped),
+        "n_with_result": len(with_result),
+        "win_rate": (wins / len(with_result)) if with_result else 0.0,
+        "roi": ((payout - cost) / cost) if cost > 0 else 0.0,
+    }
+
+
+_ws = _weekly_status()
+w1, w2, w3, w4 = st.columns(4)
+w1.metric(
+    f"今週の予測数 ({_ws['sat']}～{_ws['sun']})",
+    _ws["n_preds"],
+    help="最重要: 0 の場合 weekend_autolog が動いていない",
+)
+w2.metric(
+    "今週の結果付与数",
+    _ws["n_with_result"],
+    help="attach_results.py が結果を紐付けた件数",
+)
+w3.metric(
+    "今週勝率",
+    f"{_ws['win_rate']*100:.1f}%" if _ws["n_with_result"] else "—",
+)
+w4.metric(
+    "今週ROI",
+    f"{_ws['roi']*100:+.1f}%" if _ws["n_with_result"] else "—",
+)
+if _ws["n_preds"] == 0:
+    st.error(
+        f"⚠️ 今週 ({_ws['sat']}～{_ws['sun']}) の予測ログがゼロ件です。"
+        f"`python tools/weekend_autolog.py` が動いていない可能性があります。"
+        f"cron / Task Scheduler の状態と data/autolog/ を確認してください。"
+    )
+elif _ws["n_with_result"] == 0 and _ws["n_preds"] > 0:
+    st.warning(
+        f"📋 今週 {_ws['n_preds']} 件の予測があるが結果が未付与。"
+        f"`python tools/attach_results.py` を実行してください。"
+    )
+
+st.divider()
 
 
 # ── Sidebar: KPI dashboards ──────────────────────────
@@ -161,6 +247,9 @@ def _run_auto_analysis(race_date_iso: str) -> dict:
                 progress_cb=None,  # silence per-step spam; the bar is enough
                 auto_log=True,
             )
+            # Carry race_time from the race-list dict into the result so the
+            # UI can show "発走まで Nh" for odds-not-published warnings.
+            r["race_time"] = race.get("time", "")
             results.append(r)
         except Exception as e:
             results.append({
@@ -215,10 +304,18 @@ elif batch and batch["results"]:
     b5.metric("所要時間", f"{batch['elapsed_s']:.0f}s")
 
     # ── Odds-status health warning ──
-    # If a race had no odds on the shutuba page and injection failed,
-    # all horses end up with score_runner's uniform 1/N base and the
-    # ranking collapses to gate-number order. Surface this clearly.
-    odds_issues = [
+    # We now distinguish THREE states:
+    #   1. not-published-yet  — netkeiba has no odds yet (>3h before post).
+    #                           This is NORMAL and not a bug — tell the
+    #                           user to re-run closer to post time.
+    #   2. all-zero-no-source — genuine scraper failure (network / layout
+    #                           change / netkeiba block). Ranking is junk.
+    #   3. injected            — recovered from live-odds API or result page.
+    odds_not_pub = [
+        r for r in ok_results
+        if str(r.get("odds_status", "ok")).startswith("not-published")
+    ]
+    odds_failed = [
         r for r in ok_results
         if str(r.get("odds_status", "ok")).startswith("all-zero")
     ]
@@ -226,17 +323,73 @@ elif batch and batch["results"]:
         r for r in ok_results
         if str(r.get("odds_status", "ok")).startswith("injected")
     ]
-    if odds_issues:
+
+    if odds_not_pub:
+        # Compute re-fetch window for each affected race.
+        # netkeiba publishes odds roughly 2-3 hours before post. We
+        # suggest the window [post - 3h, post - 2h] to give the user
+        # a concrete target time instead of "wait and retry".
+        now = dt.datetime.now()
+        fetched_display = now.strftime("%H:%M")
+        rows = []
+        for r in odds_not_pub:
+            rt = r.get("race_time") or r.get("time") or ""
+            api_meta = r.get("odds_api_meta") or {}
+            schema = api_meta.get("api_schema_version") or "-"
+            http = api_meta.get("api_http_status") or "-"
+            stage = r.get("prediction_stage", "early")
+            try:
+                hh, mm = rt.split(":")
+                post = dt.datetime.combine(
+                    dt.date.today(), dt.time(int(hh), int(mm))
+                )
+                delta = post - now
+                total_min = int(delta.total_seconds() // 60)
+                hrs, mins = divmod(max(0, total_min), 60)
+                # Recommended re-fetch: between post-3h and post-2h
+                rec_start = (post - dt.timedelta(hours=3)).strftime("%H:%M")
+                rec_end   = (post - dt.timedelta(hours=2)).strftime("%H:%M")
+                wait_str = f"発走まで {hrs}h{mins:02d}m"
+                rec_str  = f"{rec_start}〜{rec_end}"
+            except Exception:
+                wait_str = "-"
+                rec_str  = "-"
+            rows.append({
+                "レース":      r.get("race_name", "?"),
+                "発走":       rt or "-",
+                "現状":       wait_str,
+                "推奨再取得":  rec_str,
+                "stage":     stage,
+                "schema":    schema,
+                "http":      http,
+            })
+
+        st.warning(
+            f"🕒 **{len(odds_not_pub)} レースでオッズ未公開** "
+            f"(`status: middle` · 取得時刻 {fetched_display}) — "
+            f"**スクレイパーのバグではありません**。"
+            f"netkeiba が発走 2〜3 時間前にならないとオッズを出さないためです。"
+            f"現在の予測は **early version** として記録されていますが、"
+            f"ROI 集計からは分離されます (history に保全)。"
+        )
+        st.dataframe(pd.DataFrame(rows),
+                     use_container_width=True, hide_index=True)
+        st.caption(
+            "推奨再取得時刻になったら `🚀 本日のレースを自動分析` を再度押してください。"
+            "同じ race_id は上書きされますが、過去版は `history` に保全されます。"
+        )
+    if odds_failed:
         st.error(
-            f"⚠️ {len(odds_issues)} レースでオッズ情報が取得できませんでした。"
+            f"⚠️ {len(odds_failed)} レースでオッズ情報の取得に失敗しました "
+            f"(scraper error / netkeiba block)。"
             f"該当レースのランキングは **信頼できません** "
             f"(全馬ほぼ同一スコア → 枠順で表示される可能性)。"
-            f"該当: {', '.join(r.get('race_name','?') for r in odds_issues[:5])}"
+            f"該当: {', '.join(r.get('race_name','?') for r in odds_failed[:5])}"
         )
-    elif odds_recovered:
+    if odds_recovered and not odds_not_pub:
         st.info(
             f"ℹ️ {len(odds_recovered)} レースで shutuba ページにオッズが無かったため、"
-            f"結果ページ / ライブオッズページから自動補完しました。"
+            f"ライブオッズAPI / 結果ページから自動補完しました。"
         )
 
     # ── Calibration warnings ──
@@ -324,10 +477,12 @@ elif batch and batch["results"]:
 
         n_loose = len(r.get("loose_bets", []))
         n_strict = len(r.get("triggers", []))
-        badge_parts = []
+        stage = r.get("prediction_stage", "final")
+        stage_icon = "🟢" if stage == "final" else "🟡"
+        badge_parts = [f"{stage_icon} {stage}"]
         if n_loose: badge_parts.append(f"🧪 {n_loose}")
         if n_strict: badge_parts.append(f"🔥 {n_strict}")
-        badge = " · ".join(badge_parts) if badge_parts else "–"
+        badge = " · ".join(badge_parts)
 
         with st.expander(
             f"{r.get('grade','?')} {r.get('race_name','?')} "
@@ -344,6 +499,45 @@ elif batch and batch["results"]:
                 "✅" if odds_st == "ok" else ("🔵" if "injected" in odds_st else "⚠"),
                 help=odds_st,
             )
+
+            # ── Audit metadata strip (stage / odds / schema / version) ──
+            api_meta = r.get("odds_api_meta") or {}
+            meta_row = (
+                f"**stage:** `{stage}`  ·  "
+                f"**odds_status:** `{odds_st}`  ·  "
+                f"**odds_source:** `{api_meta.get('odds_source') or '-'}`  ·  "
+                f"**fetched:** `{api_meta.get('api_fetched_at') or '-'}`  ·  "
+                f"**schema:** `{api_meta.get('api_schema_version') or '-'}`  ·  "
+                f"**http:** `{api_meta.get('api_http_status') or '-'}`  ·  "
+                f"**data_source_version:** `{r.get('data_source_version') or '-'}`"
+            )
+            st.caption(meta_row)
+            hist = r.get("history") or []
+            if hist:
+                st.caption(
+                    f"📜 history: {len(hist)} 版保全 · "
+                    f"初回 {r.get('first_predicted_at') or '-'} → "
+                    f"今 {r.get('prediction_created_at') or '-'}"
+                )
+            if stage == "early":
+                rt = r.get("race_time") or ""
+                rec_hint = ""
+                if rt and ":" in rt:
+                    try:
+                        hh, mm = rt.split(":")
+                        post = dt.datetime.combine(
+                            dt.date.today(), dt.time(int(hh), int(mm))
+                        )
+                        rec_start = (post - dt.timedelta(hours=3)).strftime("%H:%M")
+                        rec_end   = (post - dt.timedelta(hours=2)).strftime("%H:%M")
+                        rec_hint = f"推奨再取得: {rec_start}〜{rec_end}"
+                    except Exception:
+                        pass
+                st.info(
+                    f"🕒 この予測は **early version** です。"
+                    f"オッズ未取得のため ROI 集計から分離されます。"
+                    f"{rec_hint}"
+                )
 
             # Core-model reconnection diagnostic
             bridge_d = r.get("bridge_diag", {})
