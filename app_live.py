@@ -455,7 +455,7 @@ elif batch and batch["results"]:
                 "レース": r.get("race_name", "")[:14],
                 "G": r.get("grade", ""),
                 "馬名": lb["name"],
-                "オッズ": f"{lb.get('odds', 0):.1f}",
+                "単勝オッズ": f"{float(lb.get('odds', 0) or 0):.1f}" if float(lb.get("odds", 0) or 0) > 1.0 else "---",
                 "consensus": lb["consensus_count"],
                 "composite": f"{lb['composite_condition']:.2f}",
                 "sources": lb["source_count"],
@@ -488,7 +488,7 @@ elif batch and batch["results"]:
                     "レース": r.get("race_name", "")[:14],
                     "G": r.get("grade", ""),
                     "馬名": t["name"],
-                    "オッズ": f"{t.get('odds', 0):.1f}",
+                    "単勝オッズ": f"{float(t.get('odds', 0) or 0):.1f}" if float(t.get("odds", 0) or 0) > 1.0 else "---",
                     "consensus": t["consensus_count"],
                     "composite": f"{t['composite_condition']:.2f}",
                     "reason": t.get("reason", ""),
@@ -607,7 +607,7 @@ elif batch and batch["results"]:
                 ldf = pd.DataFrame([
                     {
                         "馬名": lb["name"],
-                        "オッズ": f"{lb.get('odds', 0):.1f}",
+                        "単勝オッズ": f"{float(lb.get('odds', 0) or 0):.1f}" if float(lb.get("odds", 0) or 0) > 1.0 else "---",
                         "consensus": lb["consensus_count"],
                         "composite": f"{lb['composite_condition']:.2f}",
                         "sources": lb["source_count"],
@@ -623,7 +623,7 @@ elif batch and batch["results"]:
                 tdf = pd.DataFrame([
                     {
                         "馬名": t["name"],
-                        "オッズ": f"{t.get('odds', 0):.1f}",
+                        "単勝オッズ": f"{float(t.get('odds', 0) or 0):.1f}" if float(t.get("odds", 0) or 0) > 1.0 else "---",
                         "consensus": t["consensus_count"],
                         "composite": f"{t['composite_condition']:.2f}",
                         "reason": t.get("reason", ""),
@@ -639,7 +639,11 @@ elif batch and batch["results"]:
                     {
                         "順位": i + 1,
                         "馬名": h["name"],
-                        "オッズ": f"{h['odds']:.1f}" if h["odds"] else "-",
+                        "単勝オッズ": (
+                            f"{float(h.get('odds', 0)):.1f}"
+                            if float(h.get("odds", 0) or 0) > 1.0
+                            else "---"
+                        ),
                         "勝率": f"{h['win_prob']*100:.1f}%",
                     }
                     for i, h in enumerate(r["selected_top3"])
@@ -648,38 +652,60 @@ elif batch and batch["results"]:
 
             # Full ranking with calibration breakdown
             if r.get("ranked"):
+                _stage_icon = "🟢" if r.get("prediction_stage") == "final" else "🟡"
                 st.markdown(
-                    "**📊 全頭ランキング (上位8) — 市場 × 構造化モデル**"
+                    f"**📊 全頭ランキング (上位8) — {_stage_icon} "
+                    f"{r.get('prediction_stage', 'unknown')} version**"
                 )
+
+                _has_odds = any(
+                    float(h.get("odds", 0) or 0) > 1.0
+                    for h in r["ranked"][:8]
+                )
+                if not _has_odds:
+                    st.warning(
+                        "⚠️ **全馬のオッズが 0 (未公開) です。** "
+                        "「単勝オッズ」列は `---` と表示されます。"
+                        "この状態では市場勝率は均一 (1/N) であり、"
+                        "ランキングは構造化スコアのみで決まっています。"
+                        "オッズが公開されたら再実行してください。"
+                    )
+
                 fdf = pd.DataFrame([
                     {
                         "順位": i + 1,
                         "馬名": h["name"],
-                        "オッズ": f"{h['odds']:.1f}" if h.get("odds") else "-",
-                        "市場勝率": (
+                        "単勝オッズ": (
+                            f"{float(h.get('odds', 0)):.1f}"
+                            if float(h.get("odds", 0) or 0) > 1.0
+                            else "---"
+                        ),
+                        "市場勝率 (overround除去)": (
                             f"{h.get('base_market_prob', 0)*100:.1f}%"
                             if h.get("base_market_prob") is not None else "—"
                         ),
-                        "構造化 edge": (
+                        "構造edge": (
                             f"{h.get('structured_edge', 0):+.3f}"
                             if h.get("structured_edge") is not None else "—"
                         ),
-                        "× multiplier": (
+                        "乗数 exp(k*e)": (
                             f"{h.get('fact_multiplier', 1.0):.2f}"
                             if h.get("fact_multiplier") is not None else "—"
                         ),
                         "最終勝率": f"{h.get('win_prob', 0)*100:.1f}%",
-                        "score_runner": f"{h.get('odds_score', 0):.1f}",
+                        "内部スコア": f"{h.get('odds_score', 0):.1f}",
                         "mode": h.get("mode", "odds"),
                     }
                     for i, h in enumerate(r["ranked"][:8])
                 ])
                 st.dataframe(fdf, width="stretch", hide_index=True)
                 st.caption(
-                    f"構造化 edge = score_runner output − (1/odds)/1.20  "
-                    f"|  最終勝率 = 市場勝率 × exp(k × edge), k = "
-                    f"{r.get('calibration_k', 1.5):.1f}  |  "
-                    f"mode: fact-override = strict trigger fired"
+                    f"**単勝オッズ** = netkeiba から取得した実オッズ "
+                    f"(--- = 未公開 or 0)  |  "
+                    f"**市場勝率** = (1/odds) / Σ(1/odds_all)  |  "
+                    f"**内部スコア** = score_runner 出力 [2-95] (オッズではない)  |  "
+                    f"**乗数** = exp(k × edge), k={r.get('calibration_k', 4.0):.1f}  |  "
+                    f"mode: fact = strict trigger"
                 )
 
     # ── Post-race: attach results button ──
