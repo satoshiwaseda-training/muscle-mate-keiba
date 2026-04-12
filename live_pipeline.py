@@ -192,6 +192,34 @@ def _inject_odds_if_missing(
         meta["odds_source"] = "api-not-published"
         return "not-published-yet", meta
 
+    # Fallback: SP (smartphone) shutuba page — odds may be in the HTML
+    # directly, unlike the desktop version which relies on JS.
+    _log(progress_cb, "SP版出馬表からオッズ取得試行")
+    try:
+        sp_odds = scraper.fetch_odds_from_sp_shutuba(race_id)
+        if sp_odds:
+            injected = 0
+            for e in entries:
+                if _parse_odds_safe(e.get("odds", 0)) > 0:
+                    continue
+                nm = (e.get("name") or "").strip()
+                try:
+                    um = int(str(e.get("number", "")).strip() or 0)
+                except ValueError:
+                    um = 0
+                if um in sp_odds:
+                    e["odds"] = str(sp_odds[um])
+                    injected += 1
+                elif nm in sp_odds:
+                    e["odds"] = str(sp_odds[nm])
+                    injected += 1
+            if injected:
+                meta["odds_source"] = "sp-shutuba"
+                meta["injected_count"] = injected
+                return f"injected-from-sp-shutuba ({injected})", meta
+    except Exception as e:
+        _log(progress_cb, f"SP版出馬表取得失敗: {e}")
+
     meta["odds_source"] = "none"
     return f"all-zero-no-source ({len(missing)}/{len(entries)} missing)", meta
 

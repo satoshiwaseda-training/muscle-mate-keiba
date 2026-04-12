@@ -71,7 +71,7 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
+        "Chrome/136.0.0.0 Safari/537.36"
     )
 }
 REQUEST_DELAY = 1.2  # polite crawl rate
@@ -1025,18 +1025,11 @@ def fetch_odds_netkeiba(race_id: str) -> dict:
                                  network error, parse error)
     """
     import datetime as _dt
-    import json as _json
-    import urllib.error as _err
-    import urllib.request as _req
 
     url = (f"https://race.netkeiba.com/api/api_get_jra_odds.html"
            f"?type=1&locale=ja&race_id={race_id}")
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/128.0 Safari/537.36"
-        ),
+    api_headers = {
+        "User-Agent": HEADERS["User-Agent"],
         "Accept": "application/json, text/plain, */*",
         "X-Requested-With": "XMLHttpRequest",
         "Referer": (
@@ -1057,23 +1050,37 @@ def fetch_odds_netkeiba(race_id: str) -> dict:
         "fetched_at": _dt.datetime.now().isoformat(timespec="seconds"),
     }
 
+    # Use requests.Session to share cookies. Visit the odds HTML page
+    # first so the session picks up netkeiba's tracking cookies, then
+    # call the JSON API — identical to what a real browser does.
+    sess = requests.Session()
+    sess.headers.update(HEADERS)
     body: str = ""
     try:
-        req = _req.Request(url, headers=headers)
-        with _req.urlopen(req, timeout=10) as resp:
-            result["http_status"] = getattr(resp, "status", 200)
-            result["response_url"] = getattr(resp, "url", url) or url
-            body = resp.read().decode("utf-8", errors="replace")
-    except _err.HTTPError as e:
-        result["http_status"] = int(getattr(e, "code", 0) or 0)
-        result["raw_reason"] = f"http-error: {e.code} {getattr(e, 'reason', '')}"
+        # Step 1: establish cookies by visiting the referer page
+        referer_url = (
+            f"https://race.netkeiba.com/odds/index.html"
+            f"?race_id={race_id}&rf=race_submenu&type=b1"
+        )
+        sess.get(referer_url, timeout=10)
+        time.sleep(0.3)
+
+        # Step 2: call the API with session cookies
+        resp = sess.get(url, headers=api_headers, timeout=10)
+        result["http_status"] = resp.status_code
+        result["response_url"] = resp.url or url
+        resp.raise_for_status()
+        body = resp.text
+    except requests.HTTPError as e:
+        result["http_status"] = int(getattr(e.response, "status_code", 0) or 0)
+        result["raw_reason"] = f"http-error: {result['http_status']}"
         return result
     except Exception as e:
         result["raw_reason"] = f"fetch-failed: {e.__class__.__name__}: {e}"
         return result
 
     try:
-        payload = _json.loads(body)
+        payload = json.loads(body)
     except Exception as e:
         result["parse_error"] = f"json-parse-failed: {e.__class__.__name__}: {e}"
         result["raw_reason"] = result["parse_error"]
@@ -1151,6 +1158,72 @@ def fetch_odds_netkeiba(race_id: str) -> dict:
         result["status"] = (
             "not-published" if raw_status in ("middle", "before", "") else "error"
         )
+    return result
+
+
+def fetch_odds_from_sp_shutuba(race_id: str) -> dict:
+    """Scrape odds from the SP (smartphone) version of the shutuba page.
+
+    The SP page may render odds directly in HTML (unlike the desktop
+    version which loads them via JS). Returns a dict mapping either
+    馬番 (int) or horse name (str) to odds (float).
+    """
+    url = f"https://race.sp.netkeiba.com/race/shutuba.html?race_id={race_id}"
+    soup = _get(url)
+    if soup is None:
+        return {}
+
+    result: dict = {}
+
+    # SP shutuba uses various table/list structures. Try multiple selectors.
+    # Pattern 1: span with id "odds-*" (common across desktop/SP)
+    for span in soup.select('span[id^="odds-"]'):
+        text = span.get_text(strip=True)
+        text = re.sub(r"[^0-9.]", "", text)
+        if not text:
+            continue
+        try:
+            v = float(text)
+        except ValueError:
+            continue
+        if v <= 1.0 or v >= 10000.0:
+            continue
+        # Extract umaban from span id: "odds-1_03" → 3
+        sid = span.get("id", "")
+        m = re.search(r"odds-\d+_(\d+)", sid)
+        if m:
+            result[int(m.group(1))] = v
+
+    if result:
+        return result
+
+    # Pattern 2: table rows with horse number and odds cells
+    for row in soup.select("tr.HorseList, li.Horse"):
+        # Try to find horse number
+        num_el = row.select_one('td:nth-child(2), .Num, .Umaban')
+        if not num_el:
+            continue
+        num_text = re.sub(r"\D", "", num_el.get_text(strip=True))
+        if not num_text:
+            continue
+
+        # Try to find odds in the row
+        odds_el = (
+            row.select_one('span[id^="odds-"]')
+            or row.select_one('.Txt_Odds, .Odds')
+        )
+        if not odds_el:
+            continue
+        odds_text = re.sub(r"[^0-9.]", "", odds_el.get_text(strip=True))
+        if not odds_text:
+            continue
+        try:
+            v = float(odds_text)
+        except ValueError:
+            continue
+        if 1.0 < v < 10000.0:
+            result[int(num_text)] = v
+
     return result
 
 
@@ -1236,9 +1309,23 @@ def fetch_entries_netkeiba(race_id: str, venue: str = "") -> list[dict]:
             horse_weight = weight_td.get_text(strip=True) if weight_td else ""
 
             # オッズ（出走前は---の場合あり）
-            odds_td = cells[9] if len(cells) > 9 else None
-            odds = odds_td.get_text(strip=True) if odds_td else "0"
-            odds = odds.replace("---.-", "0").replace("---", "0")
+            # Primary: try CSS class first (robust to column reorder).
+            # netkeiba uses class "Txt_Odds" or "Popular" on the odds cell,
+            # and a <span id="odds-..."> for the JS-injected value.
+            odds = "0"
+            odds_span = row.select_one('span[id^="odds-"]')
+            if odds_span:
+                odds = odds_span.get_text(strip=True) or "0"
+            else:
+                # Fallback 1: td with "Odds" or "Popular" in class
+                odds_td_cls = row.select_one('td.Txt_Odds, td.Odds')
+                if odds_td_cls:
+                    odds = odds_td_cls.get_text(strip=True) or "0"
+                else:
+                    # Fallback 2: fixed index (original logic)
+                    odds_td = cells[9] if len(cells) > 9 else None
+                    odds = odds_td.get_text(strip=True) if odds_td else "0"
+            odds = re.sub(r"[^0-9.]", "", odds) or "0"
 
             # 馬主（存在しない場合は空）
             owner_tag = row.select_one(".Owner a")
@@ -1594,7 +1681,7 @@ _JRA_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
+        "Chrome/136.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ja,en-US;q=0.7,en;q=0.3",
