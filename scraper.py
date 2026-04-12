@@ -1227,6 +1227,238 @@ def fetch_odds_from_sp_shutuba(race_id: str) -> dict:
     return result
 
 
+def fetch_odds_from_odds_page(race_id: str) -> dict[int, float]:
+    """Extract odds from the netkeiba odds HTML page.
+
+    The odds page is a JavaScript SPA, but the initial HTML often contains
+    odds data embedded in inline ``<script>`` tags as JavaScript variables
+    or JSON blobs.  We look for patterns like:
+      * ``var data = { "1": { "01": ["3.5", ...] } }``
+      * ``"odds":{"1":{"01":["3.5","","1"],...}}``
+    Falls back to parsing any visible odds text in the rendered HTML.
+    """
+    url = (
+        f"https://race.netkeiba.com/odds/index.html"
+        f"?race_id={race_id}&rf=race_submenu&type=b1"
+    )
+    soup = _get(url)
+    if soup is None:
+        return {}
+
+    result: dict[int, float] = {}
+
+    # Strategy 1: look for inline JSON in <script> tags
+    for script in soup.find_all("script"):
+        text = script.string or ""
+        if not text or "odds" not in text.lower():
+            continue
+        # Try to find JSON-like odds block:  "1": { "01": ["3.5", ...], ... }
+        # The key "1" is type=1 (単勝).
+        m = re.search(
+            r'"1"\s*:\s*\{([^}]{10,})\}',
+            text,
+        )
+        if not m:
+            continue
+        block = "{" + m.group(1) + "}"
+        try:
+            odds_dict = json.loads(block)
+        except json.JSONDecodeError:
+            # Try fixing common JS → JSON issues (trailing commas, single quotes)
+            cleaned = re.sub(r",\s*}", "}", block)
+            cleaned = cleaned.replace("'", '"')
+            try:
+                odds_dict = json.loads(cleaned)
+            except json.JSONDecodeError:
+                continue
+        for umaban_str, val in odds_dict.items():
+            try:
+                um = int(str(umaban_str).lstrip("0") or "0")
+                if isinstance(val, list) and val:
+                    v = float(str(val[0]).replace(",", ""))
+                elif isinstance(val, (int, float)):
+                    v = float(val)
+                elif isinstance(val, str):
+                    v = float(val.replace(",", ""))
+                else:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if um > 0 and 1.0 < v < 10000.0:
+                result[um] = v
+        if result:
+            return result
+
+    # Strategy 2: look for visible odds spans/cells in the rendered HTML
+    for span in soup.select('span[id^="odds-"], td.Odds, .OddsList span'):
+        text = re.sub(r"[^0-9.]", "", span.get_text(strip=True))
+        if not text:
+            continue
+        try:
+            v = float(text)
+        except ValueError:
+            continue
+        if v <= 1.0 or v >= 10000.0:
+            continue
+        sid = span.get("id", "")
+        m = re.search(r"odds-\d+_(\d+)", sid)
+        if m:
+            result[int(m.group(1))] = v
+
+    return result
+
+
+def fetch_odds_from_yahoo(race_id: str) -> dict[int, float]:
+    """Fetch 単勝 odds from Yahoo Sports Keiba.
+
+    Yahoo race_id is the netkeiba race_id with the leading "20" dropped:
+      netkeiba ``202609020611`` → Yahoo ``2609020611``
+
+    Odds page URL:
+      https://sports.yahoo.co.jp/keiba/race/odds/sf/{yahoo_id}
+    """
+    yahoo_id = race_id[2:] if len(race_id) == 12 else race_id
+    url = f"https://sports.yahoo.co.jp/keiba/race/odds/sf/{yahoo_id}"
+    soup = _get(url)
+    if soup is None:
+        return {}
+
+    result: dict[int, float] = {}
+
+    # Yahoo Sports Keiba odds table: rows contain horse number + odds
+    for row in soup.select("tr, li"):
+        text = row.get_text(" ", strip=True)
+        # Pattern: "馬番  馬名  オッズ" — look for a number followed by a decimal
+        # Example: "1  ドウデュース  3.5" or "01  3.5"
+        nums = re.findall(r"(\d+(?:\.\d+)?)", text)
+        if len(nums) < 2:
+            continue
+        # First integer is horse number, look for a decimal that's odds
+        try:
+            horse_num = int(nums[0])
+        except ValueError:
+            continue
+        if horse_num < 1 or horse_num > 30:
+            continue
+        for n in nums[1:]:
+            if "." in n:
+                try:
+                    v = float(n)
+                except ValueError:
+                    continue
+                if 1.0 < v < 10000.0:
+                    result[horse_num] = v
+                    break
+
+    if result:
+        return result
+
+    # Fallback: look for structured data in script tags (Next.js / JSON)
+    for script in soup.find_all("script"):
+        text = script.string or ""
+        if "odds" not in text.lower() and "tansho" not in text.lower():
+            continue
+        # Try to find JSON blob
+        for m in re.finditer(r'\{[^{}]*"odds"[^{}]*\}', text):
+            try:
+                blob = json.loads(m.group(0))
+                for k, v in blob.items():
+                    um = int(str(k).lstrip("0") or "0") if str(k).isdigit() else 0
+                    if um > 0:
+                        vf = float(v) if isinstance(v, (int, float, str)) else 0
+                        if 1.0 < vf < 10000.0:
+                            result[um] = vf
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
+        if result:
+            return result
+
+    return result
+
+
+def fetch_odds_from_netkeiba_top(race_id: str, race_date: str = "") -> dict[int, float]:
+    """Scrape odds from the netkeiba race-list top page.
+
+    The top page race list sub-HTML (the same endpoint used by
+    fetch_race_list_netkeiba) sometimes includes abbreviated odds
+    info per race. For a specific race_id, we try the dedicated
+    shutuba page with pandas read_html as a different parsing strategy.
+    """
+    # Strategy 1: pandas read_html on the shutuba page.
+    # pd.read_html extracts all <table> elements and can sometimes
+    # capture JS-rendered content that BeautifulSoup misses (when
+    # the content is in <noscript> or in a different table).
+    try:
+        import pandas as pd
+        url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
+        dfs = pd.read_html(url, header=0, encoding="euc-jp")
+        for df in dfs:
+            cols = [str(c) for c in df.columns]
+            # Find odds-like column
+            odds_col = None
+            num_col = None
+            for c in cols:
+                cl = c.lower()
+                if "オッズ" in c or "odds" in cl:
+                    odds_col = c
+                if "馬番" in c or c == "馬" or "num" in cl:
+                    num_col = c
+            if odds_col is None:
+                continue
+            if num_col is None:
+                # Try first column that looks like horse numbers
+                for c in cols:
+                    try:
+                        sample = df[c].dropna().iloc[0]
+                        if 1 <= int(sample) <= 30:
+                            num_col = c
+                            break
+                    except (ValueError, TypeError, IndexError):
+                        continue
+            if num_col is None:
+                continue
+            result: dict[int, float] = {}
+            for _, row in df.iterrows():
+                try:
+                    um = int(row[num_col])
+                    v = float(str(row[odds_col]).replace(",", ""))
+                except (TypeError, ValueError):
+                    continue
+                if um > 0 and 1.0 < v < 10000.0:
+                    result[um] = v
+            if result:
+                return result
+    except Exception:
+        pass
+
+    # Strategy 2: try the SP odds page (different from SP shutuba)
+    try:
+        sp_url = f"https://race.sp.netkeiba.com/odds/index.html?race_id={race_id}&rf=race_submenu&type=b1"
+        soup = _get(sp_url)
+        if soup:
+            result = {}
+            for span in soup.select('span[id^="odds-"]'):
+                text = re.sub(r"[^0-9.]", "", span.get_text(strip=True))
+                if not text:
+                    continue
+                try:
+                    v = float(text)
+                except ValueError:
+                    continue
+                if v <= 1.0 or v >= 10000.0:
+                    continue
+                sid = span.get("id", "")
+                m_id = re.search(r"odds-\d+_(\d+)", sid)
+                if m_id:
+                    result[int(m_id.group(1))] = v
+            if result:
+                return result
+    except Exception:
+        pass
+
+    return {}
+
+
 def fetch_race_info_netkeiba(race_id: str) -> dict:
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     soup = _get(url)

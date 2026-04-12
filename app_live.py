@@ -399,9 +399,27 @@ elif batch and batch["results"]:
             f"該当: {', '.join(r.get('race_name','?') for r in odds_failed[:5])}"
         )
     if odds_recovered and not odds_not_pub:
+        sources = set()
+        for r in odds_recovered:
+            s = str(r.get("odds_status", ""))
+            if "result" in s:
+                sources.add("結果ページ")
+            elif "live-odds" in s:
+                sources.add("ライブオッズAPI")
+            elif "sp-shutuba" in s:
+                sources.add("SP版出馬表")
+            elif "odds-page" in s:
+                sources.add("オッズページ")
+            elif "yahoo" in s:
+                sources.add("Yahoo Sports")
+            elif "netkeiba-alt" in s:
+                sources.add("netkeiba (代替)")
+            else:
+                sources.add("フォールバック")
+        src_str = " / ".join(sorted(sources)) or "フォールバック"
         st.info(
             f"ℹ️ {len(odds_recovered)} レースで shutuba ページにオッズが無かったため、"
-            f"ライブオッズAPI / 結果ページから自動補完しました。"
+            f"**{src_str}** から自動補完しました。"
         )
 
     # ── Calibration warnings ──
