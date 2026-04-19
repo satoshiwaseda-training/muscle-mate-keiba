@@ -24,49 +24,103 @@ from __future__ import annotations
 from typing import Optional
 
 
-STRATEGY_VERSION = "grade-strategy-v5.7-2026-04-19"
+STRATEGY_VERSION = "grade-strategy-v5.8-2026-04-19"
 
 
-# ─── Market rank buckets for each strategy ───
-DIVERSIFIED_BUCKETS = [
-    ("本命", "◎", (1, 3)),     # 市場 1-3 番人気
-    ("対抗", "○", (4, 7)),     # 市場 4-7 番人気
-    ("単穴", "▲", (8, 99)),    # 市場 8 番人気以下
-]
+# ─── Named strategies ───
+# Each strategy is a list of (label, mark, (market_rank_lo, market_rank_hi))
+#
+# "win_prob" is not listed here — it's the baseline (take ranked[:3] as-is).
 
-BALANCED_BUCKETS = [
-    ("本命", "◎", (1, 2)),     # 市場 1-2 番人気 (厳しめ)
-    ("対抗", "○", (3, 5)),
-    ("単穴", "▲", (6, 99)),
-]
+STRATEGIES: dict = {
+    "diversified_1-3_4-7_8+": [
+        ("本命", "◎", (1, 3)),
+        ("対抗", "○", (4, 7)),
+        ("単穴", "▲", (8, 99)),
+    ],
+    "tight_1-2_3-5_6+": [
+        ("本命", "◎", (1, 2)),
+        ("対抗", "○", (3, 5)),
+        ("単穴", "▲", (6, 99)),
+    ],
+    "loose_1-4_5-9_10+": [
+        ("本命", "◎", (1, 4)),
+        ("対抗", "○", (5, 9)),
+        ("単穴", "▲", (10, 99)),
+    ],
+    "mid_heavy_1-2_3-6_7+": [
+        ("本命", "◎", (1, 2)),
+        ("対抗", "○", (3, 6)),
+        ("単穴", "▲", (7, 99)),
+    ],
+    "wide_穴_1-3_4-8_9+": [
+        ("本命", "◎", (1, 3)),
+        ("対抗", "○", (4, 8)),
+        ("単穴", "▲", (9, 99)),
+    ],
+}
+
+# Backward-compat aliases used by old call sites
+DIVERSIFIED_BUCKETS = STRATEGIES["diversified_1-3_4-7_8+"]
+BALANCED_BUCKETS    = STRATEGIES["tight_1-2_3-5_6+"]
+
+
+# Per-grade strategy mapping (v5.8 tuned via tools/grid_search_strategy.py
+# on 221 R backtest with backfilled snapshots).
+#
+# 結果サマリ:
+#   G1  (n=39):  win_prob                 ROI -5.7%  (ex-big2 -19.8%, 最頑健)
+#                diversified_1-3_4-7_8+   ROI +0.1%  (ex-big2 -48.3%, 過学習疑義)
+#                → 現行維持 (小サンプル、robustness 重視)
+#   G2  (n=63):  diversified_1-3_4-7_8+   ROI +20.8% (ex-big2 -36.3%) ← 採用
+#   G3  (n=119): loose_1-4_5-9_10+        ROI -3.2%  (ex-big2 -36.2%) ← 採用
+#
+# 期待される改善: 221R 累積 ROI -34.5% → +3.2% (+38pp)
+GRADE_STRATEGY: dict = {
+    "G1":     "win_prob",
+    "JpnI":   "win_prob",
+    "G2":     "diversified_1-3_4-7_8+",
+    "JpnII":  "diversified_1-3_4-7_8+",
+    "G3":     "loose_1-4_5-9_10+",
+    "JpnIII": "loose_1-4_5-9_10+",
+}
+
+
+def get_strategy_for_grade(grade: str) -> str:
+    """Return the strategy name for this race grade."""
+    if not grade:
+        return "win_prob"
+    g = grade.upper()
+    for key in ("G1", "G2", "G3", "JPNI", "JPNII", "JPNIII"):
+        if key in g:
+            # Normalize lookup key to our mapping (JPNII -> JpnII)
+            lookup = {"JPNI": "JpnI", "JPNII": "JpnII", "JPNIII": "JpnIII"}.get(key, key)
+            return GRADE_STRATEGY.get(lookup, "win_prob")
+    return "win_prob"
 
 
 def pick_diversified_top3(ranked: list[dict],
                            market_rank_map: dict[str, int],
-                           strategy: str = "diversified") -> list[dict]:
+                           strategy: str = "diversified_1-3_4-7_8+") -> list[dict]:
     """Pick 3 horses spread across market-rank buckets.
 
     Args:
       ranked:          model output, list of {name, win_prob, odds, ...}
                        sorted by win_prob desc.
       market_rank_map: {horse_name: market_rank (1=最低 odds)}.
-      strategy:        "diversified" | "balanced"
+      strategy:        one of STRATEGIES keys, or legacy "diversified"/"balanced".
 
     Returns:
       list of 3 dicts (or fewer if field too small), each with:
-        {
-          **original_ranked_entry,
-          "bucket_label": "本命"/"対抗"/"単穴",
-          "bucket_mark":  "◎"/"○"/"▲",
-          "market_rank":  int,
-        }
-      If a bucket has no eligible horse, the slot is filled by the
-      highest-win_prob horse remaining in the ranked list (fallback).
+        {**ranked_entry, "bucket_label", "bucket_mark", "market_rank"}
     """
-    if strategy == "balanced":
-        buckets = BALANCED_BUCKETS
-    else:
-        buckets = DIVERSIFIED_BUCKETS
+    # Legacy aliases
+    if strategy == "diversified":
+        strategy = "diversified_1-3_4-7_8+"
+    elif strategy == "balanced":
+        strategy = "tight_1-2_3-5_6+"
+
+    buckets = STRATEGIES.get(strategy, DIVERSIFIED_BUCKETS)
 
     # ranked is already sorted by win_prob desc. For each bucket, pick the
     # first horse whose market_rank falls in that bucket and hasn't been
@@ -115,15 +169,13 @@ def pick_diversified_top3(ranked: list[dict],
 
 
 def should_apply_diversified(grade: str) -> bool:
-    """Return True if this race's grade calls for the diversified strategy.
+    """Return True if this race's grade calls for any strategy != win_prob.
 
-    現在は G2 のみ (analyze_g2_misses.py の結果に基づく)。
-    他 grade での効果が確認できたら拡張する。
+    v5.8 以降、G2 だけでなく G3 も diversified 系 (loose_1-4_5-9_10+) を
+    使うので、単なる「diversified か否か」フラグではなく、
+    「strategy != win_prob か」を返す設計。
     """
-    if not grade:
-        return False
-    g = grade.upper()
-    return "G2" in g or "JPNII" in g
+    return get_strategy_for_grade(grade) != "win_prob"
 
 
 def build_market_rank_map(ranked_or_entries: list[dict]) -> dict[str, int]:

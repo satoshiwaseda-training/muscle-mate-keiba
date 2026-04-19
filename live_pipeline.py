@@ -44,7 +44,13 @@ import prediction_log
 #   - the loose-rule definition in dual_mode_scoring.py
 # Persisted with every prediction so a later audit can diff predictions
 # that were produced under different model states.
-DATA_SOURCE_VERSION = "live-v5.7-g2-diversified-2026-04-19"
+DATA_SOURCE_VERSION = "live-v5.8-per-grade-tuned-2026-04-19"
+# v5.8 (2026-04-19): grid search により各 grade で最適戦略を選定:
+#   G1: win_prob (現行維持 — 小サンプル 39R ゆえ robustness 優先)
+#   G2: diversified_1-3_4-7_8+ (n=63, ROI -48% → +21%, robust)
+#   G3: loose_1-4_5-9_10+      (n=119, ROI -37% → -3%, robust)
+#   合計 221R: ROI -34.5% → +3.2% (+38pp 改善見込み、実運用で劣化余地)
+#   詳細: tools/grid_search_strategy.py
 # v5.7 (2026-04-19): G2 のみ TOP 3 を市場分散戦略に切り替え。
 #   - 本命: 市場 1-3 番人気から win_prob 最大
 #   - 対抗: 市場 4-7 番人気から win_prob 最大

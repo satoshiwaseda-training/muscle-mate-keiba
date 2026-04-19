@@ -635,21 +635,38 @@ elif batch and batch["results"]:
                 _apply_diversified = _gs.should_apply_diversified(_grade)
 
                 if _apply_diversified:
-                    # G2 (or JpnII): market-rank diversified pick
+                    # Use the specific strategy selected for this grade.
+                    _strategy_name = _gs.get_strategy_for_grade(_grade)
                     _mk_map = _gs.build_market_rank_map(ranked)
                     top3 = _gs.pick_diversified_top3(ranked, _mk_map,
-                                                      strategy="diversified")
+                                                      strategy=_strategy_name)
                     labels = [h.get("bucket_mark", "◎") + " " +
                               h.get("bucket_label", "本命") for h in top3]
+                    # Strategy description for UI
+                    _strategy_desc = {
+                        "diversified_1-3_4-7_8+": "G2 市場分散戦略 (1-3/4-7/8+)",
+                        "loose_1-4_5-9_10+":      "G3 広域戦略 (1-4/5-9/10+)",
+                        "tight_1-2_3-5_6+":       "厳選戦略 (1-2/3-5/6+)",
+                        "mid_heavy_1-2_3-6_7+":   "中位重視戦略 (1-2/3-6/7+)",
+                        "wide_穴_1-3_4-8_9+":     "穴寄り戦略 (1-3/4-8/9+)",
+                    }.get(_strategy_name, _strategy_name)
                     st.markdown(
-                        "### 🎯 本日のベスト 3 頭予測（G2 市場分散戦略）"
+                        f"### 🎯 本日のベスト 3 頭予測（{_strategy_desc}）"
                     )
-                    st.caption(
-                        "G2 は市場 4-10 番人気の勝利が 48% を占めるため、"
-                        "本命を市場 1-3、対抗を 4-7、単穴を 8 番以下から"
-                        "バランスよく選ぶ設計です（63 R backtest: "
-                        "ROI -48% → +21%）。"
-                    )
+                    # Per-grade caption
+                    if "diversified_1-3" in _strategy_name:
+                        st.caption(
+                            "G2 は市場 4-10 番人気の勝利が 48% を占めるため、"
+                            "本命を市場 1-3、対抗を 4-7、単穴を 8 番以下から"
+                            "バランスよく選ぶ設計（63 R backtest: "
+                            "ROI -48% → +21%）"
+                        )
+                    elif "loose_1-4" in _strategy_name:
+                        st.caption(
+                            "G3 は分散を広げつつ中上位を残す設計。"
+                            "本命を市場 1-4、対抗を 5-9、単穴を 10 番以下から。"
+                            "119 R backtest: ROI -37% → -3%。"
+                        )
                 else:
                     top3 = ranked[:3]
                     labels = ["◎ 本命", "○ 対抗", "▲ 単穴"]
