@@ -392,13 +392,27 @@ elif batch and batch["results"]:
                 "http":      http,
             })
 
+        # Show diagnostic details for debugging
+        diag_lines = []
+        for r in odds_not_pub[:3]:
+            am = r.get("odds_api_meta") or {}
+            diag_lines.append(
+                f"  {r.get('race_name','?')}: "
+                f"http={am.get('api_http_status', '?')} "
+                f"schema={am.get('api_schema_version', '?')} "
+                f"source={am.get('odds_source', '?')} "
+                f"reason={str(am.get('api_raw_reason', ''))[:60]}"
+            )
+        diag_str = "\n".join(diag_lines)
+
         st.warning(
             f"🕒 **{len(odds_not_pub)} レースでオッズ未公開** "
-            f"(`status: middle` · 取得時刻 {fetched_display}) — "
-            f"**スクレイパーのバグではありません**。"
-            f"netkeiba が発走 2〜3 時間前にならないとオッズを出さないためです。"
-            f"現在の予測は **early version** として記録されていますが、"
-            f"ROI 集計からは分離されます (history に保全)。"
+            f"(`status: middle` · 取得時刻 {fetched_display})\n\n"
+            f"netkeiba API が `status=middle` を返し、"
+            f"SP版・Yahoo・JRA等 **全7フォールバックも失敗** しています。\n\n"
+            f"**原因:** 発走2〜3時間前まで公式オッズが未公開 + "
+            f"前日オッズはJS描画のため `requests` では取得不可。\n\n"
+            f"**診断情報:**\n```\n{diag_str}\n```"
         )
         st.dataframe(pd.DataFrame(rows),
                      use_container_width=True, hide_index=True)

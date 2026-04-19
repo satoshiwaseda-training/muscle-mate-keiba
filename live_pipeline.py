@@ -216,6 +216,7 @@ def _inject_odds_if_missing(
     _log(progress_cb, "SP版出馬表からオッズ取得試行")
     try:
         sp_odds = scraper.fetch_odds_from_sp_shutuba(race_id)
+        _log(progress_cb, f"  SP版結果: {len(sp_odds)} 件取得")
         if sp_odds:
             injected = 0
             for e in entries:
@@ -243,6 +244,7 @@ def _inject_odds_if_missing(
     _log(progress_cb, "netkeiba オッズページ (inline script) から取得試行")
     try:
         page_odds = scraper.fetch_odds_from_odds_page(race_id)
+        _log(progress_cb, f"  オッズページ結果: {len(page_odds)} 件取得")
         if page_odds:
             injected = _inject_from_umaban_map(entries, page_odds)
             if injected:
@@ -256,6 +258,7 @@ def _inject_odds_if_missing(
     _log(progress_cb, "Yahoo Sports Keiba からオッズ取得試行")
     try:
         yahoo_odds = scraper.fetch_odds_from_yahoo(race_id)
+        _log(progress_cb, f"  Yahoo結果: {len(yahoo_odds)} 件取得")
         if yahoo_odds:
             injected = _inject_from_umaban_map(entries, yahoo_odds)
             if injected:
@@ -265,10 +268,11 @@ def _inject_odds_if_missing(
     except Exception as e:
         _log(progress_cb, f"Yahoo Keiba取得失敗: {e}")
 
-    # Fallback: pandas read_html / SP odds page
-    _log(progress_cb, "netkeiba (pd.read_html / SP odds) から取得試行")
+    # Fallback: pandas read_html / SP odds / JRA official
+    _log(progress_cb, "netkeiba (pd.read_html / SP odds / JRA) から取得試行")
     try:
         top_odds = scraper.fetch_odds_from_netkeiba_top(race_id)
+        _log(progress_cb, f"  代替ソース結果: {len(top_odds)} 件取得")
         if top_odds:
             injected = _inject_from_umaban_map(entries, top_odds)
             if injected:
