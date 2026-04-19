@@ -12,11 +12,43 @@ import time
 import re
 import json
 import html
+import random
 from datetime import date, datetime
+from pathlib import Path
 from typing import Optional
 
 import requests
 from bs4 import BeautifulSoup
+
+# ── Retry / backoff ─────────────────────────────────────
+MAX_RETRIES = 4          # total attempts per request (1 initial + 3 retries)
+BACKOFF_BASE = 1.8       # exponential factor: 1.8, 3.24, 5.83, 10.5 s
+RETRY_STATUS = {408, 429, 500, 502, 503, 504}
+
+# ── Disk cache for enrichment fetches ──────────────────
+_CACHE_ROOT = Path(__file__).parent / "data" / "scraper_cache"
+
+def _cache_path(kind: str, key: str) -> Path:
+    (_CACHE_ROOT / kind).mkdir(parents=True, exist_ok=True)
+    safe_key = re.sub(r"[^\w\-]", "_", str(key))
+    return _CACHE_ROOT / kind / f"{safe_key}.json"
+
+def _cache_load(kind: str, key: str):
+    p = _cache_path(kind, key)
+    if not p.exists():
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _cache_save(kind: str, key: str, data) -> None:
+    try:
+        with open(_cache_path(kind, key), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[scraper] cache save {kind}/{key} failed: {e}")
 
 
 def _clean_text(text: str) -> str:
@@ -354,33 +386,51 @@ def _is_hot_temp(weather_temp: str) -> bool:
 
 def _get(url: str, params: dict = None, encoding: str = None,
          delay: float = REQUEST_DELAY) -> Optional[BeautifulSoup]:
-    try:
-        time.sleep(delay)
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=12)
-        resp.raise_for_status()
-        # Use raw bytes so BeautifulSoup reads the meta charset tag (EUC-JP etc.) correctly.
-        # Passing resp.text causes double-encoding issues on EUC-JP pages (netkeiba).
-        if encoding:
-            return BeautifulSoup(resp.content, "html.parser", from_encoding=encoding)
-        return BeautifulSoup(resp.content, "html.parser")
-    except Exception as e:
-        print(f"[scraper] GET {url} failed: {e}")
-        return None
+    # Polite crawl rate + retry with exponential backoff on transient errors.
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        wait = delay if attempt == 0 else BACKOFF_BASE ** attempt + random.random()
+        time.sleep(wait)
+        try:
+            resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+            if resp.status_code in RETRY_STATUS:
+                last_err = f"HTTP {resp.status_code}"
+                continue
+            resp.raise_for_status()
+            if encoding:
+                return BeautifulSoup(resp.content, "html.parser", from_encoding=encoding)
+            return BeautifulSoup(resp.content, "html.parser")
+        except requests.RequestException as e:
+            last_err = str(e)
+            continue
+    print(f"[scraper] GET {url} failed after {MAX_RETRIES} attempts: {last_err}")
+    return None
 
 
 def _get_json(url: str, params: dict = None) -> Optional[dict]:
-    """Fetch JSON endpoint (used for OpenMeteo)."""
-    try:
-        time.sleep(0.3)
-        resp = requests.get(url, params=params, timeout=15)
-        data = resp.json()
-        if data.get("error"):
-            print(f"[scraper] JSON GET {url} API error: {data.get('reason')}")
-            return None
-        return data
-    except Exception as e:
-        print(f"[scraper] JSON GET {url} failed: {e}")
-        return None
+    """Fetch JSON endpoint with retry + backoff (used for OpenMeteo)."""
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        wait = 0.3 if attempt == 0 else BACKOFF_BASE ** attempt + random.random()
+        time.sleep(wait)
+        try:
+            resp = requests.get(url, params=params, timeout=15)
+            if resp.status_code in RETRY_STATUS:
+                last_err = f"HTTP {resp.status_code}"
+                continue
+            data = resp.json()
+            if isinstance(data, dict) and data.get("error"):
+                print(f"[scraper] JSON GET {url} API error: {data.get('reason')}")
+                return None
+            return data
+        except requests.RequestException as e:
+            last_err = str(e)
+            continue
+        except ValueError as e:
+            last_err = f"invalid json: {e}"
+            continue
+    print(f"[scraper] JSON GET {url} failed after {MAX_RETRIES} attempts: {last_err}")
+    return None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -524,18 +574,63 @@ def fetch_horse_detail(horse_id: str) -> dict:
     if soup is None:
         return {}
 
-    result = {"horse_id": horse_id, "recent_races": [], "sire": "", "dam": "", "weight_trend": []}
+    result = {"horse_id": horse_id, "recent_races": [], "sire": "", "dam": "",
+              "damsire": "", "breeder": "", "owner": "", "weight_trend": []}
 
-    # Bloodline
-    for row in soup.select("table.db_prof_table tr, .horse_title tr"):
-        cells = row.find_all("td")
-        if len(cells) >= 2:
-            label = cells[0].get_text(strip=True)
-            val = cells[1].get_text(strip=True)
-            if "父" == label:
-                result["sire"] = val
-            elif "母" == label:
-                result["dam"] = val
+    # Profile fields from db_prof_table (uses <th> for labels, <td> for values)
+    prof_table = soup.select_one("table.db_prof_table")
+    if prof_table:
+        for row in prof_table.select("tr"):
+            ths = row.find_all("th")
+            tds = row.find_all("td")
+            for th, td in zip(ths, tds):
+                label = th.get_text(strip=True)
+                val = td.get_text(strip=True)
+                if label == "生産者":
+                    result["breeder"] = val
+                elif label == "馬主":
+                    result["owner"] = val
+
+    # Bloodline from pedigree page (/horse/ped/{id}/)
+    # The blood_table is only on the ped subpage, not the main profile.
+    ped_url = f"https://db.netkeiba.com/horse/ped/{horse_id}/"
+    ped_soup = _get(ped_url)
+    if ped_soup:
+        blood_table = ped_soup.select_one("table.blood_table")
+        if blood_table:
+            rows = blood_table.select("tr")
+            # Row 0, first td with rowspan=16 → sire (父)
+            # Row 16, first td with rowspan=16 → dam (母)
+            # Row 16, second td with rowspan=8 → damsire (母の父)
+            if rows:
+                # Sire: first cell of first row
+                first_row_cells = rows[0].select("td")
+                if first_row_cells:
+                    a = first_row_cells[0].select_one("a")
+                    if a:
+                        sire_text = a.get_text(strip=True)
+                        # Strip country suffix like "(愛)" or "(米)"
+                        sire_text = re.sub(r"\(.*?\)$", "", sire_text).strip()
+                        result["sire"] = sire_text
+
+                # Dam and damsire: row with rowspan=16 for dam
+                # Due to rowspan collapsing, we need the row at index 16
+                if len(rows) > 16:
+                    dam_cells = rows[16].select("td")
+                    if dam_cells:
+                        # First cell = dam (母)
+                        a = dam_cells[0].select_one("a")
+                        if a:
+                            dam_text = a.get_text(strip=True)
+                            dam_text = re.sub(r"\(.*?\)$", "", dam_text).strip()
+                            result["dam"] = dam_text
+                        # Second cell = damsire (母の父)
+                        if len(dam_cells) > 1:
+                            a2 = dam_cells[1].select_one("a")
+                            if a2:
+                                ds_text = a2.get_text(strip=True)
+                                ds_text = re.sub(r"\(.*?\)$", "", ds_text).strip()
+                                result["damsire"] = ds_text
 
     # Recent race results table (直近成績)
     for tbl in soup.select("table.race_table_01, table.db_h_race_results"):
@@ -571,11 +666,15 @@ def fetch_horse_detail(horse_id: str) -> dict:
 # ═══════════════════════════════════════════════════════════
 
 def fetch_jockey_stats(jockey_id: str) -> dict:
+    """Fetch jockey career stats from db.netkeiba.com/jockey/{jockey_id}/.
+
+    The profile page has a `table.ResultsByYears` block whose 累計 row holds
+    career totals. Column layout (as of 2026-04):
+      [年度, 順位, 1着, 2着, 3着, 4着〜, 騎乗回数, 重賞出走, 重賞勝利,
+       勝率, 連対率, 複勝率, 代表馬]
+    We read 累計 row and pull 勝率 (col 9), 複勝率 (col 11), 重賞勝利 (col 8).
     """
-    Fetch jockey career stats from db.netkeiba.com/jockey/{jockey_id}/.
-    Returns win_rate, place_rate, g1_wins, single_recovery_rate.
-    """
-    url = f"https://db.netkeiba.com/jockey/result/recent/{jockey_id}/"
+    url = f"https://db.netkeiba.com/jockey/{jockey_id}/"
     soup = _get(url)
     if soup is None:
         return {}
@@ -583,30 +682,28 @@ def fetch_jockey_stats(jockey_id: str) -> dict:
     stats = {"jockey_id": jockey_id, "win_rate": "", "place_rate": "",
              "g1_wins": "", "single_recovery": ""}
 
-    tbl = soup.select_one("table.db_prof_table, table.race_table_01")
-    if tbl:
-        rows = tbl.select("tr")
-        for row in rows:
-            cells = row.find_all("td")
-            if len(cells) >= 6:
-                try:
-                    rides = int(cells[0].get_text(strip=True).replace(",", ""))
-                    wins = int(cells[1].get_text(strip=True).replace(",", ""))
-                    seconds = int(cells[2].get_text(strip=True).replace(",", ""))
-                    thirds = int(cells[3].get_text(strip=True).replace(",", ""))
-                    if rides > 0:
-                        stats["win_rate"] = f"{wins/rides:.1%}"
-                        stats["place_rate"] = f"{(wins+seconds+thirds)/rides:.1%}"
-                except Exception:
-                    pass
-                break
-
-    # G1 wins: count from results filtered by grade
-    grade_url = f"https://db.netkeiba.com/jockey/result/recent/{jockey_id}/?grade=G1"
-    g1_soup = _get(grade_url)
-    if g1_soup:
-        g1_wins_match = re.search(r"(\d+)勝", g1_soup.get_text())
-        stats["g1_wins"] = g1_wins_match.group(1) + "勝" if g1_wins_match else "?"
+    # Career summary sits in the first ResultsByYears table (JRA 中央).
+    summary = soup.select_one("table.ResultsByYears")
+    if summary:
+        for row in summary.select("tr"):
+            cells = row.find_all(["th", "td"])
+            if not cells:
+                continue
+            label = cells[0].get_text(strip=True)
+            if label != "累計" or len(cells) < 12:
+                continue
+            # Numeric columns are plain text; percent cols have "％"
+            def _pct(s: str) -> str:
+                s = s.replace("％", "%").strip()
+                return s if s and s != "%" else ""
+            try:
+                stats["win_rate"] = _pct(cells[9].get_text(strip=True))
+                stats["place_rate"] = _pct(cells[11].get_text(strip=True))
+                # 重賞勝利 = graded stakes wins, use as g1 proxy floor
+                stats["g1_wins"] = cells[8].get_text(strip=True) + "勝"
+            except Exception:
+                pass
+            break
 
     return stats
 
@@ -645,9 +742,89 @@ def fetch_trainer_stats(trainer_id: str) -> dict:
 # 5. Training times — race.netkeiba.com/oikiri
 # ═══════════════════════════════════════════════════════════
 
-def fetch_training_times(race_id: str) -> list[dict]:
+# ── Training critic text → ordinal score ─────────────
+# Ordinal mapping of the free Training_Critic text found on the oikiri
+# page. Longest phrases come first so more specific strings (e.g. "仕上がり
+# 抜群") win over shorter prefixes (e.g. "仕上がり"). Neutral default 0.50
+# applies when a non-empty text contains none of these phrases.
+
+TRAINING_CRITIC_ORDINAL: list[tuple[str, float]] = sorted([
+    # S-tier: peak condition
+    ("仕上がり抜群", 1.00),
+    ("絶好調", 1.00),
+    ("文句なし", 1.00),
+    ("万全", 1.00),
+    # A-tier: well-prepared
+    ("態勢は整った", 0.80),
+    ("好仕上がり", 0.80),
+    ("状態良好", 0.80),
+    ("態勢整う", 0.75),
+    ("順調", 0.75),
+    ("好調", 0.80),
+    # B+-tier: upward / satisfactory
+    ("状態上向き", 0.45),
+    ("上昇途上", 0.35),
+    ("まずまずの仕上がり", 0.60),
+    ("悪くない", 0.60),
+    ("まずまず", 0.60),
+    # B-tier: neutral
+    ("普通", 0.50),
+    ("平凡", 0.50),
+    ("及第点", 0.50),
+    # C-tier: concern
+    ("物足りない", 0.35),
+    ("今ひとつ", 0.35),
+    ("いまいち", 0.35),
+    # D-tier: worry
+    ("物足りず", 0.20),
+    ("状態に疑問", 0.20),
+    ("不安", 0.20),
+    # E-tier: bad
+    ("状態悪い", 0.10),
+    ("大幅減", 0.10),
+    ("太め", 0.15),
+], key=lambda kv: -len(kv[0]))  # longest-match-first
+
+
+def parse_training_critic(text: str) -> float:
+    """Map a free Training_Critic string to an ordinal score in [0.0, 1.0].
+
+    Empty text → 0.0 (no signal). Non-empty text with no phrase match → 0.50.
+    Matches are longest-first so "仕上がり抜群" does not get caught by an
+    earlier shorter rule.
     """
-    Fetch training (追い切り) times for all horses in a race.
+    if not text:
+        return 0.0
+    for phrase, score in TRAINING_CRITIC_ORDINAL:
+        if phrase in text:
+            return score
+    return 0.50
+
+
+def synthetic_training_acceleration(critic_score: float,
+                                    scale: float = 0.16) -> float:
+    """Convert a critic ordinal score to a synthetic training_acceleration.
+
+    score_runner expects training_acceleration in roughly [-0.15, +0.15].
+    With scale=0.16, critic=1.0 → +0.08, critic=0.0 → -0.08, critic=0.5 → 0.
+    We start intentionally weak (×0.16) — bump to 0.20 or 0.24 only if
+    the ranking-changed rate stays too flat under live evaluation.
+    """
+    if critic_score <= 0:
+        return 0.0
+    return (critic_score - 0.5) * scale
+
+
+def fetch_training_times(race_id: str) -> list[dict]:
+    """Fetch training (追い切り) text-only fields for all horses in a race.
+
+    Numeric lap times (一番時計, ハロン) are behind netkeiba's paid paywall
+    on the free /oikiri/ page — trying to extract them returns either
+    placeholder `--` marks or header junk. We deliberately do NOT parse
+    `lap` numerically here; instead we extract the text evaluation
+    (.Training_Critic cell) which is free, and later map it to a synthetic
+    ordinal acceleration via `parse_training_critic()`.
+
     Returns list of {name, course, lap, evaluation}.
     """
     url = f"https://race.netkeiba.com/race/oikiri.html?race_id={race_id}"
@@ -656,23 +833,21 @@ def fetch_training_times(race_id: str) -> list[dict]:
         return []
 
     results = []
-    for row in soup.select("tr.OikiriList_Row, tr[class*='HorseList']"):
-        cells = row.find_all("td")
-        if len(cells) < 4:
+    for row in soup.select("tr[class*='HorseList']"):
+        name_tag = row.select_one(".Horse_Name, .HorseName")
+        if not name_tag:
             continue
-        try:
-            name_tag = row.select_one(".HorseName, .Horse_Name")
-            name = name_tag.get_text(strip=True) if name_tag else cells[1].get_text(strip=True)
-            course_tag = row.select_one(".Course, .TrackCourse")
-            course = course_tag.get_text(strip=True) if course_tag else cells[2].get_text(strip=True)
-            time_tag = row.select_one(".Time, .OikiriTime")
-            lap = time_tag.get_text(strip=True) if time_tag else cells[3].get_text(strip=True)
-            eval_tag = row.select_one(".Hyouka, .Evaluation")
-            evaluation = eval_tag.get_text(strip=True) if eval_tag else ""
-            results.append({"name": name, "course": course, "lap": lap, "evaluation": evaluation})
-        except Exception:
+        name = _clean_text(name_tag.get_text(strip=True))
+        if not name:
             continue
-
+        critic_tag = row.select_one(".Training_Critic")
+        evaluation = _clean_text(critic_tag.get_text(strip=True)) if critic_tag else ""
+        results.append({
+            "name": name,
+            "course": "",       # paywalled
+            "lap": "",          # paywalled
+            "evaluation": evaluation,
+        })
     return results
 
 
@@ -694,10 +869,42 @@ def get_this_week_race_dates() -> tuple["date", "date"]:
     return saturday, sunday
 
 
-def fetch_race_list_netkeiba(race_date: date) -> list[dict]:
+def fetch_race_list_netkeiba(
+    race_date: date,
+    graded_only: bool = True,
+    grades: tuple = ("G1", "G2", "G3"),
+) -> list[dict]:
     """
-    race_list_sub.html (AJAXエンドポイント) から G1/G2/G3 を取得。
-    Icon_GradeType1=G1, Icon_GradeType2=G2, Icon_GradeType3=G3
+    race_list_sub.html (AJAX endpoint) からその日のレース一覧を取得。
+
+    Args:
+        race_date:   target date
+        graded_only: True (default) → only races whose Icon_GradeType
+                     matches one of `grades` are returned.
+                     False → all JRA races for the day (≈30-36).
+        grades:      Which grades to include when graded_only=True.
+                     Default ("G1","G2","G3") preserves the legacy
+                     contract of fetch_past_g_races /
+                     fetch_this_week_races. The live batch uses
+                     ("G1","G2") only (see LIVE_GRADE_FILTER).
+
+    Bug history (fixed 2026-04-12):
+      1. Earlier revisions hard-skipped every race without an
+         Icon_GradeType1/2/3 class, which returned only 1 race on a
+         typical G1 Sunday (桜花賞) and 0 on most weekends. The filter
+         is now parameterised.
+      2. Earlier revisions computed venue_map by picking the FIRST
+         .RaceList_DataTitle found inside the single .RaceList_Box and
+         mapping every li.RaceList_DataItem in that box to it — so all
+         36 races got tagged with the first venue (e.g. all tagged 中山
+         even when actually at 阪神/福島). The fix pairs each
+         .RaceList_DataList with its own .RaceList_DataTitle by
+         document-order index, because the real DOM is:
+             DataList[0] (venue A)   Title[0] "N回 A X日目"
+             DataList[1] (venue B)   Title[1] "N回 B X日目"
+             DataList[2] (venue C)   Title[2] "N回 C X日目"
+         i.e. each title appears IMMEDIATELY AFTER the DataList it
+         describes, not before.
     """
     date_str = race_date.strftime("%Y%m%d")
     soup = _get(
@@ -707,15 +914,18 @@ def fetch_race_list_netkeiba(race_date: date) -> list[dict]:
     if soup is None:
         return []
 
-    # 会場名を先に収集: .RaceList_DataTitle の直後のリストが同会場
-    # 構造: RaceList_Box > RaceList_DataTitle + RaceList_DataList > li.RaceList_DataItem
+    # ── Venue mapping (fix #2) ────────────────────────────────
+    # Pair DataList[i] ↔ DataTitle[i] by document-order index.
     venue_map: dict[str, str] = {}
-    for box in soup.select(".RaceList_Box"):
-        venue_tag = box.select_one(".RaceList_DataTitle")
-        venue_text = venue_tag.get_text(strip=True) if venue_tag else ""
-        # 「2回中山4日目」→ 「中山」を抽出
-        venue_short = re.sub(r"\d+回|\d+日目", "", venue_text).strip()
-        for li in box.select("li.RaceList_DataItem"):
+    dls    = soup.find_all(class_="RaceList_DataList")
+    titles = soup.find_all(class_="RaceList_DataTitle")
+    for i, dl in enumerate(dls):
+        if i >= len(titles):
+            break
+        title_text = titles[i].get_text(strip=True)
+        # "3回中山6日目" → "中山"
+        venue_short = re.sub(r"\d+回|\d+日目", "", title_text).strip()
+        for li in dl.select("li.RaceList_DataItem"):
             a = li.select_one("a[href*='race_id']")
             if not a:
                 continue
@@ -725,7 +935,7 @@ def fetch_race_list_netkeiba(race_date: date) -> list[dict]:
 
     races = []
     for li in soup.select("li.RaceList_DataItem"):
-        # ── グレード判定 (Type1=G1, Type2=G2, Type3=G3) ────
+        # ── grade 判定 ────
         grade = ""
         for tag in li.select(".Icon_GradeType"):
             for cls in tag.get("class", []):
@@ -735,10 +945,14 @@ def fetch_race_list_netkeiba(race_date: date) -> list[dict]:
                     grade = "G2"
                 elif cls == "Icon_GradeType3":
                     grade = "G3"
-        if not grade:
-            continue
+        # Fix #1: only skip non-graded races when explicitly asked to.
+        # Also honour the `grades` tuple so callers can restrict to a
+        # subset (e.g. ("G1","G2") for the live weekend batch).
+        if graded_only:
+            if not grade or grade not in grades:
+                continue
 
-        # ── race_id ─────────────────────────────────────────
+        # ── race_id ────
         a = li.select_one("a[href*='race_id']")
         if not a:
             continue
@@ -747,20 +961,24 @@ def fetch_race_list_netkeiba(race_date: date) -> list[dict]:
             continue
         race_id = m.group(1)
 
-        # ── レース名 ────────────────────────────────────────
+        # ── レース名 ────
         name_tag = li.select_one(".ItemTitle")
         race_name = name_tag.get_text(strip=True) if name_tag else "不明"
 
-        # ── 発走時刻 ────────────────────────────────────────
+        # ── 発走時刻 ────
         time_tag = li.select_one(".RaceList_Itemtime")
         race_time = time_tag.get_text(strip=True) if time_tag else ""
 
-        # ── 会場 ────────────────────────────────────────────
+        # ── 会場 ────
         venue = venue_map.get(race_id, "")
+
+        # Append the grade suffix only when the race is actually graded;
+        # otherwise the display name is the raw class name ("3歳未勝利" etc).
+        display_name = f"{race_name} ({grade})" if grade else race_name
 
         races.append({
             "race_id": race_id,
-            "race_name": f"{race_name} ({grade})",
+            "race_name": display_name,
             "grade": grade,
             "venue": venue,
             "time": race_time,
@@ -777,6 +995,234 @@ def fetch_race_list_netkeiba(race_date: date) -> list[dict]:
 # ═══════════════════════════════════════════════════════════
 # 7. Race metadata — netkeiba shutuba
 # ═══════════════════════════════════════════════════════════
+
+def fetch_odds_netkeiba(race_id: str) -> dict:
+    """Fetch 単勝 (win) odds from netkeiba's JSON API.
+
+    The HTML odds page (`/odds/index.html?...`) is a JavaScript SPA and
+    its raw HTML only contains `---.-` placeholders. The real odds are
+    served by an XHR endpoint that netkeiba itself uses to populate the
+    page:
+
+      GET https://race.netkeiba.com/api/api_get_jra_odds.html
+          ?type=1&locale=ja&race_id={race_id}
+
+    Response shape (confirmed against past and current races, 2026-04):
+      {
+        "status": "result" | "middle" | ...,
+        "update_count": "<int>",
+        "reason": "",
+        "data": {
+          "official_datetime": "2026-04-05 15:48:34",
+          "odds": {
+            "1": {                       # type 1 = 単勝
+              "01": ["336.7", "", "15"], # 馬番 → [単勝odds, blank, popularity]
+              ...
+            },
+            "2": { ... }                 # type 2 = 複勝 (not used here)
+          }
+        }
+      }
+
+    Status semantics:
+      - "result" : odds are available (current or past race)
+      - "middle" : netkeiba has not yet published odds for this race
+                   (normal for races >3h before post time); caller must
+                   distinguish this from a fetch failure.
+
+    Returns a defensive dict shaped so that "netkeiba is just not ready"
+    can be cleanly distinguished from "the API shape has changed and we
+    cannot parse it anymore". Every failure mode populates the same keys
+    so the caller does not need try/except:
+      {
+        "status":               "result" | "not-published" | "error",
+        "by_number":            {umaban_int: odds_float},  # {} unless "result"
+        "official_time":        str | None,
+        "update_count":         int,
+        "raw_reason":           str,       # netkeiba's own reason field
+        # ── defensive metadata (ADDED 2026-04) ──
+        "http_status":          int,       # 0 if no HTTP response was read
+        "response_url":         str,       # final URL after any redirect
+        "parse_error":          str | None,  # set only on JSON parse failure
+        "schema_version_guess": str,       # "v1-jra-odds-2026" | "unknown-*"
+        "fetched_at":           str,       # ISO local time of the fetch
+      }
+
+    The 馬番→odds keying is intentional because the netkeiba API is keyed
+    by 馬番 (stable) and not by name. Callers join with shutuba entries
+    via `entry["number"]`.
+
+    schema_version_guess semantics:
+      "v1-jra-odds-2026"       — top-level has (status, data, update_count,
+                                 reason) and data.odds.1 values are 3-element
+                                 lists. Current (2026-04) schema.
+      "v1-empty-odds"          — correct shape but odds dict is empty
+                                 (netkeiba in middle state)
+      "v1-empty-data"          — correct top-level but data is "" or None
+                                 (netkeiba in middle state)
+      "unknown-top:..."        — top-level key set differs from expected
+                                 → SUSPECT API CHANGE, investigate
+      "unknown-inner-shape"    — odds dict exists but inner list shape is
+                                 wrong → SUSPECT API CHANGE
+      "unknown-data-shape"     — data exists but has no "odds" key
+                                 → SUSPECT API CHANGE
+      "unknown-no-json"        — we never got a JSON body (HTTP error,
+                                 network error, parse error)
+    """
+    import datetime as _dt
+    import json as _json
+    import urllib.error as _err
+    import urllib.request as _req
+
+    # URL: netkeiba の内部 API。`action=init` は初回取得フラグで、
+    # 既知の OSS ライブラリ (new-village/KeibaScraper) が使っている正規形式。
+    # `type=1` は単勝指定。これらが揃わないと別の bet type が返ってくる
+    # 可能性がある (フォルテアンジェロ事件の suspect 原因のひとつ)。
+    url = (f"https://race.netkeiba.com/api/api_get_jra_odds.html"
+           f"?type=1&action=init&race_id={race_id}&locale=ja")
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/128.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": (
+            f"https://race.netkeiba.com/odds/index.html"
+            f"?race_id={race_id}&rf=race_submenu&type=b1"
+        ),
+    }
+    result: dict = {
+        "status": "error",
+        "by_number": {},
+        "official_time": None,
+        "update_count": 0,
+        "raw_reason": "",
+        "http_status": 0,
+        "response_url": url,
+        "parse_error": None,
+        "schema_version_guess": "unknown-no-json",
+        "fetched_at": _dt.datetime.now().isoformat(timespec="seconds"),
+    }
+
+    body: str = ""
+    try:
+        req = _req.Request(url, headers=headers)
+        with _req.urlopen(req, timeout=10) as resp:
+            result["http_status"] = getattr(resp, "status", 200)
+            result["response_url"] = getattr(resp, "url", url) or url
+            body = resp.read().decode("utf-8", errors="replace")
+    except _err.HTTPError as e:
+        result["http_status"] = int(getattr(e, "code", 0) or 0)
+        result["raw_reason"] = f"http-error: {e.code} {getattr(e, 'reason', '')}"
+        return result
+    except Exception as e:
+        result["raw_reason"] = f"fetch-failed: {e.__class__.__name__}: {e}"
+        return result
+
+    # ── Trace dump (ODDS_TRACE_DIR 環境変数が設定されているとき) ──
+    # 偽オッズ事件 (170/678/788) の原因特定のため、API の生 JSON を
+    # ディスクに落とせるようにする。本番環境でのみ有効化する想定:
+    #   export ODDS_TRACE_DIR=/path/to/trace
+    # 実行後、ODDS_TRACE_DIR/<race_id>_<timestamp>.json に生レスポンスが残る。
+    import os as _os
+    _trace_dir = _os.environ.get("ODDS_TRACE_DIR")
+    if _trace_dir:
+        try:
+            _td = Path(_trace_dir)
+            _td.mkdir(parents=True, exist_ok=True)
+            _ts = _dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+            _p = _td / f"{race_id}_{_ts}.json"
+            _p.write_text(body, encoding="utf-8")
+            print(f"[odds-trace] raw API body saved: {_p}")
+        except Exception as e:
+            print(f"[odds-trace] dump failed: {e}")
+
+    try:
+        payload = _json.loads(body)
+    except Exception as e:
+        result["parse_error"] = f"json-parse-failed: {e.__class__.__name__}: {e}"
+        result["raw_reason"] = result["parse_error"]
+        return result
+
+    if not isinstance(payload, dict):
+        result["schema_version_guess"] = f"unknown-top-type:{type(payload).__name__}"
+        result["raw_reason"] = "payload not a dict"
+        return result
+
+    # Schema detection — must run before status decoding so we can flag
+    # API shape changes even when the endpoint returns a 200 with data.
+    top_keys = set(payload.keys())
+    expected_top = {"status", "data", "update_count", "reason"}
+    if expected_top.issubset(top_keys):
+        data_for_schema = payload.get("data")
+        if isinstance(data_for_schema, dict) and "odds" in data_for_schema:
+            odds_block_for_schema = (data_for_schema.get("odds") or {}).get("1") or {}
+            if isinstance(odds_block_for_schema, dict) and odds_block_for_schema:
+                sample = next(iter(odds_block_for_schema.values()), None)
+                if isinstance(sample, list) and len(sample) >= 3:
+                    result["schema_version_guess"] = "v1-jra-odds-2026"
+                else:
+                    result["schema_version_guess"] = "unknown-inner-shape"
+            elif isinstance(odds_block_for_schema, dict):
+                result["schema_version_guess"] = "v1-empty-odds"
+            else:
+                result["schema_version_guess"] = "unknown-data-shape"
+        elif data_for_schema in ("", None):
+            result["schema_version_guess"] = "v1-empty-data"
+        else:
+            result["schema_version_guess"] = "unknown-data-shape"
+    else:
+        # Sort so the string is deterministic for monitoring / alerting
+        result["schema_version_guess"] = (
+            "unknown-top:" + ",".join(sorted(top_keys))[:80]
+        )
+
+    raw_status = (payload.get("status") or "").strip()
+    # netkeiba's own reason wins over whatever we put earlier
+    if payload.get("reason"):
+        result["raw_reason"] = payload.get("reason")
+    try:
+        result["update_count"] = int(payload.get("update_count") or 0)
+    except (TypeError, ValueError):
+        result["update_count"] = 0
+
+    data = payload.get("data")
+    # netkeiba returns "" (empty string) for `data` when odds are not
+    # yet published — that's the "middle" state.
+    if not isinstance(data, dict) or not data:
+        result["status"] = (
+            "not-published" if raw_status in ("middle", "before", "") else "error"
+        )
+        return result
+
+    result["official_time"] = data.get("official_datetime")
+    odds_block = (data.get("odds") or {}).get("1") or {}
+    parsed: dict[int, float] = {}
+    for umaban_str, arr in odds_block.items():
+        if not isinstance(arr, (list, tuple)) or not arr:
+            continue
+        try:
+            um = int(str(umaban_str).lstrip("0") or "0")
+            v = float(str(arr[0]).replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        # 1.0 は JRA 単勝オッズの最小値として合法 (超人気馬) なので
+        # 下限は閉区間 `1.0 <= v` を使う。以前は `1.0 < v` でオッズ
+        # 1.0 ちょうどの馬が silently に捨てられていた。
+        if um > 0 and 1.0 <= v < 10000.0:
+            parsed[um] = v
+
+    if parsed:
+        result["status"] = "result"
+        result["by_number"] = parsed
+    else:
+        result["status"] = (
+            "not-published" if raw_status in ("middle", "before", "") else "error"
+        )
+    return result
+
 
 def fetch_race_info_netkeiba(race_id: str) -> dict:
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
@@ -805,6 +1251,71 @@ def fetch_race_info_netkeiba(race_id: str) -> dict:
 # ═══════════════════════════════════════════════════════════
 # 8. Entries — netkeiba shutuba (with horse/jockey IDs)
 # ═══════════════════════════════════════════════════════════
+
+# 単勝オッズのサニティ範囲 (odds_sources.ODDS_MIN / ODDS_MAX と同じ値)。
+# ここで同一性を担保するために import はしない (循環回避)。
+_SHUTUBA_ODDS_MIN = 1.0
+_SHUTUBA_ODDS_MAX = 500.0
+
+
+def _parse_shutuba_odds(row, cells) -> str:
+    """Parse 単勝オッズ from a netkeiba shutuba row, defensively.
+
+    ⚠ 重要: netkeiba の出馬表 HTML は odds/人気 列を JavaScript で動的に
+    埋める。サーバが返す HTML body の中身は:
+
+        <td class="Txt_R Popular">
+          <span id="odds-1_03">---.-</span>
+        </td>
+
+    つまり requests ベースでは **odds 値は取れない** (常に `---.-`)。
+    本関数は:
+
+      (1) `span[id^='odds-']` の中身を拾う — もし JS 実行後の HTML が
+          渡されていれば値が入っている (Selenium などで保存された
+          HTML を処理する場合)
+      (2) そうでなければ「取得不能」として "0" を返し、下流の
+          consensus overlay (JSON API 経由) に仕事を譲る。
+
+    過去の実装は (a) class="Odds" を探して空振り、(b) 位置指定
+    `cells[9]` へフォールバックしていたが、cells[9] は netkeiba の
+    レイアウト改訂で収得賞金や予想配当など**別カラム**に変わっており、
+    そこから 168.8/170.3/678.1/788.7 等の偽オッズが UI に漏れていた
+    (フォルテアンジェロ事件, 2026-04-19)。本改訂では cells[9]
+    フォールバックを **廃止** し、shutuba HTML からは『未公開』以外を
+    返さない設計に戻す。
+
+    Returns:
+      数値文字列 (e.g. "4.5") または "0" (= 未取得 / shutuba では不可)。
+    """
+    raw = ""
+
+    # 優先: span[id^='odds-'] の中身。netkeiba shutuba で確実に
+    # odds 列を指す唯一の stable なマーカー。
+    span = row.select_one("span[id^='odds-']")
+    if span is not None:
+        raw = span.get_text(strip=True)
+
+    # 次点: 古い result 系テンプレで使われる td.Odds
+    if not raw:
+        td = row.select_one("td.Odds")
+        if td is not None:
+            raw = td.get_text(strip=True)
+
+    # --- / ---.- / 空を "0" に (未公開 = overlay 対象)
+    s = (raw or "").replace("---.-", "0").replace("---", "0").strip()
+    if not s or s == "0":
+        return "0"
+
+    # 数値化 + サニティ (念のため最終防衛)
+    try:
+        v = float(s.replace(",", ""))
+    except ValueError:
+        return "0"
+    if not (_SHUTUBA_ODDS_MIN <= v <= _SHUTUBA_ODDS_MAX):
+        return "0"
+    return f"{v:.1f}"
+
 
 def fetch_entries_netkeiba(race_id: str, venue: str = "") -> list[dict]:
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
@@ -855,14 +1366,22 @@ def fetch_entries_netkeiba(race_id: str, venue: str = "") -> list[dict]:
                 m = re.search(r"/trainer/(?:result/recent/)?(\w+)", trainer_tag.get("href", ""))
                 trainer_id = m.group(1) if m else ""
 
-            # 馬体重
-            weight_td = cells[8] if len(cells) > 8 else None
+            # 馬体重 — class 指定で先に探し、無ければ cells[8] にフォールバック
+            weight_td = row.select_one("td.Weight") or (cells[8] if len(cells) > 8 else None)
             horse_weight = weight_td.get_text(strip=True) if weight_td else ""
 
-            # オッズ（出走前は---の場合あり）
-            odds_td = cells[9] if len(cells) > 9 else None
-            odds = odds_td.get_text(strip=True) if odds_td else "0"
-            odds = odds.replace("---.-", "0").replace("---", "0")
+            # オッズ — class 指定で取る (位置 index はカラム追加で壊れる)。
+            # netkeiba は新しいシーズンに 収得賞金 / 馬主 等を途中に差し
+            # 込むことがあり、cells[9] だと別カラム (e.g. 収得賞金 "168.8"
+            # = 1.688 億円) が誤って読まれる (2026 皐月賞フォルテアンジェロ
+            # 事件)。`td.Odds` は netkeiba が単勝オッズ列に常に付与する
+            # クラスなので、まずこれを試し、無ければ最後の <td> から
+            # 小数値を探すフォールバックに倒す。
+            #
+            # 加えてサニティバウンド: 単勝オッズは 1.0 〜 500.0 の範囲
+            # (ODDS_MIN / ODDS_MAX)。これを外れた値は "0" (= 未取得) 扱い
+            # にして下流 consensus が overlay できるようにする。
+            odds = _parse_shutuba_odds(row, cells)
 
             # 馬主（存在しない場合は空）
             owner_tag = row.select_one(".Owner a")
@@ -912,58 +1431,177 @@ def fetch_entries_netkeiba(race_id: str, venue: str = "") -> list[dict]:
     return horses if horses else _mock_entries(race_id)
 
 
+def _cached_horse_detail(horse_id: str) -> dict:
+    cached = _cache_load("horse", horse_id)
+    # Re-fetch if cache is stale (missing damsire/breeder from v1 scraper)
+    if cached is not None and cached.get("damsire") is not None:
+        return cached
+    detail = fetch_horse_detail(horse_id) or {}
+    if detail:
+        _cache_save("horse", horse_id, detail)
+    return detail
+
+
+def _cached_jockey_stats(jockey_id: str) -> dict:
+    cached = _cache_load("jockey", jockey_id)
+    if cached is not None:
+        return cached
+    jstats = fetch_jockey_stats(jockey_id) or {}
+    if jstats:
+        _cache_save("jockey", jockey_id, jstats)
+    return jstats
+
+
+def _cached_training_times(race_id: str) -> list:
+    cached = _cache_load("training", race_id)
+    if cached is not None:
+        return cached
+    times = fetch_training_times(race_id) or []
+    if times:
+        _cache_save("training", race_id, times)
+    return times
+
+
+def _cached_paddock_reports(race_id: str, horse_names: list, race_name: str = "") -> dict:
+    """Disk-cached per-race paddock report fetch."""
+    cached = _cache_load("paddock", race_id)
+    if cached is not None:
+        return cached
+    reports = fetch_paddock_reports(race_id, horse_names, race_name) or {}
+    if reports:
+        _cache_save("paddock", race_id, reports)
+    return reports
+
+
 def enrich_entries(horses: list[dict], race_id: str,
-                   progress_callback=None) -> list[dict]:
+                   progress_callback=None, race_name: str = "") -> list[dict]:
     """
     Fetch detailed public data for each horse:
       - Horse recent races + bloodline (db.netkeiba)
       - Jockey stats (db.netkeiba)
-      - Training times (netkeiba oikiri)
-    This is slow (~N*3 requests). Call separately from a "詳細取得" button.
+      - Training times — text critic only (lap numerics paywalled)
+      - Paddock reports (multi-source)
+
+    Resilient:
+      - Per-horse try/except so a single failure does not break the race
+      - Disk-cached per horse_id / jockey_id / race_id (see data/scraper_cache)
+      - Whole-race snapshot cached under enrich_race/<race_id>.json
+      - Success/failure counts saved under enrich_stats/<race_id>.json
     """
-    training_map = {t["name"]: t for t in fetch_training_times(race_id)}
+    # Fast path: full-race cache hit
+    cached_race = _cache_load("enrich_race", race_id)
+    if cached_race and len(cached_race) == len(horses):
+        return cached_race
+
+    training_map = {t["name"]: t for t in _cached_training_times(race_id)}
+
+    # Paddock reports — single race-level fetch, covers all horses in one call.
+    horse_names = [h.get("name", "") for h in horses]
+    paddock_map = _cached_paddock_reports(race_id, horse_names, race_name)
+
+    stats = {"total": len(horses), "ok": 0, "partial": 0, "failed": 0}
 
     for i, h in enumerate(horses):
         if progress_callback:
             progress_callback(i, len(horses), h["name"])
 
+        horse_ok = True
+        horse_errors = 0
+
         # Horse detail
         if h.get("horse_id"):
-            detail = fetch_horse_detail(h["horse_id"])
-            if detail:
-                races = detail.get("recent_races", [])
-                h["recent_form"] = " → ".join(
-                    f'{r["date"]} {r["race_name"]} {r["rank"]}着'
-                    for r in races[:3]
-                )
-                h["bloodline"] = f"父:{detail.get('sire','?')} 母:{detail.get('dam','?')}"
-                h["weight_trend"] = " ".join(detail.get("weight_trend", [])[:3])
+            try:
+                detail = _cached_horse_detail(h["horse_id"])
+                if detail:
+                    races = detail.get("recent_races", [])
+                    h["recent_form"] = " → ".join(
+                        f'{r["date"]} {r["race_name"]} {r["rank"]}着'
+                        for r in races[:3]
+                    )
+                    h["bloodline"] = f"父:{detail.get('sire','?')} 母:{detail.get('dam','?')}"
+                    h["sire"] = detail.get("sire", "")
+                    h["dam"] = detail.get("dam", "")
+                    h["damsire"] = detail.get("damsire", "")
+                    h["breeder"] = detail.get("breeder", "")
+                    # owner from detail page (may be more accurate than shutuba)
+                    if detail.get("owner") and not h.get("owner"):
+                        h["owner"] = detail["owner"]
+                    h["weight_trend"] = " ".join(detail.get("weight_trend", [])[:3])
+                else:
+                    horse_errors += 1
+            except Exception as e:
+                horse_errors += 1
+                print(f"[enrich] horse_detail {h.get('name','?')}: {e}")
 
         # Jockey stats
         if h.get("jockey_id"):
-            jstats = fetch_jockey_stats(h["jockey_id"])
-            h["jockey_win_rate"] = jstats.get("win_rate", "")
-            h["jockey_g1_wins"] = jstats.get("g1_wins", "")
+            try:
+                jstats = _cached_jockey_stats(h["jockey_id"])
+                h["jockey_win_rate"] = jstats.get("win_rate", "")
+                h["jockey_g1_wins"] = jstats.get("g1_wins", "")
+                if not jstats:
+                    horse_errors += 1
+            except Exception as e:
+                horse_errors += 1
+                print(f"[enrich] jockey_stats {h.get('name','?')}: {e}")
 
-        # Training eval + physics analysis
-        train = training_map.get(h["name"], {})
-        if train:
-            lap_str = train.get("lap", "")
-            eval_str = train.get("evaluation", "")
-            h["training_eval"] = f"{train.get('course','')} {lap_str} {eval_str}"
-            # Physics analysis
-            h["training_physics"] = analyze_training_physics(lap_str)
-            # NLP score of evaluation text
-            h["training_nlp"] = parse_training_comment(eval_str)
+        # Training — text-only (numeric laps paywalled).
+        # Use the free Training_Critic text → ordinal score → synthetic
+        # training_acceleration. This lets score_runner's training term
+        # bite without modifying train.py.
+        try:
+            train = training_map.get(h["name"], {})
+            eval_str = train.get("evaluation", "") if train else ""
+            critic_score = parse_training_critic(eval_str)
+            h["training_eval"] = eval_str
+            h["training_critic_score"] = critic_score
+            synth_acc = synthetic_training_acceleration(critic_score)
+            h["training_physics"] = {
+                "final_split": 0.0,
+                "acceleration_rate": synth_acc,
+                "cardio_index": critic_score * 0.5,  # weak proxy
+            }
+            h["training_nlp"] = parse_training_comment(eval_str) if eval_str else {}
+            if not eval_str:
+                horse_errors += 1
+        except Exception as e:
+            horse_errors += 1
+            h.setdefault("training_physics", {"final_split": 0.0, "acceleration_rate": 0.0, "cardio_index": 0.0})
+            h.setdefault("training_nlp", {})
+            print(f"[enrich] training {h.get('name','?')}: {e}")
+
+        # Paddock — use the per-race fetch_paddock_reports results.
+        try:
+            report = paddock_map.get(h["name"], {}) if paddock_map else {}
+            paddock_text = report.get("text", "") or h.get("paddock_comment", "")
+            h["paddock_comment"] = paddock_text
+            scores = report.get("scores")
+            if not scores:
+                scores = parse_paddock_comment(paddock_text) if paddock_text else {}
+            h["paddock_scores"] = scores or {}
+            if not paddock_text:
+                horse_errors += 1
+        except Exception as e:
+            h["paddock_scores"] = {}
+            horse_errors += 1
+            print(f"[enrich] paddock {h.get('name','?')}: {e}")
+
+        if horse_ok and horse_errors == 0:
+            stats["ok"] += 1
+        elif horse_ok:
+            stats["partial"] += 1
         else:
-            h["training_physics"] = {"final_split": 0.0, "acceleration_rate": 0.0, "cardio_index": 0.0}
-            h["training_nlp"] = {}
+            stats["failed"] += 1
 
-        # Paddock NLP scores (from pre-filled training_eval text or evaluation field)
-        paddock_text = h.get("paddock_comment", "")
-        h["paddock_scores"] = parse_paddock_comment(paddock_text)
-
+    # Persist snapshot + stats so a crash still leaves partial progress on disk.
+    _cache_save("enrich_race", race_id, horses)
+    _cache_save("enrich_stats", race_id, stats)
     return horses
+
+
+def get_enrich_stats(race_id: str) -> Optional[dict]:
+    """Return the most recently saved enrichment stats for a race, or None."""
+    return _cache_load("enrich_stats", race_id)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1434,15 +2072,17 @@ def fetch_paddock_reports(race_id: str, horse_names: list, race_name: str = "") 
     if missing:
         _scrape_yahoo_news_paddock(race_name or race_id, missing, reports)
 
-    # 3. uma-jo.jp
-    missing = [n for n in horse_names if not reports.get(n, {}).get("text")]
-    if missing:
-        _scrape_umajo_paddock(race_id, missing, reports)
+    # 3. uma-jo.jp — DISABLED 2026-04: domain is dead (DNS failure).
+    #    Keeping the function defined for future re-enable; skipping the call
+    #    saves ~21s retry budget per race.
+    # missing = [n for n in horse_names if not reports.get(n, {}).get("text")]
+    # if missing:
+    #     _scrape_umajo_paddock(race_id, missing, reports)
 
-    # 4. keibago.com
-    missing = [n for n in horse_names if not reports.get(n, {}).get("text")]
-    if missing:
-        _scrape_keibago_paddock(race_id, missing, reports)
+    # 4. keibago.com — DISABLED 2026-04: domain is dead. Same rationale.
+    # missing = [n for n in horse_names if not reports.get(n, {}).get("text")]
+    # if missing:
+    #     _scrape_keibago_paddock(race_id, missing, reports)
 
     # 未取得馬は空エントリ
     for name in horse_names:
@@ -1582,8 +2222,42 @@ def _scrape_keibago_paddock(race_id: str, horse_names: list, reports: dict):
 # Unified public API
 # ═══════════════════════════════════════════════════════════
 
+# ─────────────────────────────────────────────────────────────
+# LIVE_GRADE_FILTER — operational knob for the weekend batch.
+#
+# Current policy (2026-04-12): G1 + G2 only. Rationale:
+#   - The full card (36 races) takes ≈55 min to process with the
+#     current fact-collector stack, which exceeds the cron budget and
+#     leaves no headroom for retries.
+#   - G3 was the worst-performing grade in the 121-race audit
+#     (win% 20.0, ROI -38.8%) so deferring it costs no known value.
+#   - G1 was the only profitable tier (+19.6% ROI), G2 sits between.
+#
+# To include more grades later, widen the tuple. To process every race
+# (regardless of grade), set the constant to None.
+#
+#   ("G1",)              → G1 only (1-2 races/day)
+#   ("G1", "G2")         → CURRENT (2-5 races/day)
+#   ("G1", "G2", "G3")   → all graded races (5-10/day)
+#   None                 → all JRA races on the card (30-36/day)
+LIVE_GRADE_FILTER: tuple | None = ("G1", "G2")
+
+
 def fetch_race_list(race_date: date) -> list[dict]:
-    races = fetch_race_list_netkeiba(race_date)
+    """Return the races to process in the live weekend batch.
+
+    The grade filter is controlled by the LIVE_GRADE_FILTER module
+    constant. Currently G1+G2 only — see the constant's docstring for
+    the rationale and the instructions for widening.
+    """
+    if LIVE_GRADE_FILTER is None:
+        races = fetch_race_list_netkeiba(race_date, graded_only=False)
+    else:
+        races = fetch_race_list_netkeiba(
+            race_date,
+            graded_only=True,
+            grades=LIVE_GRADE_FILTER,
+        )
     if not races:
         races = fetch_race_list_jra(race_date)
     return races if races else []
@@ -1591,11 +2265,16 @@ def fetch_race_list(race_date: date) -> list[dict]:
 
 def fetch_this_week_races() -> list[dict]:
     """
-    今週の土曜・日曜両日のG1/G2/G3レースをまとめて取得する。
+    今週の土曜・日曜両日の対象グレードレースをまとめて取得する。
+
+    Uses the same LIVE_GRADE_FILTER as fetch_race_list — currently
+    G1+G2 only. To include G3 or all races, widen LIVE_GRADE_FILTER.
     """
     saturday, sunday = get_this_week_race_dates()
     races = []
     for d in (saturday, sunday):
+        # fetch_race_list honours LIVE_GRADE_FILTER, so the grade
+        # restriction is applied here transparently.
         day_races = fetch_race_list(d)
         races.extend(day_races)
     return races
@@ -1603,8 +2282,13 @@ def fetch_this_week_races() -> list[dict]:
 
 def fetch_past_g_races(n_weeks: int = 4) -> list[dict]:
     """
-    直近N週分の終了済みG1/G2/G3レース一覧を取得する。
+    直近N週分の終了済み対象グレードレース一覧を取得する。
     土曜・日曜の両日を対象に、今日より前の開催分のみ返す。
+
+    Uses the same LIVE_GRADE_FILTER as fetch_race_list — currently
+    G1+G2 only. This keeps PDCA reflection data aligned with what
+    the live system actually predicts. To include G3 historical
+    data, widen LIVE_GRADE_FILTER.
 
     Returns:
         list of race dicts (race_id, race_name, grade, venue, race_date, ...)
@@ -1620,6 +2304,14 @@ def fetch_past_g_races(n_weeks: int = 4) -> list[dict]:
     races: list[dict] = []
     seen: set = set()
 
+    # Resolve the grade restriction once.
+    if LIVE_GRADE_FILTER is None:
+        graded_only = False
+        grades: tuple = ("G1", "G2", "G3")
+    else:
+        graded_only = True
+        grades = LIVE_GRADE_FILTER
+
     for w in range(n_weeks):
         for day_delta in (0, 1):  # 土=0, 日=1
             target = last_sat - _td(weeks=w) + _td(days=day_delta)
@@ -1627,7 +2319,11 @@ def fetch_past_g_races(n_weeks: int = 4) -> list[dict]:
             if target >= today:
                 continue
             try:
-                day_races = fetch_race_list_netkeiba(target)
+                day_races = fetch_race_list_netkeiba(
+                    target,
+                    graded_only=graded_only,
+                    grades=grades,
+                )
             except Exception:
                 day_races = []
             for r in day_races:

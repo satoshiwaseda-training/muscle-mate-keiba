@@ -1,4 +1,10 @@
-"""Streamlit UI for 競馬G1/G2/G3 自律進化型予想アプリ."""
+"""Streamlit UI for 競馬自律進化型予想アプリ.
+
+Active grade filter is sourced from `scraper.LIVE_GRADE_FILTER`
+(currently G1+G2 only). To widen or narrow the scope, edit the
+constant in scraper.py — this file picks up the change
+automatically through _grade_label.
+"""
 
 import os
 import re as _re
@@ -17,6 +23,7 @@ except Exception:
 import scraper
 import gemini_client
 import pdca_engine
+import feature_store
 from data_store import (
     save_prediction,
     save_result,
@@ -176,8 +183,17 @@ WEIGHT_COLORS = {
 }
 
 with st.sidebar:
+    # Grade filter label is driven by scraper.LIVE_GRADE_FILTER so there
+    # is a single source of truth across app.py, app_live.py, and cron.
+    _grade_filter = scraper.LIVE_GRADE_FILTER
+    _grade_label = "ALL races" if _grade_filter is None else " + ".join(_grade_filter)
+
     st.title("🏇 競馬AI予想")
-    st.caption("自律進化型 G1/G2/G3 予想システム")
+    st.caption(f"自律進化型 **{_grade_label}** 予想システム")
+    st.caption(
+        f"対象: {_grade_label} のみ "
+        f"(`scraper.LIVE_GRADE_FILTER`)"
+    )
 
     st.divider()
 
@@ -211,16 +227,19 @@ with st.sidebar:
         type="primary",
         use_container_width=True,
     ):
-        with st.spinner("今週の土日レースを取得中..."):
+        with st.spinner(f"今週の土日 {_grade_label} を取得中..."):
             races = scraper.fetch_this_week_races()
             st.session_state.races = races
             st.session_state.selected_race = None
             st.session_state.entries = []
             st.session_state.prediction_result = None
         if races:
-            st.success(f"{len(races)}件のG1/G2/G3レースを取得（土日合計）")
+            st.success(f"{len(races)}件の {_grade_label} を取得（土日合計）")
         else:
-            st.warning("今週末のG1/G2/G3レースが見つかりませんでした")
+            st.warning(
+                f"今週末の {_grade_label} レースが見つかりませんでした "
+                f"(G3/平場は LIVE_GRADE_FILTER で除外中)"
+            )
 
     st.caption("または特定日を指定して取得")
 
@@ -241,9 +260,12 @@ with st.sidebar:
             st.session_state.entries = []
             st.session_state.prediction_result = None
         if races:
-            st.success(f"{len(races)}件のG1/G2/G3レースを取得")
+            st.success(f"{len(races)}件の {_grade_label} を取得")
         else:
-            st.warning(f"{selected_date.strftime('%m/%d')}のG1/G2/G3レースが見つかりませんでした")
+            st.warning(
+                f"{selected_date.strftime('%m/%d')} の {_grade_label} "
+                f"レースが見つかりませんでした (G3/平場は除外中)"
+            )
 
     st.divider()
 
@@ -267,9 +289,16 @@ with st.sidebar:
 # Main content
 # ─────────────────────────────────────────────
 
-st.title("🏇 競馬AI予想システム")
+st.title(f"🏇 競馬AI予想システム — {_grade_label}")
+st.caption(
+    f"現在の対象グレード: **{_grade_label}** "
+    f"(変更: `scraper.py` の `LIVE_GRADE_FILTER` を編集)"
+)
 
-tab1, tab2, tab3, tab4 = st.tabs(["予想", "結果入力 & PDCA", "ダッシュボード", "過去Gレース学習"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "予想", "結果入力 & PDCA", "ダッシュボード",
+    f"過去 {_grade_label} 学習",
+])
 
 # ═════════════════════════════════════════════
 # Tab 1: Prediction
@@ -678,6 +707,15 @@ with tab1:
                     else:
                         result = _mock_analysis(entries, selected_race["race_name"])
 
+                    # Extract structured pre-race features before saving
+                    _sf = feature_store.extract_structured_features(
+                        entries=active_entries,
+                        track_condition=track_condition,
+                        weather=weather,
+                        temperature=temperature,
+                        cushion_value=cushion_value,
+                        venue=selected_race.get("venue", ""),
+                    )
                     save_prediction(
                         race_id=selected_race["race_id"],
                         prediction={
@@ -685,6 +723,7 @@ with tab1:
                             "grade": selected_race["grade"],
                             "horses": result["horses"],
                             "gemini_comment": result["comment"],
+                            "structured_features": _sf,
                         },
                     )
                     st.session_state.prediction_result = result
@@ -868,14 +907,20 @@ with tab2:
         with _t2c1:
             _t2_date = st.date_input("取得日付", value=date.today(), key="tab2_race_date")
         with _t2c2:
-            if st.button("今日のGレース取得", key="tab2_fetch_today", use_container_width=True):
+            if st.button(
+                f"今日の {_grade_label} 取得",
+                key="tab2_fetch_today", use_container_width=True,
+            ):
                 with st.spinner("取得中..."):
                     _fetched = scraper.fetch_race_list(_t2_date)
                 st.session_state.races = _fetched
                 st.rerun()
         with _t2c3:
-            if st.button("直近4週の過去レース取得", key="tab2_fetch_past", use_container_width=True):
-                with st.spinner("過去Gレース取得中..."):
+            if st.button(
+                f"直近4週の過去 {_grade_label} 取得",
+                key="tab2_fetch_past", use_container_width=True,
+            ):
+                with st.spinner(f"過去 {_grade_label} 取得中..."):
                     _fetched = scraper.fetch_past_g_races(4)
                 st.session_state.races = _fetched
                 st.rerun()
@@ -998,12 +1043,19 @@ with tab2:
                             weights=load_weights(),
                             system_instruction=_build_system_instruction(),
                         )
+                    _sf2 = feature_store.extract_structured_features(
+                        entries=_entries,
+                        track_condition=race2.get("track_condition", "良"),
+                        weather=race2.get("weather", ""),
+                        venue=race2.get("venue", ""),
+                    )
                     save_prediction(race_id2, {
                         "race_name": race2["race_name"],
                         "grade": race2.get("grade", ""),
                         "horses": _retro.get("horses", []),
                         "gemini_comment": _retro.get("comment", ""),
                         "retroactive": True,
+                        "structured_features": _sf2,
                     })
                     st.success("遡及予想を生成しました。PDCA分析を続けます...")
                     st.session_state.auto_pdca_race = race_id2
@@ -1328,15 +1380,16 @@ with tab3:
 
 
 # ═════════════════════════════════════════════
-# Tab 4: 過去Gレース学習
+# Tab 4: 過去レース学習 (対象グレードのみ)
 # ═════════════════════════════════════════════
 
 with tab4:
-    st.header("過去Gレース一括学習")
+    st.header(f"過去 {_grade_label} 一括学習")
     st.caption(
-        "直近の終了済みG1/G2/G3レースを自動取得し、AIが「当時の予想」を再構築して "
-        "実際の結果と照合します。PDCA自己進化ループを複数レース分まとめて実行し、"
-        "黄金比パラメーターを実績ベースで調整します。"
+        f"直近の終了済み {_grade_label} レースを自動取得し、AIが「当時の予想」を再構築して "
+        f"実際の結果と照合します。PDCA自己進化ループを複数レース分まとめて実行し、"
+        f"黄金比パラメーターを実績ベースで調整します。"
+        f"対象グレードは `scraper.LIVE_GRADE_FILTER` で制御 (現在: {_grade_label})。"
     )
 
     if not st.session_state.api_key:
@@ -1345,17 +1398,25 @@ with tab4:
         # ── 過去レース取得 ───────────────────────────────────
         col_fetch_past, col_n_weeks = st.columns([2, 1])
         with col_n_weeks:
-            n_weeks = st.number_input("取得週数", min_value=1, max_value=8, value=4, step=1,
-                                      help="最大8週前までのGレースを対象にします")
+            n_weeks = st.number_input(
+                "取得週数", min_value=1, max_value=8, value=4, step=1,
+                help=f"最大8週前までの {_grade_label} レースを対象にします",
+            )
         with col_fetch_past:
-            if st.button("直近の終了済みGレースを取得", type="primary", use_container_width=True):
-                with st.spinner(f"直近{n_weeks}週のGレース一覧を取得中..."):
+            if st.button(
+                f"直近の終了済み {_grade_label} を取得",
+                type="primary", use_container_width=True,
+            ):
+                with st.spinner(f"直近{n_weeks}週の {_grade_label} 一覧を取得中..."):
                     past_races = scraper.fetch_past_g_races(int(n_weeks))
                 st.session_state["past_g_races"] = past_races
                 if past_races:
                     st.success(f"{len(past_races)}レースを取得しました")
                 else:
-                    st.warning("Gレースが見つかりませんでした（netkeiba接続を確認してください）")
+                    st.warning(
+                        f"{_grade_label} レースが見つかりませんでした"
+                        "（netkeiba 接続 or LIVE_GRADE_FILTER を確認）"
+                    )
 
         past_races = st.session_state.get("past_g_races", [])
 
@@ -1444,12 +1505,19 @@ with tab4:
                                     weights=load_weights(),
                                     system_instruction=_build_system_instruction(),
                                 )
+                                _sf3 = feature_store.extract_structured_features(
+                                    entries=entries,
+                                    track_condition=race.get("track_condition", "良"),
+                                    weather=race.get("weather", ""),
+                                    venue=race.get("venue", ""),
+                                )
                                 save_prediction(rid, {
                                     "race_name": rname,
                                     "grade": race.get("grade", ""),
                                     "horses": retro_result.get("horses", []),
                                     "gemini_comment": retro_result.get("comment", ""),
-                                    "retroactive": True,  # 遡及予想フラグ
+                                    "retroactive": True,
+                                    "structured_features": _sf3,
                                 })
                                 log_lines.append(f"✓ {rname}: 遡及予想を生成・保存")
                             else:
