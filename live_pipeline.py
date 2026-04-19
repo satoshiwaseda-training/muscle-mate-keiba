@@ -44,7 +44,14 @@ import prediction_log
 #   - the loose-rule definition in dual_mode_scoring.py
 # Persisted with every prediction so a later audit can diff predictions
 # that were produced under different model states.
-DATA_SOURCE_VERSION = "live-v5.1-encoding-fix-2026-04-19"
+DATA_SOURCE_VERSION = "live-v5.2-deep-horse-facts-2026-04-19"
+# v5.2 (2026-04-19): horse_facts_enricher 導入。累計獲得賞金 / 馬体重
+# トレンド / 直近成績 (会場・複勝圏) / 休養期間 / 馬主・生産者・外厩
+# tier を既取得データから fact として抽出 (追加 fetch 無し)。
+# source tier `horse_deep` (conf 0.85) として composite に参加。
+# LOOSE 4 条件の数値は不変更。
+#
+# 旧版履歴:
 # v5.0 (2026-04-19 第5波): ユーザ直訴を受け、**データ取得側を完全に
 # scratch-rewrite**。推論 (score_runner, dual_mode_scoring,
 # probability_engine, trigger_loose_capped, 憲法) は一切変更しない。
@@ -547,6 +554,41 @@ def predict_live(
             "error": None,
         })
         article_facts.extend(oikiri_facts)
+
+    # ── Step 3d: horse_deep facts (v5.2 deep enrichment) ──
+    # 既に `enrich_entries` で取得済みの horse detail / recent_races /
+    # weight_trend / owner / breeder / ritto から **追加 fetch 無しで**
+    # fact を抽出する。憲法 §7.1 の「ファクト抽出辞書の拡張」枠内。
+    _log(progress_cb, "Tier 3 (deep): 累計賞金/体重トレンド/直近成績/休養/馬主 由来 fact")
+    deep_facts: list = []
+    try:
+        import horse_facts_enricher as _hfe
+        horses_for_deep = cached_race if cached_race else entries
+        # race_info は後段 (Step 5) で fetch されるが、enricher に
+        # 必要なのは race_date / venue だけなので predict_live 引数から
+        # 直接構築する (Step 3 時点では race_info はまだ未定義)。
+        _race_ctx_for_deep = {
+            "race_date": race_date or "",
+            "venue":     venue or "",
+            "grade":     "",
+        }
+        deep_facts = _hfe.compute_deep_horse_facts(
+            horses=horses_for_deep or [],
+            race_info=_race_ctx_for_deep,
+            venue=venue or "",
+        )
+        _log(progress_cb, f"horse_deep: {len(deep_facts)} facts generated "
+                          f"({_hfe.ENRICHER_VERSION})")
+    except Exception as e:
+        _log(progress_cb, f"horse_deep enrichment skipped: {e}")
+    collection_log.append({
+        "source": "horse_deep",
+        "status": "ok" if deep_facts else "skipped",
+        "facts": deep_facts,
+        "items_seen": len(cached_race) if cached_race else len(entries),
+        "error": None,
+    })
+    article_facts.extend(deep_facts)
 
     # ── Step 4a: validate + contradiction-detect (fact_validator) ──
     _log(progress_cb, "ファクト検証 + 矛盾検出")

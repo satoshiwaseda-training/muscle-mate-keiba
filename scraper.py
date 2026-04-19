@@ -575,7 +575,10 @@ def fetch_horse_detail(horse_id: str) -> dict:
         return {}
 
     result = {"horse_id": horse_id, "recent_races": [], "sire": "", "dam": "",
-              "damsire": "", "breeder": "", "owner": "", "weight_trend": []}
+              "damsire": "", "breeder": "", "owner": "", "weight_trend": [],
+              # v5.2 additions (used by horse_facts_enricher):
+              "career_prize": "", "birth_date": "", "coat_color": "",
+              "sex_age": "", "trainer_name": ""}
 
     # Profile fields from db_prof_table (uses <th> for labels, <td> for values)
     prof_table = soup.select_one("table.db_prof_table")
@@ -590,6 +593,16 @@ def fetch_horse_detail(horse_id: str) -> dict:
                     result["breeder"] = val
                 elif label == "馬主":
                     result["owner"] = val
+                # ── v5.2 additional profile extraction ──
+                elif label == "生年月日":
+                    result["birth_date"] = val
+                elif label == "毛色":
+                    result["coat_color"] = val
+                elif label in ("獲得賞金", "総賞金", "獲得賞金(中央)"):
+                    # 例: "12,345万円 (中央)" / "1,234.5万円" を数値に
+                    result["career_prize"] = val
+                elif label == "調教師":
+                    result["trainer_name"] = val
 
     # Bloodline from pedigree page (/horse/ped/{id}/)
     # The blood_table is only on the ped subpage, not the main profile.
