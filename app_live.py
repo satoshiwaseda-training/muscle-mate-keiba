@@ -54,7 +54,7 @@ from tools._autolog_utils import last_weekend
 
 
 st.set_page_config(
-    page_title="理論予想 Live — G1/G2 自動分析",
+    page_title="理論予想 Live — G1/G2/G3 自動分析",
     page_icon="🎯",
     layout="wide",
 )

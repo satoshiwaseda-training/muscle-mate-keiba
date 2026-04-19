@@ -2253,7 +2253,7 @@ def _scrape_keibago_paddock(race_id: str, horse_names: list, reports: dict):
 #   ("G1", "G2")         → CURRENT (2-5 races/day)
 #   ("G1", "G2", "G3")   → all graded races (5-10/day)
 #   None                 → all JRA races on the card (30-36/day)
-LIVE_GRADE_FILTER: tuple | None = ("G1", "G2")
+LIVE_GRADE_FILTER: tuple | None = ("G1", "G2", "G3")
 
 
 def fetch_race_list(race_date: date) -> list[dict]:

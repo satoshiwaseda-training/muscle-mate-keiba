@@ -44,7 +44,15 @@ import prediction_log
 #   - the loose-rule definition in dual_mode_scoring.py
 # Persisted with every prediction so a later audit can diff predictions
 # that were produced under different model states.
-DATA_SOURCE_VERSION = "live-v5.3-paddock-multi-2026-04-19"
+DATA_SOURCE_VERSION = "live-v5.6-g3-scope-2026-04-19"
+# v5.6 (2026-04-19): scope 拡大 G1/G2 → G1/G2/G3。
+#   - scraper.LIVE_GRADE_FILTER = ("G1","G2","G3")
+#   - paddock_sources.GRADE_TRIGGERS に G3 / JpnIII を追加
+#   - live_pipeline の grade_guess 検出に G3 追加
+# ユーザ買い方 (単勝×3 + 馬連×3 = 600円/R) を G3 までの全重賞に適用可能に。
+# LOOSE 4 条件の数値は不変更。
+#
+# v5.4 (2026-04-19): TOP 3 本命/対抗/単穴 UI パネル追加。
 # v5.3 (2026-04-19): paddock_sources 導入。G1/G2 限定で
 # 東スポ + ラジオ NIKKEI + 日刊スポの 3 追加ソースからパドックテキスト
 # を収集し、既存 netkeiba パドックに merge。consensus 向上狙い。
@@ -542,8 +550,9 @@ def predict_live(
         import paddock_sources as _psrc
         grade_guess = ""
         # Try to read grade from race context (not yet fetched, but hints exist)
+        # v5.6: G3 も追加 (ユーザ買い方は G3 まで)
         if race_name:
-            for g_tag in ("G1", "G2", "JpnI", "JpnII"):
+            for g_tag in ("G1", "G2", "G3", "JpnI", "JpnII", "JpnIII"):
                 if f"({g_tag})" in race_name or f"({g_tag.lower()})" in race_name:
                     grade_guess = g_tag
                     break

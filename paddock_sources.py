@@ -38,8 +38,10 @@ from bs4 import BeautifulSoup as _BS
 
 PADDOCK_MULTI_VERSION = "paddock-multi-v5.3-2026-04-19"
 
-# G1/G2 のみ発火。G3 / 平場では叩かない (rate limit / ban 回避)。
-GRADE_TRIGGERS = ("G1", "G2", "JpnI", "JpnII")
+# G1/G2/G3 で発火 (v5.6 拡張)。平場では叩かない (rate limit 回避)。
+# ユーザ買い方 (単勝×3 + 馬連×3 = 600円/R) が G3 まで適用される運用に
+# 合わせて、追加ソースの paddock も G3 まで拡大。
+GRADE_TRIGGERS = ("G1", "G2", "G3", "JpnI", "JpnII", "JpnIII")
 
 _HEADERS = {
     "User-Agent": (
