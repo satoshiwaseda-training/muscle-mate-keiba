@@ -44,12 +44,16 @@ import prediction_log
 #   - the loose-rule definition in dual_mode_scoring.py
 # Persisted with every prediction so a later audit can diff predictions
 # that were produced under different model states.
-DATA_SOURCE_VERSION = "live-v5.2-deep-horse-facts-2026-04-19"
+DATA_SOURCE_VERSION = "live-v5.3-paddock-multi-2026-04-19"
+# v5.3 (2026-04-19): paddock_sources 導入。G1/G2 限定で
+# 東スポ + ラジオ NIKKEI + 日刊スポの 3 追加ソースからパドックテキスト
+# を収集し、既存 netkeiba パドックに merge。consensus 向上狙い。
+# LOOSE 4 条件の数値は不変更。
+#
 # v5.2 (2026-04-19): horse_facts_enricher 導入。累計獲得賞金 / 馬体重
 # トレンド / 直近成績 (会場・複勝圏) / 休養期間 / 馬主・生産者・外厩
 # tier を既取得データから fact として抽出 (追加 fetch 無し)。
 # source tier `horse_deep` (conf 0.85) として composite に参加。
-# LOOSE 4 条件の数値は不変更。
 #
 # 旧版履歴:
 # v5.0 (2026-04-19 第5波): ユーザ直訴を受け、**データ取得側を完全に
@@ -528,8 +532,63 @@ def predict_live(
                 "error": "non-live race date — newspaper sources publish only current articles",
             })
 
-    # ── Step 3: cached paddock text + training_eval ──
+    # ── Step 3a (v5.3): multi-source paddock for G1/G2 only ──
+    # 東スポ + ラジオ NIKKEI + 日刊スポ から追加のパドック情報を取得
+    # (grade フィルタ内蔵 — G1/G2 以外では no-op)。
+    # 得られたテキストは cached_race の paddock_comment に merge され、
+    # 直後の collect_paddock_observation_facts の入力として使われる。
     cached_race = scraper._cache_load("enrich_race", race_id)
+    try:
+        import paddock_sources as _psrc
+        grade_guess = ""
+        # Try to read grade from race context (not yet fetched, but hints exist)
+        if race_name:
+            for g_tag in ("G1", "G2", "JpnI", "JpnII"):
+                if f"({g_tag})" in race_name or f"({g_tag.lower()})" in race_name:
+                    grade_guess = g_tag
+                    break
+        multi_result = _psrc.fetch_paddock_multi_sources(
+            race_id=race_id, race_name=race_name,
+            horse_names=list(running), grade=grade_guess,
+        )
+        _meta = multi_result.get("_meta", {}) if isinstance(multi_result, dict) else {}
+        if _meta.get("enabled"):
+            _log(progress_cb,
+                 f"Tier 3 (v5.3): multi-paddock {_meta.get('n_sources_with_hits', 0)} "
+                 f"sources, {_meta.get('total_horses_covered', 0)} horses")
+            if cached_race:
+                # Build a reports dict from cached_race so we can merge into it
+                existing_reports = {
+                    (h.get("name") or "").strip(): {
+                        "text":   h.get("paddock_comment", "") or "",
+                        "source": "netkeiba-cached",
+                        "scores": h.get("paddock_scores", {}) or {},
+                    }
+                    for h in cached_race if h.get("name")
+                }
+                existing_reports = _psrc.merge_paddock_into_reports(
+                    existing_reports, multi_result, list(running),
+                )
+                # Propagate merged text back onto cached_race horses so
+                # downstream paddock fact collector sees the expanded text.
+                for h in cached_race:
+                    name = (h.get("name") or "").strip()
+                    rep = existing_reports.get(name) or {}
+                    if rep.get("text"):
+                        h["paddock_comment"] = rep["text"]
+                    if rep.get("scores"):
+                        h["paddock_scores"] = rep["scores"]
+        collection_log.append({
+            "source": "paddock_multi_v5.3",
+            "status": "ok" if _meta.get("enabled") else "skipped",
+            "facts": [],  # facts are produced by downstream collector
+            "items_seen": _meta.get("total_horses_covered", 0),
+            "error": _meta.get("reason") if not _meta.get("enabled") else None,
+        })
+    except Exception as e:
+        _log(progress_cb, f"paddock_sources multi skipped: {e}")
+
+    # ── Step 3: cached paddock text + training_eval ──
     if cached_race:
         _log(progress_cb, "Tier 3: キャッシュ済みパドック観察")
         pd = fc.collect_paddock_observation_facts(race_id, running, cached_race)
