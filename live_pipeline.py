@@ -44,7 +44,7 @@ import prediction_log
 #   - the loose-rule definition in dual_mode_scoring.py
 # Persisted with every prediction so a later audit can diff predictions
 # that were produced under different model states.
-DATA_SOURCE_VERSION = "live-v5.0-scratch-rewrite-2026-04-19"
+DATA_SOURCE_VERSION = "live-v5.1-encoding-fix-2026-04-19"
 # v5.0 (2026-04-19 第5波): ユーザ直訴を受け、**データ取得側を完全に
 # scratch-rewrite**。推論 (score_runner, dual_mode_scoring,
 # probability_engine, trigger_loose_capped, 憲法) は一切変更しない。

@@ -54,7 +54,7 @@ import requests as _requests
 from bs4 import BeautifulSoup as _BS
 
 
-ENTRIES_FETCHER_VERSION = "entries-fetcher-v5.0-2026-04-19"
+ENTRIES_FETCHER_VERSION = "entries-fetcher-v5.1-encoding-fix-2026-04-19"
 
 _SHUTUBA_URL = "https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
 
@@ -228,13 +228,20 @@ def fetch_horse_entries(race_id: str, venue: str = "",
     sess = session or _requests.Session()
     try:
         resp = sess.get(url, headers=_BROWSER_HEADERS, timeout=timeout)
-        if resp.status_code != 200 or not resp.text:
+        if resp.status_code != 200 or not resp.content:
             return []
-        html = resp.text
+        raw_bytes = resp.content
     except Exception:
         return []
 
-    soup = _BS(html, "html.parser")
+    # Encoding: netkeiba は Content-Type に charset を含めない場合があり、
+    # `resp.text` を使うと requests が ISO-8859-1 で decode して馬名が
+    # 文字化けする (フォルテアンジェロ事件 後の文字化け報告の原因)。
+    # BeautifulSoup に生 bytes を渡し、HTML 内の <meta charset> / BOM /
+    # chardet で自動検出させる — これは旧 scraper._get と同じ方式。
+    # 明示フォールバック: EUC-JP (netkeiba の歴史的デフォルト) と UTF-8
+    # のどちらにも対応するよう from_encoding は指定せず BS に委ねる。
+    soup = _BS(raw_bytes, "html.parser")
     rows = soup.select("tr.HorseList")
     out: list[dict] = []
     for row in rows:

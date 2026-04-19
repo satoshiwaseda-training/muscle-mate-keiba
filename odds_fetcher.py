@@ -62,7 +62,7 @@ import requests as _requests
 # Constants
 # ──────────────────────────────────────────────────────
 
-FETCHER_VERSION = "odds-fetcher-v5.0-2026-04-19"
+FETCHER_VERSION = "odds-fetcher-v5.1-encoding-fix-2026-04-19"
 
 # 単勝オッズのサニティ範囲。JRA 公式の pari-mutuel は下限 1.0, 実質上限
 # 500 程度 (超大穴でも)。これを超える値を返すソースは単勝ではない別データ。
@@ -214,7 +214,10 @@ def fetch_win_odds(race_id: str,
         resp = sess.get(url, headers=headers, timeout=timeout)
         result.http_status = resp.status_code
         result.response_url = resp.url or url
-        body = resp.text or ""
+        # Encoding: JSON API は通常 UTF-8 だが、Content-Type に charset を
+        # 書かないケースがあるので `resp.text` (requests 既定 ISO-8859-1)
+        # に依存せず、bytes → UTF-8 を明示する。文字化け対策。
+        body = resp.content.decode("utf-8", errors="replace") if resp.content else ""
     except Exception as e:
         result.raw_reason = f"fetch-failed: {e.__class__.__name__}: {e}"
         return result
