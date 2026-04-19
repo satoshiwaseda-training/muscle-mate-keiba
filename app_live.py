@@ -615,9 +615,96 @@ elif batch and batch["results"]:
             if src_badges:
                 st.caption("ソース: " + " / ".join(src_badges))
 
+            # ── 🎯 本日のベスト 3 頭予測 (本命 / 対抗 / 単穴) ──
+            # 憲法 §1.3「勝てるのは条件付き」を踏まえ、「必ず勝てる」とは
+            # 言わない。model の win_prob を本命/対抗/単穴という馴染みの
+            # 日本語で示し、買い方の目安を併記する。
+            # LOOSE bets (ROI 検証用ルール) とは独立した「見やすい提示」。
+            if r.get("ranked"):
+                ranked = r["ranked"]
+                top3 = ranked[:3]
+                labels = ["◎ 本命", "○ 対抗", "▲ 単穴"]
+                bet_suggestions = [
+                    "単勝 / 複勝",          # 本命: 勝ち狙いと保険
+                    "複勝 / ワイド (本命絡み)",  # 対抗: 複勝圏狙い
+                    "ワイド / 馬連 (本命絡み)",  # 単穴: 穴押さえ
+                ]
+                st.markdown("### 🎯 本日のベスト 3 頭予測（本命 / 対抗 / 単穴）")
+
+                # 期待値計算: win_prob × odds。1.0 を超えれば理論的プラス
+                def _ev(h):
+                    odds = float(h.get("odds", 0) or 0)
+                    wp = float(h.get("win_prob", 0) or 0)
+                    if odds <= 1.0 or wp <= 0:
+                        return None
+                    return wp * odds
+
+                top3_rows = []
+                for i, h in enumerate(top3):
+                    odds = float(h.get("odds", 0) or 0)
+                    wp = float(h.get("win_prob", 0) or 0) * 100
+                    ev = _ev(h)
+                    odds_str = (
+                        "---" if odds <= 1.0 else
+                        f"⚠{odds:.1f}(要確認)" if odds > 500.0 else
+                        f"{odds:.1f}倍"
+                    )
+                    ev_str = f"{ev:.2f}" if ev is not None else "—"
+                    top3_rows.append({
+                        "印": labels[i],
+                        "馬名": h.get("name", "?"),
+                        "モデル勝率": f"{wp:.1f}%",
+                        "単勝オッズ": odds_str,
+                        "単勝期待値 (勝率×オッズ)": ev_str,
+                        "推奨買い目": bet_suggestions[i],
+                    })
+                top3_df = pd.DataFrame(top3_rows)
+                st.dataframe(top3_df, use_container_width=True, hide_index=True)
+
+                # 平易な補足 — 本命の根拠 (composite が取れていれば 1 行)
+                best = top3[0]
+                best_name = best.get("name", "この馬")
+                best_wp = float(best.get("win_prob", 0) or 0) * 100
+                best_comp = float(best.get("composite_condition", 0.5) or 0.5)
+                best_edge = float(best.get("structured_edge", 0) or 0)
+                reason_bits = []
+                if best_comp >= 0.65:
+                    reason_bits.append(f"composite {best_comp:.2f} (強ポジティブ)")
+                if best_edge >= 0.05:
+                    reason_bits.append(f"構造edge +{best_edge:.2f} (市場超過)")
+                if best_edge <= -0.05:
+                    reason_bits.append(f"構造edge {best_edge:.2f} (市場割安)")
+                if float(best.get("odds", 0) or 0) <= 15.0:
+                    reason_bits.append(
+                        f"単勝 {float(best.get('odds', 0)):.1f}倍 (LOOSE 許容帯)"
+                    )
+                reason_text = (" · ".join(reason_bits)
+                                if reason_bits else "特筆すべき edge なし")
+                st.caption(
+                    f"**本命 {best_name}**: モデル勝率 {best_wp:.1f}% · {reason_text}"
+                )
+
+                # 期待値警告: 本命の EV < 0.85 なら「本命でも妙味なし」を示唆
+                ev_best = _ev(best)
+                if ev_best is not None and ev_best < 0.85:
+                    st.info(
+                        f"⚠️ 本命の単勝期待値が **{ev_best:.2f}** と低め "
+                        f"(市場 takeout 0.80 水準)。無理に単勝で勝負せず、"
+                        f"複勝 / ワイドで薄く抑えるか、見送りも選択肢です。"
+                    )
+
+                # 憲法由来のスタンス
+                st.caption(
+                    "※ 競馬に「必ず勝てる」はありません（憲法 §1.3）。"
+                    "表示は **モデルの確信度** であり、保証ではありません。"
+                    "LOOSE 自動ベットは下の別パネルで引き続き運用中。"
+                )
+
+                st.divider()
+
             # Loose bets for this race
             if r.get("loose_bets"):
-                st.markdown("**🧪 Loose bets**")
+                st.markdown("**🧪 Loose bets (ROI 検証中の自動ルール)**")
                 ldf = pd.DataFrame([
                     {
                         "馬名": lb["name"],
