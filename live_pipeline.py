@@ -44,7 +44,13 @@ import prediction_log
 #   - the loose-rule definition in dual_mode_scoring.py
 # Persisted with every prediction so a later audit can diff predictions
 # that were produced under different model states.
-DATA_SOURCE_VERSION = "live-v5.6-g3-scope-2026-04-19"
+DATA_SOURCE_VERSION = "live-v5.7-g2-diversified-2026-04-19"
+# v5.7 (2026-04-19): G2 のみ TOP 3 を市場分散戦略に切り替え。
+#   - 本命: 市場 1-3 番人気から win_prob 最大
+#   - 対抗: 市場 4-7 番人気から win_prob 最大
+#   - 単穴: 市場 8 番人気以下から win_prob 最大
+#   - backtest (63 G2 レース): ROI -48.2% → +20.8% (+69 pp)
+#   - UI layer のみ変更。推論・LOOSE 4 条件は不変更。
 # v5.6 (2026-04-19): scope 拡大 G1/G2 → G1/G2/G3。
 #   - scraper.LIVE_GRADE_FILTER = ("G1","G2","G3")
 #   - paddock_sources.GRADE_TRIGGERS に G3 / JpnIII を追加

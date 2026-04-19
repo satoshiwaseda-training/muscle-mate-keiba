@@ -38,6 +38,8 @@ import feature_store as fs
 # v5.0 (2026-04-19 scratch rewrite): new dedicated modules.
 import odds_fetcher
 import entries_fetcher
+# v5.7 (2026-04-19): grade-specific strategies (G2 diversified).
+import grade_strategy
 
 # Force-reload all project modules on every Streamlit rerun so that
 # code changes on disk take effect immediately without restarting
@@ -47,6 +49,7 @@ import entries_fetcher
 # to persist even after the JSON API fix was deployed.
 for _mod in [scraper, fs, bridge, train, dm, pe,
              odds_fetcher, entries_fetcher,   # v5.0 scratch modules
+             grade_strategy,                    # v5.7
              lp, plog]:
     importlib.reload(_mod)
 
@@ -620,16 +623,45 @@ elif batch and batch["results"]:
             # 言わない。model の win_prob を本命/対抗/単穴という馴染みの
             # 日本語で示し、買い方の目安を併記する。
             # LOOSE bets (ROI 検証用ルール) とは独立した「見やすい提示」。
+            #
+            # v5.7: G2 は市場分散戦略を適用 (analyze_g2_misses の結果、
+            # G2 勝ち馬の 48% が市場 4-10 番人気のため、現行 win_prob TOP3
+            # では構造的に取れない。過去 63 G2 レースの backtest で
+            # ROI -48.2% → +20.8% へ改善)
             if r.get("ranked"):
+                import grade_strategy as _gs
                 ranked = r["ranked"]
-                top3 = ranked[:3]
-                labels = ["◎ 本命", "○ 対抗", "▲ 単穴"]
+                _grade = (r.get("grade", "") or "")
+                _apply_diversified = _gs.should_apply_diversified(_grade)
+
+                if _apply_diversified:
+                    # G2 (or JpnII): market-rank diversified pick
+                    _mk_map = _gs.build_market_rank_map(ranked)
+                    top3 = _gs.pick_diversified_top3(ranked, _mk_map,
+                                                      strategy="diversified")
+                    labels = [h.get("bucket_mark", "◎") + " " +
+                              h.get("bucket_label", "本命") for h in top3]
+                    st.markdown(
+                        "### 🎯 本日のベスト 3 頭予測（G2 市場分散戦略）"
+                    )
+                    st.caption(
+                        "G2 は市場 4-10 番人気の勝利が 48% を占めるため、"
+                        "本命を市場 1-3、対抗を 4-7、単穴を 8 番以下から"
+                        "バランスよく選ぶ設計です（63 R backtest: "
+                        "ROI -48% → +21%）。"
+                    )
+                else:
+                    top3 = ranked[:3]
+                    labels = ["◎ 本命", "○ 対抗", "▲ 単穴"]
+                    st.markdown(
+                        "### 🎯 本日のベスト 3 頭予測（本命 / 対抗 / 単穴）"
+                    )
+
                 bet_suggestions = [
                     "単勝 / 複勝",          # 本命: 勝ち狙いと保険
                     "複勝 / ワイド (本命絡み)",  # 対抗: 複勝圏狙い
                     "ワイド / 馬連 (本命絡み)",  # 単穴: 穴押さえ
                 ]
-                st.markdown("### 🎯 本日のベスト 3 頭予測（本命 / 対抗 / 単穴）")
 
                 # 期待値計算: win_prob × odds。1.0 を超えれば理論的プラス
                 def _ev(h):
@@ -650,14 +682,18 @@ elif batch and batch["results"]:
                         f"{odds:.1f}倍"
                     )
                     ev_str = f"{ev:.2f}" if ev is not None else "—"
-                    top3_rows.append({
+                    row = {
                         "印": labels[i],
                         "馬名": h.get("name", "?"),
                         "モデル勝率": f"{wp:.1f}%",
                         "単勝オッズ": odds_str,
                         "単勝期待値 (勝率×オッズ)": ev_str,
                         "推奨買い目": bet_suggestions[i],
-                    })
+                    }
+                    # Diversified mode: add market rank column for transparency
+                    if _apply_diversified and "market_rank" in h:
+                        row["市場人気"] = f"{h['market_rank']}番人気"
+                    top3_rows.append(row)
                 top3_df = pd.DataFrame(top3_rows)
                 st.dataframe(top3_df, use_container_width=True, hide_index=True)
 
