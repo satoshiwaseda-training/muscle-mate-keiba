@@ -75,6 +75,7 @@ def _snapshot_of(entry: dict) -> dict:
     """
     ranked = entry.get("ranked") or []
     loose = entry.get("loose_bets") or []
+    meta = entry.get("odds_api_meta") or {}
     return {
         "snapshot_at":               entry.get("snapshot_at"),
         "prediction_created_at":     entry.get("prediction_created_at"),
@@ -98,7 +99,11 @@ def _snapshot_of(entry: dict) -> dict:
         "loose_bet_names": [b.get("name") for b in loose],
         "loose_bet_count": len(loose),
         "triggers_count":  len(entry.get("triggers") or []),
-        "odds_api_meta":   entry.get("odds_api_meta"),
+        "odds_api_meta":   meta,
+        # Multi-source consensus digest (2026-04)
+        "consensus_primary_source":   meta.get("consensus_primary_source"),
+        "consensus_has_disagreement": meta.get("consensus_has_disagreement"),
+        "consensus_summary":          meta.get("consensus_summary"),
     }
 
 
@@ -424,6 +429,14 @@ def recent_loose_bets_table(limit: int = 20) -> list[dict]:
         winner = _race_winner(fo)
         payouts = result.get("payouts") or {}
         win_payout = float(payouts.get("単勝", 0) or 0)
+        # 結果ページの確定オッズを name→odds で引けるようにしておく
+        # (RC-4: bet-time odds と settled odds を UI で併記するため)
+        settled_by_name = {}
+        for h in fo:
+            nm = _norm(h.get("name"))
+            od = _parse_odds(h.get("odds"))
+            if nm and od > 0 and nm not in settled_by_name:
+                settled_by_name[nm] = od
         for lb in loose:
             is_win = bool(winner and lb["name"] == winner)
             payout = win_payout if is_win else 0
@@ -434,6 +447,23 @@ def recent_loose_bets_table(limit: int = 20) -> list[dict]:
                 "race_name": e.get("race_name", ""),
                 "horse": lb["name"],
                 "odds": lb.get("odds", 0),
+                # 馬単位の odds 出典 (FIX-3): "jra-official" / "netkeiba-api"
+                # / "yahoo-keiba" / "live-odds-api" / "shutuba" / "result-page"
+                # / "none" / None (古いログ)
+                "odds_source": lb.get("odds_source"),
+                "odds_fetched_at": lb.get("odds_fetched_at"),
+                # 確定オッズ (結果ページから)。bet-time と分離して併記
+                # することで RC-4 のズレが UI 上で可視化される。
+                "odds_settled": settled_by_name.get(lb["name"]),
+                # Multi-source cross-check (2026-04)
+                # - odds_by_source: {source: float}. bet-time の値
+                # - odds_disagreement_pct: 最大相対差 (0.0 〜)
+                # - odds_disagreement_flag: >= 20% 差があった場合 True
+                # これらが立っている bet は実運用では held になっているはず
+                # だが、過去ログの事後監査のために表示する。
+                "odds_by_source":         lb.get("odds_by_source") or {},
+                "odds_disagreement_pct":  lb.get("odds_disagreement_pct", 0.0),
+                "odds_disagreement_flag": lb.get("odds_disagreement_flag", False),
                 "consensus_count": lb.get("consensus_count"),
                 "composite_condition": lb.get("composite_condition"),
                 "source_count": lb.get("source_count"),

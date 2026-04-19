@@ -35,13 +35,19 @@ import train
 import dual_mode_scoring as dm
 import feature_store as fs
 
+# v5.0 (2026-04-19 scratch rewrite): new dedicated modules.
+import odds_fetcher
+import entries_fetcher
+
 # Force-reload all project modules on every Streamlit rerun so that
 # code changes on disk take effect immediately without restarting
 # the Streamlit server. Python caches imports in sys.modules and
 # Streamlit's file watcher only re-executes the script — it does NOT
 # re-import dependency modules. This caused stale HTML-scraping code
 # to persist even after the JSON API fix was deployed.
-for _mod in [scraper, fs, bridge, train, dm, pe, lp, plog]:
+for _mod in [scraper, fs, bridge, train, dm, pe,
+             odds_fetcher, entries_fetcher,   # v5.0 scratch modules
+             lp, plog]:
     importlib.reload(_mod)
 
 from tools._autolog_utils import last_weekend
@@ -392,27 +398,13 @@ elif batch and batch["results"]:
                 "http":      http,
             })
 
-        # Show diagnostic details for debugging
-        diag_lines = []
-        for r in odds_not_pub[:3]:
-            am = r.get("odds_api_meta") or {}
-            diag_lines.append(
-                f"  {r.get('race_name','?')}: "
-                f"http={am.get('api_http_status', '?')} "
-                f"schema={am.get('api_schema_version', '?')} "
-                f"source={am.get('odds_source', '?')} "
-                f"reason={str(am.get('api_raw_reason', ''))[:60]}"
-            )
-        diag_str = "\n".join(diag_lines)
-
         st.warning(
             f"🕒 **{len(odds_not_pub)} レースでオッズ未公開** "
-            f"(`status: middle` · 取得時刻 {fetched_display})\n\n"
-            f"netkeiba API が `status=middle` を返し、"
-            f"SP版・Yahoo・JRA等 **全7フォールバックも失敗** しています。\n\n"
-            f"**原因:** 発走2〜3時間前まで公式オッズが未公開 + "
-            f"前日オッズはJS描画のため `requests` では取得不可。\n\n"
-            f"**診断情報:**\n```\n{diag_str}\n```"
+            f"(`status: middle` · 取得時刻 {fetched_display}) — "
+            f"**スクレイパーのバグではありません**。"
+            f"netkeiba が発走 2〜3 時間前にならないとオッズを出さないためです。"
+            f"現在の予測は **early version** として記録されていますが、"
+            f"ROI 集計からは分離されます (history に保全)。"
         )
         st.dataframe(pd.DataFrame(rows),
                      use_container_width=True, hide_index=True)
@@ -467,7 +459,12 @@ elif batch and batch["results"]:
                 "レース": r.get("race_name", "")[:14],
                 "G": r.get("grade", ""),
                 "馬名": lb["name"],
-                "単勝オッズ": f"{float(lb.get('odds', 0) or 0):.1f}" if float(lb.get("odds", 0) or 0) > 1.0 else "---",
+                "単勝オッズ": (
+                    "---" if float(lb.get("odds", 0) or 0) <= 1.0
+                    else f"⚠{float(lb.get('odds', 0) or 0):.1f}(要確認)"
+                    if float(lb.get("odds", 0) or 0) > 500.0
+                    else f"{float(lb.get('odds', 0) or 0):.1f}"
+                ),
                 "consensus": lb["consensus_count"],
                 "composite": f"{lb['composite_condition']:.2f}",
                 "sources": lb["source_count"],
@@ -500,7 +497,12 @@ elif batch and batch["results"]:
                     "レース": r.get("race_name", "")[:14],
                     "G": r.get("grade", ""),
                     "馬名": t["name"],
-                    "単勝オッズ": f"{float(t.get('odds', 0) or 0):.1f}" if float(t.get("odds", 0) or 0) > 1.0 else "---",
+                    "単勝オッズ": (
+                        "---" if float(t.get("odds", 0) or 0) <= 1.0
+                        else f"⚠{float(t.get('odds', 0) or 0):.1f}(要確認)"
+                        if float(t.get("odds", 0) or 0) > 500.0
+                        else f"{float(t.get('odds', 0) or 0):.1f}"
+                    ),
                     "consensus": t["consensus_count"],
                     "composite": f"{t['composite_condition']:.2f}",
                     "reason": t.get("reason", ""),
@@ -619,7 +621,12 @@ elif batch and batch["results"]:
                 ldf = pd.DataFrame([
                     {
                         "馬名": lb["name"],
-                        "単勝オッズ": f"{float(lb.get('odds', 0) or 0):.1f}" if float(lb.get("odds", 0) or 0) > 1.0 else "---",
+                        "単勝オッズ": (
+                    "---" if float(lb.get("odds", 0) or 0) <= 1.0
+                    else f"⚠{float(lb.get('odds', 0) or 0):.1f}(要確認)"
+                    if float(lb.get("odds", 0) or 0) > 500.0
+                    else f"{float(lb.get('odds', 0) or 0):.1f}"
+                ),
                         "consensus": lb["consensus_count"],
                         "composite": f"{lb['composite_condition']:.2f}",
                         "sources": lb["source_count"],
@@ -635,7 +642,12 @@ elif batch and batch["results"]:
                 tdf = pd.DataFrame([
                     {
                         "馬名": t["name"],
-                        "単勝オッズ": f"{float(t.get('odds', 0) or 0):.1f}" if float(t.get("odds", 0) or 0) > 1.0 else "---",
+                        "単勝オッズ": (
+                        "---" if float(t.get("odds", 0) or 0) <= 1.0
+                        else f"⚠{float(t.get('odds', 0) or 0):.1f}(要確認)"
+                        if float(t.get("odds", 0) or 0) > 500.0
+                        else f"{float(t.get('odds', 0) or 0):.1f}"
+                    ),
                         "consensus": t["consensus_count"],
                         "composite": f"{t['composite_condition']:.2f}",
                         "reason": t.get("reason", ""),
@@ -652,9 +664,10 @@ elif batch and batch["results"]:
                         "順位": i + 1,
                         "馬名": h["name"],
                         "単勝オッズ": (
-                            f"{float(h.get('odds', 0)):.1f}"
-                            if float(h.get("odds", 0) or 0) > 1.0
-                            else "---"
+                            "---" if float(h.get("odds", 0) or 0) <= 1.0
+                            else f"⚠{float(h.get('odds', 0) or 0):.1f}(要確認)"
+                            if float(h.get("odds", 0) or 0) > 500.0
+                            else f"{float(h.get('odds', 0) or 0):.1f}"
                         ),
                         "勝率": f"{h['win_prob']*100:.1f}%",
                     }
@@ -683,15 +696,27 @@ elif batch and batch["results"]:
                         "オッズが公開されたら再実行してください。"
                     )
 
+                # UI-level odds sanity gate (2026-04-19 最終防衛)。
+                # 上流 pipeline で何かおかしな値 (>500) が紛れ込んでも、
+                # 画面には絶対に "誤オッズ" として表示しない。
+                # 現実の JRA 単勝最大は ~500 倍程度なので、
+                # それを超える値は ?? + 警告を出す。
+                def _fmt_odds(v) -> str:
+                    try:
+                        vf = float(v or 0)
+                    except (TypeError, ValueError):
+                        return "---"
+                    if vf <= 1.0:
+                        return "---"
+                    if vf > 500.0:
+                        return f"⚠{vf:.1f}(要確認)"
+                    return f"{vf:.1f}"
+
                 fdf = pd.DataFrame([
                     {
                         "順位": i + 1,
                         "馬名": h["name"],
-                        "単勝オッズ": (
-                            f"{float(h.get('odds', 0)):.1f}"
-                            if float(h.get("odds", 0) or 0) > 1.0
-                            else "---"
-                        ),
+                        "単勝オッズ": _fmt_odds(h.get("odds", 0)),
                         "市場勝率 (overround除去)": (
                             f"{h.get('base_market_prob', 0)*100:.1f}%"
                             if h.get("base_market_prob") is not None else "—"

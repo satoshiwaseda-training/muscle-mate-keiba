@@ -30,6 +30,7 @@ import fact_extractor as fe
 import fact_validator as fv
 import dual_mode_scoring as dm
 import core_model_bridge as bridge
+import odds_sources as osrc
 from train import score_runner
 from data_store import load_weights
 
@@ -43,7 +44,23 @@ import prediction_log
 #   - the loose-rule definition in dual_mode_scoring.py
 # Persisted with every prediction so a later audit can diff predictions
 # that were produced under different model states.
-DATA_SOURCE_VERSION = "live-v1.2-scale-fix-2026-04"
+DATA_SOURCE_VERSION = "live-v5.0-scratch-rewrite-2026-04-19"
+# v5.0 (2026-04-19 第5波): ユーザ直訴を受け、**データ取得側を完全に
+# scratch-rewrite**。推論 (score_runner, dual_mode_scoring,
+# probability_engine, trigger_loose_capped, 憲法) は一切変更しない。
+#
+# - 新規モジュール `entries_fetcher.py`  : 出馬表 (馬/騎手/厩舎) のみ。odds 非対応。
+# - 新規モジュール `odds_fetcher.py`     : 単勝オッズの単一エントリ。
+#                                          JSON API (action=init) 1 本だけ。
+#                                          サニティ [1.0, 500.0]。欠損は None。
+# - `_inject_odds_if_missing` / consensus / shutuba cells[9] 等、
+#   過去の多層防御ロジックは**predict_live から除外**された。
+#   (※ 関数自体は残しているが呼び出さない — v5.0 経路には関与しない)
+#
+# 旧版の履歴:
+# v4.2 (2026-04-19 第4波): consensus 優先順位を shutuba-direct > API に。
+# v4.1 (2026-04-19 第3波): cells[9] 廃止、span[id^='odds-'] のみ。
+# v4.0 (2026-04 初回): multi-source consensus 導入。
 
 
 def _log(cb: Optional[Callable[[str], None]], msg: str) -> None:
@@ -71,45 +88,39 @@ def _parse_odds_safe(raw) -> float:
         return 0.0
 
 
-def _inject_from_umaban_map(entries: list[dict], odds_map: dict[int, float]) -> int:
-    """Inject odds from a {馬番: odds} dict into entries. Returns count."""
-    injected = 0
-    for e in entries:
-        if _parse_odds_safe(e.get("odds", 0)) > 0:
-            continue
-        try:
-            um = int(str(e.get("number", "")).strip() or 0)
-        except ValueError:
-            um = 0
-        if um in odds_map:
-            e["odds"] = str(odds_map[um])
-            injected += 1
-    return injected
-
-
 def _inject_odds_if_missing(
     entries: list[dict],
     race_id: str,
     progress_cb: Optional[Callable[[str], None]] = None,
+    race_date: Optional[str] = None,
+    venue: Optional[str] = None,
 ) -> tuple[str, dict]:
-    """If ≥50% of entries have 0 odds, try to inject real odds.
+    """Ensure every entry has the freshest available odds.
 
-    Returns (status_str, meta_dict).
+    Priority (高→低):
+      1. netkeiba の JSON odds API が `status=result` を返したら、
+         shutuba の値に**関係なく全馬を上書き**する。これが最も
+         直近の市場状態を反映する。(odds_source = "live-odds-api")
+      2. (1) が使えないとき、shutuba HTML が既に全馬ぶん埋まっていれば
+         そのまま使う。(odds_source = "shutuba")
+      3. shutuba の欠損が少数 (<50%) なら残りは scratch と見なして触らない。
+         (odds_source = "shutuba-partial")
+      4. 欠損が過半なら結果ページから fill-in を試みる (past races)。
+         (odds_source = "result-page")
+      5. 結果ページも駄目で API が `middle` を返すなら未公開。
+         (odds_source = "api-not-published", status = "not-published-yet")
+      6. いずれも NG なら全ゼロで返す。(odds_source = "none")
 
-    status_str values:
-      'ok'                              — no injection needed
-      'partial-kept ({n})'              — few missing, probably scratches
-      'injected-from-result ({n})'      — result page filled n horses
-      'injected-from-live-odds ({n})'   — odds API filled n horses
-      'not-published-yet'               — netkeiba returned status:middle
-                                          (race too early; not a bug)
-      'all-zero-no-source ({n}/{m})'    — true fetch failure
+    この順序は「shutuba より API、API より何もしない」ではなく
+    「実際に使える最新の数字を最優先」にするための設計。
+    RC-1 (`docs/odds_pipeline_audit.md` §2) を解消する。
 
-    meta_dict carries the defensive fields from scraper.fetch_odds_netkeiba
-    (http_status, response_url, raw_reason, parse_error,
-     schema_version_guess, fetched_at, update_count, official_time) so the
-    caller can persist them on the prediction record for audit. The dict
-    is always returned with the same keys — missing values are None.
+    Returns (status_str, meta_dict). meta_dict は常に同じキーセット。
+
+    Per-entry provenance:
+      各エントリには `odds_source` と `odds_fetched_at` を書き込む。
+      後段の `prediction_log` / `recent_loose_bets_table` が
+      レース単位ではなく馬単位の出典を追跡できるようにするため。
     """
     meta: dict = {
         "odds_source":           None,
@@ -122,18 +133,150 @@ def _inject_odds_if_missing(
         "api_update_count":      None,
         "api_official_time":     None,
         "injected_count":        0,
+        # ── 2026-04 multi-source consensus (RC-3 拡張) ──
+        "consensus_primary_source":   None,   # "jra-official" | "netkeiba-api" | ...
+        "consensus_enabled_sources":  [],
+        "consensus_per_source":       {},     # source_name → SourceResult summary
+        "consensus_disagreements":    {},     # umaban(str) → disagreement record
+        "consensus_has_disagreement": False,
+        "consensus_summary":          "",
+        # ── 2026-04 pre-consensus sanity (フォルテアンジェロ事件対策) ──
+        "entries_sanity_rejected":    {},     # number → bad_value (for audit)
+        # ── pipeline version (古い cached result と見分けるため) ──
+        "pipeline_version":           "v4.2-shutuba-primary-2026-04-19",
     }
 
+    now_iso = datetime.now().isoformat(timespec="seconds")
+
+    def _tag(e: dict, src: str, fetched_at: Optional[str] = None) -> None:
+        """馬単位で出典と取得時刻を残す。"""
+        e["odds_source"] = src
+        e["odds_fetched_at"] = fetched_at or now_iso
+
+    # ── Step 0: 入り口で sanity を掛ける (入力健全化) ──
+    # shutuba HTML のカラムずれや別ソースのゴミが entries[*].odds に
+    # 入ったまま到達すると、次の "欠損チェック" で「値あり」扱いされて
+    # overlay のチャンスを失い、168.8 / 681.5 / 782.7 のような偽オッズが
+    # 生き残ってしまう。ここで `[ODDS_MIN, ODDS_MAX]` 範囲外を "0" に
+    # 叩き落とすことで、欠損扱い → overlay 可能状態にする。
+    for e in entries:
+        raw = e.get("odds", 0)
+        v = _parse_odds_safe(raw)
+        if v > 0 and not (osrc.ODDS_MIN <= v <= osrc.ODDS_MAX):
+            try:
+                num = int(str(e.get("number", "")).strip() or 0)
+            except ValueError:
+                num = 0
+            meta["entries_sanity_rejected"][num] = v
+            e["odds"] = "0"  # overlay 対象にする
+            e["odds_prev_rejected"] = v
+            _log(progress_cb,
+                 f"⚠ sanity: 馬番#{num} odds={v} は範囲外なので欠損扱い "
+                 f"({e.get('name', '?')})")
+
+    # ── Step 1: Multi-source consensus を先に取る ──
+    #   優先順位 (2026-04-19 第4波):
+    #     shutuba-direct > JRA公式 > netkeiba JSON API > Yahoo 競馬
+    #   `entries` を consensus に渡すことで shutuba-direct (= scraper が
+    #   既に拾っている値) が最優先 primary として参加する。
+    #   ユーザ確認済みの「scraping 結果は正しい」を pipeline 内で権威化し、
+    #   JSON API が別 bet type を返す奇病を overlay で無効化する。
+    consensus: dict = {}
+    try:
+        consensus = osrc.fetch_odds_consensus(
+            race_id=race_id, race_date=race_date, venue=venue,
+            entries=entries,
+        ) or {}
+    except Exception as e:
+        _log(progress_cb, f"オッズ consensus 取得失敗: {e}")
+        meta["api_raw_reason"] = f"consensus-exception: {e.__class__.__name__}: {e}"
+
+    # Consensus 詳細を meta にたたみ込む
+    per_source_summary = {}
+    for name, res in (consensus.get("per_source") or {}).items():
+        per_source_summary[name] = {
+            "status":       res.get("status"),
+            "n_horses":     len(res.get("by_number") or {}),
+            "http_status":  res.get("http_status"),
+            "schema_guess": res.get("schema_guess"),
+            "fetched_at":   res.get("fetched_at"),
+            "raw_reason":   res.get("raw_reason"),
+        }
+    meta["consensus_primary_source"]   = consensus.get("primary_source")
+    meta["consensus_enabled_sources"]  = list(consensus.get("enabled_sources") or [])
+    meta["consensus_per_source"]       = per_source_summary
+    meta["consensus_disagreements"]    = {
+        str(um): d for um, d in (consensus.get("disagreements") or {}).items()
+    }
+    meta["consensus_has_disagreement"] = bool(consensus.get("has_disagreement_any"))
+    meta["consensus_summary"]          = osrc.summarize_disagreement(consensus)
+
+    # 従来の "api_*" フィールドは netkeiba-api の取得結果をそのまま反映
+    # （下流コードがこれらの名前を参照するため後方互換に残す）。
+    nk = (consensus.get("per_source") or {}).get("netkeiba-api") or {}
+    meta.update({
+        "api_http_status":    nk.get("http_status"),
+        "api_response_url":   nk.get("response_url"),
+        "api_raw_reason":     nk.get("raw_reason") or meta["api_raw_reason"],
+        "api_parse_error":    nk.get("parse_error"),
+        "api_schema_version": nk.get("schema_guess"),
+        "api_fetched_at":     nk.get("fetched_at"),
+    })
+
+    primary = consensus.get("primary_source") or "none"
+    primary_by_number = consensus.get("primary_by_number") or {}
+
+    if primary != "none" and primary_by_number:
+        overlaid = 0
+        for e in entries:
+            try:
+                um = int(str(e.get("number", "")).strip() or 0)
+            except ValueError:
+                um = 0
+            if um in primary_by_number:
+                e["odds"] = str(primary_by_number[um])
+                _tag(e, primary, now_iso)
+                # 馬ごとに disagreement フラグも書いておく — 下流 LOOSE veto 用
+                dgr = osrc.disagreement_for_number(consensus, um)
+                e["odds_disagreement_flag"] = bool(dgr.get("flag"))
+                e["odds_disagreement_pct"]  = float(dgr.get("max_pct") or 0.0)
+                e["odds_by_source"]         = dict(dgr.get("values") or {})
+                overlaid += 1
+
+        if overlaid:
+            meta["odds_source"] = primary
+            meta["injected_count"] = overlaid
+            # 残りの scratch/欠番 entry にも最小限の tag を残す
+            for e in entries:
+                e.setdefault("odds_source",
+                             "shutuba" if _parse_odds_safe(e.get("odds")) > 0
+                             else "none")
+                e.setdefault("odds_fetched_at", now_iso)
+                e.setdefault("odds_disagreement_flag", False)
+                e.setdefault("odds_disagreement_pct", 0.0)
+                e.setdefault("odds_by_source", {})
+            if overlaid >= len(entries):
+                return f"overlaid-from-{primary} ({overlaid})", meta
+            return f"overlaid-from-{primary} ({overlaid}/{len(entries)})", meta
+
+    # ── Step 2: API 使えず、shutuba の状態で分岐 ──
     missing = [e for e in entries if _parse_odds_safe(e.get("odds", 0)) <= 0]
     if not missing:
         meta["odds_source"] = "shutuba"
+        for e in entries:
+            _tag(e, "shutuba")
         return "ok", meta
     if len(missing) < len(entries) / 2:
-        # Probably just scratched horses showing `---` — leave alone
+        # 欠損が少ない → scratch と見なして放置
         meta["odds_source"] = "shutuba-partial"
+        for e in entries:
+            if _parse_odds_safe(e.get("odds", 0)) > 0:
+                _tag(e, "shutuba")
+            else:
+                _tag(e, "none")
         return f"partial-kept ({len(missing)})", meta
 
-    # Try result page first (past races)
+    # ── Step 3: 結果ページから fill-in (past races) ──
     _log(progress_cb, f"オッズ欠損検知 ({len(missing)}/{len(entries)}) — 結果ページから取得試行")
     try:
         result = scraper.fetch_result_netkeiba(race_id)
@@ -150,7 +293,10 @@ def _inject_odds_if_missing(
                     nm = (e.get("name") or "").strip()
                     if _parse_odds_safe(e.get("odds", 0)) <= 0 and nm in odds_map:
                         e["odds"] = str(odds_map[nm])
+                        _tag(e, "result-page")
                         injected += 1
+                    else:
+                        _tag(e, "shutuba" if _parse_odds_safe(e.get("odds")) > 0 else "none")
                 if injected:
                     meta["odds_source"] = "result-page"
                     meta["injected_count"] = injected
@@ -158,135 +304,23 @@ def _inject_odds_if_missing(
     except Exception as e:
         _log(progress_cb, f"結果ページ取得失敗: {e}")
 
-    # Fallback: live odds JSON API (upcoming races).
-    # Joins by 馬番 (stable key) rather than name.
-    _log(progress_cb, "ライブオッズAPI から取得試行")
-    live: dict = {}
-    try:
-        live = scraper.fetch_odds_netkeiba(race_id) or {}
-    except Exception as e:
-        _log(progress_cb, f"オッズAPI取得失敗: {e}")
-        meta["api_raw_reason"] = f"exception: {e.__class__.__name__}: {e}"
-
-    # Always populate meta from whatever we got back so an audit trail
-    # exists even when the call returned "not-published".
-    meta.update({
-        "api_http_status":    live.get("http_status"),
-        "api_response_url":   live.get("response_url"),
-        "api_raw_reason":     live.get("raw_reason") or meta["api_raw_reason"],
-        "api_parse_error":    live.get("parse_error"),
-        "api_schema_version": live.get("schema_version_guess"),
-        "api_fetched_at":     live.get("fetched_at"),
-        "api_update_count":   live.get("update_count"),
-        "api_official_time":  live.get("official_time"),
-    })
-
-    api_status = str(live.get("status") or "error")
-    by_number = live.get("by_number") or {}
-    api_not_published = False
-    if api_status == "result" and by_number:
-        injected = 0
-        for e in entries:
-            if _parse_odds_safe(e.get("odds", 0)) > 0:
-                continue
-            try:
-                um = int(str(e.get("number", "")).strip() or 0)
-            except ValueError:
-                um = 0
-            if um in by_number:
-                e["odds"] = str(by_number[um])
-                injected += 1
-        if injected:
-            meta["odds_source"] = "live-odds-api"
-            meta["injected_count"] = injected
-            return f"injected-from-live-odds ({injected})", meta
-    elif api_status == "not-published":
+    # ── Step 4: netkeiba API が middle を返した場合の情報提示 ──
+    # consensus の per_source から netkeiba-api の status を参照する。
+    nk_status = (per_source_summary.get("netkeiba-api") or {}).get("status")
+    if nk_status == "not-published":
         _log(
             progress_cb,
-            f"netkeiba オッズ API: 公式オッズ未公開 "
-            f"(status=middle, schema={meta['api_schema_version']}) "
-            f"— 前日オッズ / 暫定オッズを他ソースから取得試行",
+            f"netkeiba オッズ API: まだ公開前 "
+            f"(status=middle, schema={meta['api_schema_version']})",
         )
-        api_not_published = True
-        # Do NOT return here — fall through to try other sources
-        # that may have preliminary / previous-day odds.
-
-    # Fallback: SP (smartphone) shutuba page — odds may be in the HTML
-    # directly, unlike the desktop version which relies on JS.
-    _log(progress_cb, "SP版出馬表からオッズ取得試行")
-    try:
-        sp_odds = scraper.fetch_odds_from_sp_shutuba(race_id)
-        _log(progress_cb, f"  SP版結果: {len(sp_odds)} 件取得")
-        if sp_odds:
-            injected = 0
-            for e in entries:
-                if _parse_odds_safe(e.get("odds", 0)) > 0:
-                    continue
-                nm = (e.get("name") or "").strip()
-                try:
-                    um = int(str(e.get("number", "")).strip() or 0)
-                except ValueError:
-                    um = 0
-                if um in sp_odds:
-                    e["odds"] = str(sp_odds[um])
-                    injected += 1
-                elif nm in sp_odds:
-                    e["odds"] = str(sp_odds[nm])
-                    injected += 1
-            if injected:
-                meta["odds_source"] = "sp-shutuba"
-                meta["injected_count"] = injected
-                return f"injected-from-sp-shutuba ({injected})", meta
-    except Exception as e:
-        _log(progress_cb, f"SP版出馬表取得失敗: {e}")
-
-    # Fallback: netkeiba odds HTML page — parse inline <script> data
-    _log(progress_cb, "netkeiba オッズページ (inline script) から取得試行")
-    try:
-        page_odds = scraper.fetch_odds_from_odds_page(race_id)
-        _log(progress_cb, f"  オッズページ結果: {len(page_odds)} 件取得")
-        if page_odds:
-            injected = _inject_from_umaban_map(entries, page_odds)
-            if injected:
-                meta["odds_source"] = "odds-page-script"
-                meta["injected_count"] = injected
-                return f"injected-from-odds-page ({injected})", meta
-    except Exception as e:
-        _log(progress_cb, f"オッズページ取得失敗: {e}")
-
-    # Fallback: Yahoo Sports Keiba — independent source
-    _log(progress_cb, "Yahoo Sports Keiba からオッズ取得試行")
-    try:
-        yahoo_odds = scraper.fetch_odds_from_yahoo(race_id)
-        _log(progress_cb, f"  Yahoo結果: {len(yahoo_odds)} 件取得")
-        if yahoo_odds:
-            injected = _inject_from_umaban_map(entries, yahoo_odds)
-            if injected:
-                meta["odds_source"] = "yahoo-keiba"
-                meta["injected_count"] = injected
-                return f"injected-from-yahoo ({injected})", meta
-    except Exception as e:
-        _log(progress_cb, f"Yahoo Keiba取得失敗: {e}")
-
-    # Fallback: pandas read_html / SP odds / JRA official
-    _log(progress_cb, "netkeiba (pd.read_html / SP odds / JRA) から取得試行")
-    try:
-        top_odds = scraper.fetch_odds_from_netkeiba_top(race_id)
-        _log(progress_cb, f"  代替ソース結果: {len(top_odds)} 件取得")
-        if top_odds:
-            injected = _inject_from_umaban_map(entries, top_odds)
-            if injected:
-                meta["odds_source"] = "netkeiba-top-pandas"
-                meta["injected_count"] = injected
-                return f"injected-from-netkeiba-alt ({injected})", meta
-    except Exception as e:
-        _log(progress_cb, f"netkeiba alternative取得失敗: {e}")
-
-    # All fallbacks exhausted.
-    if api_not_published:
         meta["odds_source"] = "api-not-published"
+        for e in entries:
+            _tag(e, "none")
         return "not-published-yet", meta
+
     meta["odds_source"] = "none"
+    for e in entries:
+        _tag(e, "none")
     return f"all-zero-no-source ({len(missing)}/{len(entries)} missing)", meta
 
 
@@ -314,11 +348,141 @@ def predict_live(
     jra = fc.collect_jra_facts(race_id, venue)
     collection_log.append(jra)
 
-    entries = scraper.fetch_entries_netkeiba(race_id, venue) or []
-    # Inject odds from result/live-odds page when shutuba shows 0/`---`.
-    # Without this, all horses would get score_runner's uniform 1/N base
-    # and the ranking would collapse to gate-number order.
-    odds_status, odds_meta = _inject_odds_if_missing(entries, race_id, progress_cb)
+    # ── v5.0 (2026-04-19): scratch-rewrite data acquisition ──
+    # ユーザ直訴 (フォルテアンジェロ事件) を受け、データ取得側を完全に
+    # 新モジュール `entries_fetcher` + `odds_fetcher` に切り替える。
+    # 旧 `scraper.fetch_entries_netkeiba` / 旧 `_inject_odds_if_missing`
+    # は**呼ばない**。推論層 (score_runner, dual_mode_score,
+    # probability_engine, trigger_loose_capped) は不変更。
+    import entries_fetcher as _ef
+    import odds_fetcher as _of
+
+    entries = _ef.fetch_horse_entries(race_id, venue) or []
+
+    # 旧 scraper の enrich cache (paddock / training / horse detail) は
+    # これまで通り scraper 側で拾う。entries 側のフィールドを派生情報で
+    # 埋める必要があるので、scraper.enrich_entries を run する。
+    # ただし **scraper.enrich_entries は odds フィールドに触らない**
+    # (新 entries_fetcher は odds を持たないので、もし enrich が偶然
+    #  odds を書き込んでも 0 化される)。念のため明示的に削除する。
+    try:
+        entries = scraper.enrich_entries(entries, race_id,
+                                         race_name=race_name) or entries
+    except Exception as _e:
+        _log(progress_cb, f"enrich_entries skipped: {_e}")
+    for _e in entries:
+        # enrich 側が past-cached odds (旧 cells[9] 由来) を残したまま
+        # だった場合の防御。必ず新取得の値だけを採用する。
+        _e.pop("odds", None)
+
+    # 単勝オッズは scratch-rewrite の odds_fetcher から取得。
+    _log(progress_cb, f"単勝オッズ取得 ({_of.FETCHER_VERSION})")
+    win_odds = _of.fetch_win_odds(race_id)
+
+    # entries に join
+    odds_by_num = win_odds.by_number or {}
+    filled = 0
+    for e in entries:
+        try:
+            num = int(str(e.get("number", "")).strip() or 0)
+        except (TypeError, ValueError):
+            num = 0
+        v = odds_by_num.get(num)
+        if v is not None:
+            e["odds"] = f"{v:.1f}"          # 文字列で保持 (既存 pipeline 互換)
+            e["odds_source"] = "odds_fetcher-v5"
+            e["odds_fetched_at"] = win_odds.fetched_at
+            filled += 1
+        else:
+            e["odds"] = "0"
+            e["odds_source"] = "missing"
+            e["odds_fetched_at"] = win_odds.fetched_at
+
+    # v5.0 simplified meta (旧 odds_meta の互換レイヤ)。
+    if filled > 0:
+        odds_status = f"v5-odds_fetcher ({filled}/{len(entries)})"
+    elif win_odds.status == "not-published":
+        odds_status = "not-published-yet"
+    else:
+        odds_status = f"all-zero-no-source ({len(entries)} missing)"
+
+    odds_meta = {
+        "odds_source":                "odds_fetcher-v5" if filled else "missing",
+        "pipeline_version":           "v5.0-scratch-rewrite-2026-04-19",
+        "fetcher_version":            _of.FETCHER_VERSION,
+        "entries_fetcher_version":    _ef.ENTRIES_FETCHER_VERSION,
+        "win_odds_status":            win_odds.status,
+        "win_odds_raw_reason":        win_odds.raw_reason,
+        "win_odds_http_status":       win_odds.http_status,
+        "win_odds_official_time":     win_odds.official_time,
+        "win_odds_update_count":      win_odds.update_count,
+        "win_odds_rejected":          dict(win_odds.rejected or {}),
+        "injected_count":             filled,
+        # Legacy-compatible fields (下流の app_live などがまだ読んでる):
+        "api_http_status":            win_odds.http_status,
+        "api_raw_reason":             win_odds.raw_reason,
+        "api_fetched_at":             win_odds.fetched_at,
+        "api_schema_version":         "v1-jra-odds-2026",
+        "api_response_url":           win_odds.response_url,
+        "api_official_time":          win_odds.official_time,
+        "api_parse_error":            None,
+        "api_update_count":           win_odds.update_count,
+        "consensus_primary_source":   "odds_fetcher-v5",
+        "consensus_enabled_sources":  ["odds_fetcher-v5"],
+        "consensus_per_source":       {"odds_fetcher-v5": {
+            "status":       win_odds.status,
+            "n_horses":     len(odds_by_num),
+            "http_status":  win_odds.http_status,
+            "schema_guess": "v1-jra-odds-2026",
+            "fetched_at":   win_odds.fetched_at,
+            "raw_reason":   win_odds.raw_reason,
+        }},
+        "consensus_disagreements":    {},
+        "consensus_has_disagreement": False,
+        "consensus_summary":          "single-source-v5",
+        "entries_sanity_rejected":    dict(win_odds.rejected or {}),
+    }
+
+    # Provenance dump (hunting フォルテアンジェロ事件):
+    # ODDS_TRACE_DIR が設定されている場合、このレースで各馬の odds が
+    # どの経路から来たかを詳細 JSON で保存する。
+    # これは不正値が UI に現れたとき「最後のチャンスで診断」する手段。
+    import os as _os
+    _trace_dir = _os.environ.get("ODDS_TRACE_DIR")
+    if _trace_dir:
+        try:
+            from pathlib import Path as _P
+            _td = _P(_trace_dir)
+            _td.mkdir(parents=True, exist_ok=True)
+            _ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+            _dump = {
+                "race_id": race_id,
+                "race_date": race_date,
+                "venue": venue,
+                "odds_status": odds_status,
+                "odds_meta": odds_meta,
+                "entries": [
+                    {
+                        "number": e.get("number"),
+                        "name": e.get("name"),
+                        "odds": e.get("odds"),
+                        "odds_source": e.get("odds_source"),
+                        "odds_fetched_at": e.get("odds_fetched_at"),
+                        "odds_by_source": e.get("odds_by_source"),
+                        "odds_disagreement_flag": e.get("odds_disagreement_flag"),
+                        "odds_disagreement_pct": e.get("odds_disagreement_pct"),
+                        "odds_prev_rejected": e.get("odds_prev_rejected"),
+                    }
+                    for e in entries
+                ],
+            }
+            import json as _json
+            _p = _td / f"pipeline_{race_id}_{_ts}.json"
+            _p.write_text(_json.dumps(_dump, ensure_ascii=False, indent=2),
+                          encoding="utf-8")
+            _log(progress_cb, f"[odds-trace] pipeline dump saved: {_p}")
+        except Exception as _e:
+            _log(progress_cb, f"[odds-trace] pipeline dump failed: {_e}")
     horse_names = [(e.get("name") or "").strip() for e in entries if e.get("name")]
 
     # Scratches go out of the name list
@@ -411,6 +575,14 @@ def predict_live(
     _log(progress_cb, "スコア計算 (score_runner + dual-mode)")
     race_info = scraper.fetch_race_info_netkeiba(race_id) or {}
     entries_run = [e for e in entries if (e.get("name") or "").strip() in set(running)]
+
+    # 馬ごとに odds の出典と取得時刻を後段で参照できるようにするため、
+    # 名前→entry の lookup を作る（feature_store は source/fetched_at を
+    # 通さないので、ここで持っておく）。
+    entry_by_name = {
+        (e.get("name") or "").strip(): e
+        for e in entries_run
+    }
 
     sf = fs.extract_structured_features(
         entries=entries_run,
@@ -528,6 +700,24 @@ def predict_live(
         }
         loose_flag, loose_reason = dm.trigger_loose_capped(loose_input)
 
+        # ── Odds disagreement veto (RC-new 2026-04) ──
+        #   憲法 §7.2 は LOOSE の 4 数値条件を fix するが、「入力される
+        #   odds がそもそも正確でない」ケースの発火抑制は数値改変では
+        #   なく入力健全性の担保。主権ソース (JRA 公式 > netkeiba-api)
+        #   と他ソースで 20%+ 差が出ている馬は、オッズ反映の信頼度が
+        #   確保できないので LOOSE を保留する。
+        entry_for_veto = entry_by_name.get(this_name, {})
+        disagreement_flag = bool(entry_for_veto.get("odds_disagreement_flag", False))
+        disagreement_pct = float(entry_for_veto.get("odds_disagreement_pct", 0.0) or 0.0)
+        if loose_flag and disagreement_flag:
+            by_src = entry_for_veto.get("odds_by_source") or {}
+            src_str = ", ".join(f"{s}={v:.1f}" for s, v in by_src.items())
+            loose_flag = False
+            loose_reason = (
+                f"held: odds source disagreement "
+                f"{disagreement_pct*100:.0f}% ({src_str})"
+            )
+
         # Tiebreaker for exactly-tied scores (rare after bridge reconnection).
         jwr = float(sf_horses[this_name].get("jockey_win_rate", 0) or 0)
         epsilon = jwr * 0.2
@@ -542,6 +732,12 @@ def predict_live(
             decision["odds_score"], horse_odds,
         )
 
+        # ── v2: pedigree & camp trace fields ──
+        h_sf = sf_horses[this_name]
+        pedigree_comp = h_sf.get("pedigree_composite", 0.5)
+        camp_comp = h_sf.get("camp_composite", 0.5)
+        sire_dist_fit = h_sf.get("sire_distance_fit", 0.5)
+
         # Enrich scored rows with the signals assign_calibrated_probs needs
         scored.append({
             "name": this_name,
@@ -554,6 +750,13 @@ def predict_live(
             "structured_edge": struct_edge,
             "composite_condition": composite,
             "consensus_count": consensus_count,
+            # v2: pedigree & camp trace
+            "pedigree_composite": round(pedigree_comp, 4),
+            "camp_composite": round(camp_comp, 4),
+            "sire_distance_fit": round(sire_dist_fit, 4),
+            "sire_name": h_sf.get("sire_name", ""),
+            "damsire_name": h_sf.get("damsire_name", ""),
+            "breeder_name": h_sf.get("breeder_name", ""),
         })
 
         # Track triggers explicitly
@@ -565,6 +768,20 @@ def predict_live(
         })
 
         states = per_horse_states.get(this_name, {})
+        # Per-horse odds provenance (RC-3 の解消)。
+        # `_inject_odds_if_missing` が各 entry に `odds_source` /
+        # `odds_fetched_at` を書き込んでいる。ここでそれを trigger_info
+        # に射影しておくと、`loose_bets` に自動で流れる。
+        entry_for_horse = entry_by_name.get(this_name, {})
+        odds_source_for_horse = entry_for_horse.get("odds_source")
+        odds_fetched_for_horse = entry_for_horse.get("odds_fetched_at")
+        odds_by_source_for_horse = entry_for_horse.get("odds_by_source") or {}
+        odds_disagreement_flag_for_horse = bool(
+            entry_for_horse.get("odds_disagreement_flag", False)
+        )
+        odds_disagreement_pct_for_horse = float(
+            entry_for_horse.get("odds_disagreement_pct", 0.0) or 0.0
+        )
         trigger_info.append({
             "name": this_name,
             "consensus_count": consensus_count,
@@ -582,6 +799,15 @@ def predict_live(
             "odds_score": round(decision["odds_score"], 2),
             "fact_score": round(decision["fact_score"], 2),
             "odds": sf_horses[this_name].get("odds", 0),
+            # 馬単位の odds 出典 (RC-3): "jra-official" / "netkeiba-api" /
+            # "yahoo-keiba" / "live-odds-api" (legacy alias) / "shutuba" /
+            # "result-page" / "none" のいずれか
+            "odds_source": odds_source_for_horse,
+            "odds_fetched_at": odds_fetched_for_horse,
+            # 複数ソース cross-check (2026-04 multi-source consensus)
+            "odds_by_source":            odds_by_source_for_horse,
+            "odds_disagreement_flag":    odds_disagreement_flag_for_horse,
+            "odds_disagreement_pct":     round(odds_disagreement_pct_for_horse, 4),
             "facts_preview": [
                 f.type for f in by_horse.get(this_name, [])
                 if f.meta.get("in_consensed_category")
@@ -619,7 +845,10 @@ def predict_live(
     #           fact layer + gate/field signals can still be reviewed
     #           BUT must never be mixed with final predictions in ROI
     #           aggregation — see weekly_report.by_stage.
-    if odds_status.startswith(("ok", "partial-kept", "injected")):
+    if odds_status.startswith((
+        "ok", "partial-kept", "injected", "overlaid",
+        "v5-odds_fetcher",   # v5.0 scratch-rewrite success
+    )):
         prediction_stage = "final"
     else:
         prediction_stage = "early"
