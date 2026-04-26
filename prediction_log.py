@@ -11,6 +11,10 @@ from __future__ import annotations
 
 import json
 import os
+import csv
+import io
+import re
+import zipfile
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +22,7 @@ from typing import Optional
 
 ROOT = Path(__file__).parent
 LIVE_FILE = ROOT / "data" / "live_predictions.json"
+ARCHIVE_DIR = ROOT / "data" / "prediction_archive"
 
 
 def _load() -> dict:
@@ -56,7 +61,344 @@ def _save(data: dict) -> None:
             os.fsync(f.fileno())
         except (OSError, AttributeError):
             pass  # some filesystems (network, OneDrive) don't support fsync
-    os.replace(tmp_path, LIVE_FILE)
+    try:
+        os.replace(tmp_path, LIVE_FILE)
+    except PermissionError:
+        # OneDrive / WindowsApps sandboxes can allow the temp write but
+        # deny the atomic rename. Fall back to a direct complete write so
+        # logging still works; the JSON was already fully serialized above.
+        LIVE_FILE.write_text(payload, encoding="utf-8", newline="\n")
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Write text using the same replace-on-complete pattern as _save."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except (OSError, AttributeError):
+            pass
+    try:
+        os.replace(tmp_path, path)
+    except PermissionError:
+        path.write_text(text, encoding="utf-8", newline="\n")
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    _write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _safe_name(value: object, fallback: str = "unknown") -> str:
+    raw = str(value or "").strip() or fallback
+    raw = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw)
+    raw = re.sub(r"\s+", "_", raw)
+    raw = raw.strip("._ ")
+    return raw[:80] or fallback
+
+
+def _archive_slug(entry: dict) -> str:
+    race_id = _safe_name(entry.get("race_id"), "race")
+    race_name = _safe_name(entry.get("race_name"), "prediction")
+    return f"{race_id}_{race_name}"
+
+
+def _archive_timestamp(entry: dict) -> str:
+    raw = (
+        entry.get("snapshot_at")
+        or entry.get("prediction_created_at")
+        or datetime.now().isoformat(timespec="seconds")
+    )
+    return _safe_name(str(raw).replace(":", "").replace("-", ""), "snapshot")
+
+
+def _fmt_pct(value: object) -> str:
+    try:
+        return f"{float(value) * 100:.1f}%"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _fmt_odds(value: object) -> str:
+    try:
+        v = float(value or 0)
+    except (TypeError, ValueError):
+        return "-"
+    return f"{v:.1f}" if v > 0 else "-"
+
+
+def _prediction_markdown(entry: dict) -> str:
+    """Human-readable race snapshot for later review."""
+    title = entry.get("race_name") or entry.get("race_id") or "Prediction"
+    lines = [
+        f"# {title}",
+        "",
+        f"- race_id: `{entry.get('race_id', '')}`",
+        f"- race_date: `{entry.get('race_date', '')}`",
+        f"- venue: `{entry.get('venue', '')}`",
+        f"- grade: `{entry.get('grade', '')}`",
+        f"- prediction_stage: `{entry.get('prediction_stage', '')}`",
+        f"- prediction_created_at: `{entry.get('prediction_created_at', '')}`",
+        f"- snapshot_at: `{entry.get('snapshot_at', '')}`",
+        f"- data_source_version: `{entry.get('data_source_version', '')}`",
+        f"- odds_status_at_prediction: `{entry.get('odds_status_at_prediction', entry.get('odds_status', ''))}`",
+        "",
+        "## Selected Top 3",
+        "",
+        "| Mark | Horse | Odds | Win Prob |",
+        "|---|---:|---:|---:|",
+    ]
+    marks = ["◎", "○", "▲"]
+    for i, horse in enumerate(entry.get("selected_top3") or []):
+        lines.append(
+            "| {mark} | {name} | {odds} | {prob} |".format(
+                mark=marks[i] if i < len(marks) else str(i + 1),
+                name=horse.get("name", ""),
+                odds=_fmt_odds(horse.get("odds")),
+                prob=_fmt_pct(horse.get("win_prob")),
+            )
+        )
+
+    lines.extend([
+        "",
+        "## Loose Bets",
+        "",
+        "| Horse | Odds | Consensus | Composite | Reason | Rule Version |",
+        "|---|---:|---:|---:|---|---|",
+    ])
+    loose = entry.get("loose_bets") or []
+    if loose:
+        for bet in loose:
+            lines.append(
+                "| {name} | {odds} | {cons} | {comp} | {reason} | `{version}` |".format(
+                    name=bet.get("name", ""),
+                    odds=_fmt_odds(bet.get("odds")),
+                    cons=bet.get("consensus_count", ""),
+                    comp=f"{float(bet.get('composite_condition', 0) or 0):.2f}",
+                    reason=str(bet.get("loose_trigger_reason", "")).replace("|", "/"),
+                    version=entry.get("loose_rule_version", ""),
+                )
+            )
+    else:
+        lines.append("| - | - | - | - | No loose bet candidates | - |")
+
+    lines.extend([
+        "",
+        "## Ranking Top 8",
+        "",
+        "| Rank | Horse | Odds | Win Prob | Mode | Internal Score |",
+        "|---:|---|---:|---:|---|---:|",
+    ])
+    for i, horse in enumerate((entry.get("ranked") or [])[:8], start=1):
+        lines.append(
+            "| {rank} | {name} | {odds} | {prob} | {mode} | {score} |".format(
+                rank=i,
+                name=horse.get("name", ""),
+                odds=_fmt_odds(horse.get("odds")),
+                prob=_fmt_pct(horse.get("win_prob")),
+                mode=horse.get("mode", ""),
+                score=f"{float(horse.get('odds_score', 0) or 0):.1f}",
+            )
+        )
+
+    result = entry.get("result") or {}
+    fo = result.get("finishing_order") or []
+    if fo:
+        winner = _race_winner(fo) or "-"
+        lines.extend([
+            "",
+            "## Result",
+            "",
+            f"- winner: **{winner}**",
+            f"- win payout: `{(result.get('payouts') or {}).get('単勝', '')}`",
+        ])
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _archive_summary_row(entry: dict, md_path: Path) -> dict:
+    ranked = entry.get("ranked") or []
+    selected = entry.get("selected_top3") or []
+    top_source = selected or ranked
+    return {
+        "race_date": entry.get("race_date", ""),
+        "race_id": entry.get("race_id", ""),
+        "race_name": entry.get("race_name", ""),
+        "venue": entry.get("venue", ""),
+        "grade": entry.get("grade", ""),
+        "prediction_stage": entry.get("prediction_stage", ""),
+        "prediction_created_at": entry.get("prediction_created_at", ""),
+        "snapshot_at": entry.get("snapshot_at", ""),
+        "loose_bet_count": len(entry.get("loose_bets") or []),
+        "top1": (top_source[0].get("name", "") if len(top_source) > 0 else ""),
+        "top2": (top_source[1].get("name", "") if len(top_source) > 1 else ""),
+        "top3": (top_source[2].get("name", "") if len(top_source) > 2 else ""),
+        "has_result": bool((entry.get("result") or {}).get("finishing_order")),
+        "archive_markdown": str(md_path),
+    }
+
+
+def _write_index(path: Path, rows: list[dict]) -> None:
+    columns = [
+        "race_date", "race_id", "race_name", "venue", "grade",
+        "prediction_stage", "prediction_created_at", "snapshot_at",
+        "loose_bet_count", "top1", "top2", "top3", "has_result",
+        "archive_markdown",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({c: row.get(c, "") for c in columns})
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except (OSError, AttributeError):
+            pass
+    try:
+        os.replace(tmp_path, path)
+    except PermissionError:
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=columns)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({c: row.get(c, "") for c in columns})
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def rebuild_prediction_archive_index() -> list[dict]:
+    """Rebuild date-level and global archive CSV indexes from latest.json."""
+    rows = []
+    if not ARCHIVE_DIR.exists():
+        return []
+    by_date: dict[str, list[dict]] = defaultdict(list)
+    for latest in ARCHIVE_DIR.glob("*/*/latest.json"):
+        try:
+            entry = json.loads(latest.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        md_path = latest.with_name("latest.md")
+        row = _archive_summary_row(entry, md_path)
+        rows.append(row)
+        by_date[str(row.get("race_date") or "unknown")].append(row)
+
+    rows.sort(
+        key=lambda r: (r.get("race_date", ""), r.get("snapshot_at", ""), r.get("race_id", "")),
+        reverse=True,
+    )
+    for race_date, date_rows in by_date.items():
+        date_rows.sort(key=lambda r: (r.get("snapshot_at", ""), r.get("race_id", "")), reverse=True)
+        _write_index(ARCHIVE_DIR / race_date / "index.csv", date_rows)
+    _write_index(ARCHIVE_DIR / "index.csv", rows)
+    return rows
+
+
+def export_prediction_archive(entry: dict) -> Optional[dict]:
+    """Export the latest prediction into review-friendly folder files.
+
+    The canonical machine log remains data/live_predictions.json. This
+    archive is a convenience layer for humans: date folder, race folder,
+    latest JSON/Markdown, immutable snapshot copies, and CSV indexes.
+    """
+    if not entry or not entry.get("race_id"):
+        return None
+
+    race_date = _safe_name(entry.get("race_date"), "unknown-date")
+    race_dir = ARCHIVE_DIR / race_date / _archive_slug(entry)
+    snap_dir = race_dir / "snapshots"
+    stamp = _archive_timestamp(entry)
+    md = _prediction_markdown(entry)
+
+    latest_json = race_dir / "latest.json"
+    latest_md = race_dir / "latest.md"
+    snapshot_json = snap_dir / f"{stamp}.json"
+    snapshot_md = snap_dir / f"{stamp}.md"
+
+    _write_json_atomic(latest_json, entry)
+    _write_text_atomic(latest_md, md)
+    _write_json_atomic(snapshot_json, entry)
+    _write_text_atomic(snapshot_md, md)
+    rebuild_prediction_archive_index()
+
+    return {
+        "race_dir": str(race_dir),
+        "latest_json": str(latest_json),
+        "latest_markdown": str(latest_md),
+        "snapshot_json": str(snapshot_json),
+        "snapshot_markdown": str(snapshot_md),
+    }
+
+
+def recent_prediction_archive_table(limit: int = 50) -> list[dict]:
+    rows = rebuild_prediction_archive_index()
+    return rows[:limit]
+
+
+def build_prediction_archive_zip(predictions: list[dict]) -> bytes:
+    """Return a ZIP containing review files for the given predictions.
+
+    This is primarily for Streamlit Cloud: the app cannot write directly
+    to a user's local PC, but it can generate a downloadable archive with
+    the same JSON/Markdown/index files that local runs persist under
+    data/prediction_archive.
+    """
+    rows = []
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for entry in predictions or []:
+            if not entry or not entry.get("race_id"):
+                continue
+            race_date = _safe_name(entry.get("race_date"), "unknown-date")
+            race_slug = _archive_slug(entry)
+            stamp = _archive_timestamp(entry)
+            base = f"prediction_archive/{race_date}/{race_slug}"
+            md_text = _prediction_markdown(entry)
+            json_text = json.dumps(entry, ensure_ascii=False, indent=2)
+
+            zf.writestr(f"{base}/latest.json", json_text)
+            zf.writestr(f"{base}/latest.md", md_text)
+            zf.writestr(f"{base}/snapshots/{stamp}.json", json_text)
+            zf.writestr(f"{base}/snapshots/{stamp}.md", md_text)
+            rows.append(_archive_summary_row(entry, Path(base) / "latest.md"))
+
+        columns = [
+            "race_date", "race_id", "race_name", "venue", "grade",
+            "prediction_stage", "prediction_created_at", "snapshot_at",
+            "loose_bet_count", "top1", "top2", "top3", "has_result",
+            "archive_markdown",
+        ]
+        csv_buf = io.StringIO()
+        writer = csv.DictWriter(csv_buf, fieldnames=columns)
+        writer.writeheader()
+        for row in sorted(
+            rows,
+            key=lambda r: (
+                r.get("race_date", ""),
+                r.get("snapshot_at", ""),
+                r.get("race_id", ""),
+            ),
+            reverse=True,
+        ):
+            writer.writerow({c: row.get(c, "") for c in columns})
+        zf.writestr("prediction_archive/index.csv", csv_buf.getvalue())
+
+    return buf.getvalue()
 
 
 # ── Public API ────────────────────────────────────────
@@ -163,6 +505,12 @@ def store_prediction(prediction: dict) -> None:
 
     data[rid] = entry
     _save(data)
+    try:
+        export_prediction_archive(entry)
+    except Exception:
+        # The canonical log must remain the source of truth even if the
+        # human-readable archive cannot be written (OneDrive lock, etc.).
+        pass
 
 
 def attach_result(race_id: str, result: dict) -> bool:
@@ -182,6 +530,10 @@ def attach_result(race_id: str, result: dict) -> bool:
     entry["result_attached_at"] = datetime.now().isoformat()
     data[race_id] = entry
     _save(data)
+    try:
+        export_prediction_archive(entry)
+    except Exception:
+        pass
     return True
 
 
