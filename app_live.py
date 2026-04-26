@@ -340,6 +340,22 @@ elif batch and batch["results"]:
     b4.metric("🔥 Strict trigger", total_strict)
     b5.metric("所要時間", f"{batch['elapsed_s']:.0f}s")
 
+    if ok_results:
+        archive_bytes = plog.build_prediction_archive_zip(ok_results)
+        archive_date = race_date.isoformat()
+        st.download_button(
+            "💾 本日の予想アーカイブをローカルに保存",
+            data=archive_bytes,
+            file_name=f"prediction_archive_{archive_date}.zip",
+            mime="application/zip",
+            use_container_width=True,
+            help=(
+                "Streamlit Cloud 版はPCのフォルダへ直接書き込めないため、"
+                "予想結果をZIPで保存します。ローカル実行時は data/prediction_archive "
+                "にも自動保存されます。"
+            ),
+        )
+
     # ── Odds-status health warning ──
     # We now distinguish THREE states:
     #   1. not-published-yet  — netkeiba has no odds yet (>3h before post).
@@ -916,6 +932,24 @@ elif batch and batch["results"]:
 # ── Footer: history tables ───────────────────────────
 
 st.divider()
+st.markdown("### 🗂️ 予想アーカイブ")
+archive_rows = plog.recent_prediction_archive_table(limit=30)
+if archive_rows:
+    adf = pd.DataFrame(archive_rows)
+    preferred = [
+        "race_date", "race_name", "prediction_stage", "loose_bet_count",
+        "top1", "top2", "top3", "has_result", "archive_markdown",
+    ]
+    cols = [c for c in preferred if c in adf.columns] + \
+           [c for c in adf.columns if c not in preferred]
+    st.dataframe(adf[cols], use_container_width=True, hide_index=True)
+    st.caption(f"保存先: `{plog.ARCHIVE_DIR}`")
+else:
+    st.caption(
+        f"まだ保存済みアーカイブがありません。次回の予想から `{plog.ARCHIVE_DIR}` "
+        "に日付別フォルダで保存されます。"
+    )
+
 st.markdown("### 📜 最近の Loose Bet 履歴 (実験的)")
 loose_history = plog.recent_loose_bets_table(limit=20)
 if loose_history:
