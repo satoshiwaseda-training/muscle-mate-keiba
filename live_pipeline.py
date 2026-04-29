@@ -44,7 +44,13 @@ import prediction_log
 #   - the loose-rule definition in dual_mode_scoring.py
 # Persisted with every prediction so a later audit can diff predictions
 # that were produced under different model states.
-DATA_SOURCE_VERSION = "live-v5.8-per-grade-tuned-2026-04-19"
+DATA_SOURCE_VERSION = "live-v5.9-deploy-visibility-2026-04-29"
+# v5.9 (2026-04-29): deploy 可視化 + Gist 永続化
+#   - app_live サイドバー先頭に DATA_SOURCE_VERSION バナー (色付き)
+#   - github_sync._FILES に live_predictions.json 追加
+#   - prediction_log.store_prediction / attach_result が Gist push を呼ぶ
+#   - app_live 起動時に Gist から live_predictions.json を pull 復元
+#   背景: 4/26 週末予測ログ消失 (Streamlit Cloud ephemeral fs + Gist 対象外)
 # v5.8 (2026-04-19): grid search により各 grade で最適戦略を選定:
 #   G1: win_prob (現行維持 — 小サンプル 39R ゆえ robustness 優先)
 #   G2: diversified_1-3_4-7_8+ (n=63, ROI -48% → +21%, robust)

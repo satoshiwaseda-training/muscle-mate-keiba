@@ -40,6 +40,8 @@ import odds_fetcher
 import entries_fetcher
 # v5.7 (2026-04-19): grade-specific strategies (G2 diversified).
 import grade_strategy
+# v5.9 (2026-04-29): Gist persistence (Streamlit Cloud ephemeral fs 対策).
+import github_sync
 
 # Force-reload all project modules on every Streamlit rerun so that
 # code changes on disk take effect immediately without restarting
@@ -50,8 +52,27 @@ import grade_strategy
 for _mod in [scraper, fs, bridge, train, dm, pe,
              odds_fetcher, entries_fetcher,   # v5.0 scratch modules
              grade_strategy,                    # v5.7
+             github_sync,                       # v5.9
              lp, plog]:
     importlib.reload(_mod)
+
+# ── v5.9: Streamlit Cloud で live_predictions.json が無ければ Gist から pull ──
+# Streamlit Cloud は filesystem ephemeral なので、リブート後は予測ログが
+# 消える。アプリ起動時に Gist に保存された前回ログを自動復元する。
+import json as _json
+from pathlib import Path as _Path
+_LIVE_LOG_FILE = _Path("data/live_predictions.json")
+if not _LIVE_LOG_FILE.exists() and github_sync._available():
+    try:
+        _gist_data = github_sync.pull_file("live_predictions.json")
+        if isinstance(_gist_data, dict) and _gist_data:
+            _LIVE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _LIVE_LOG_FILE.write_text(
+                _json.dumps(_gist_data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+    except Exception:
+        pass  # Fallback to empty log; no startup blocker
 
 from tools._autolog_utils import last_weekend
 
@@ -61,6 +82,47 @@ st.set_page_config(
     page_icon="🎯",
     layout="wide",
 )
+
+# ── 🏷️ DEPLOY VERSION BANNER (TOP) ─────────────────────────────
+# 4/26 週末: v5.8 push 済だがユーザ UI で version 確認できず、
+# Streamlit Cloud が古いコードのまま動いていた可能性 (deploy 漏れ事件)。
+# 以後、deploy 状態を一目で確認できるようサイドバー先頭に
+# DATA_SOURCE_VERSION を **大きく** 常時表示する。
+try:
+    _running_version = lp.DATA_SOURCE_VERSION
+except Exception:
+    _running_version = "UNKNOWN"
+_is_v58_plus = "v5.8" in _running_version or any(
+    f"v{n}" in _running_version for n in range(58, 100)
+)
+_version_color = "#1b5e20" if _is_v58_plus else "#b71c1c"  # green / dark red
+_version_status = "✓" if _is_v58_plus else "⚠ OLD"
+with st.sidebar:
+    st.markdown(
+        f"""
+        <div style="
+            background-color:{_version_color};
+            color:white;
+            padding:10px 14px;
+            border-radius:6px;
+            font-weight:bold;
+            font-size:0.95rem;
+            margin-bottom:8px;
+            line-height:1.4;
+        ">
+            {_version_status} Pipeline<br>
+            <span style="font-family:monospace; font-size:0.85rem;">
+            {_running_version}
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if not _is_v58_plus:
+        st.warning(
+            "古いコードが動いている可能性があります。"
+            "Streamlit Cloud → Manage app → Reboot app で再起動してください。"
+        )
 
 # Keep this source-of-truth display in sync with scraper.LIVE_GRADE_FILTER.
 _filter = scraper.LIVE_GRADE_FILTER

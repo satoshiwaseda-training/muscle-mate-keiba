@@ -21,7 +21,16 @@ import os
 import requests
 
 # Gist内のファイル名マッピング
-_FILES = ["weights.json", "predictions.json", "results.json", "pdca_log.json"]
+# v5.9 (2026-04-29): live_predictions.json を追加。Streamlit Cloud は
+# ephemeral filesystem なので、リブートで予測が消えるのを防ぐ。
+# 4/26 週末: live_predictions.json が Gist 同期外で先週末予測ログ消失。
+_FILES = [
+    "weights.json",
+    "predictions.json",
+    "results.json",
+    "pdca_log.json",
+    "live_predictions.json",   # ← v5.9 追加
+]
 
 
 def _token() -> str:

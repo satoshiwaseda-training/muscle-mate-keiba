@@ -511,6 +511,15 @@ def store_prediction(prediction: dict) -> None:
         # The canonical log must remain the source of truth even if the
         # human-readable archive cannot be written (OneDrive lock, etc.).
         pass
+    # v5.9: live_predictions.json を Gist に push (Streamlit Cloud
+    # ephemeral filesystem 対策)。failure は silent — ログの正本はあくまで
+    # local file。Gist 認証無し環境では _available() が False で no-op。
+    try:
+        import github_sync as _gs
+        if _gs._available():
+            _gs.push_file("live_predictions.json", data)
+    except Exception:
+        pass
 
 
 def attach_result(race_id: str, result: dict) -> bool:
@@ -532,6 +541,13 @@ def attach_result(race_id: str, result: dict) -> bool:
     _save(data)
     try:
         export_prediction_archive(entry)
+    except Exception:
+        pass
+    # v5.9: Gist sync (Streamlit Cloud ephemeral filesystem 対策)
+    try:
+        import github_sync as _gs
+        if _gs._available():
+            _gs.push_file("live_predictions.json", data)
     except Exception:
         pass
     return True
