@@ -92,9 +92,18 @@ try:
     _running_version = lp.DATA_SOURCE_VERSION
 except Exception:
     _running_version = "UNKNOWN"
-_is_v58_plus = "v5.8" in _running_version or any(
-    f"v{n}" in _running_version for n in range(58, 100)
-)
+
+# Parse "live-v5.9-..." as (major, minor) and check >= (5, 8).
+# 旧ロジックは "v58" を探していたが正しくは "v5.8" 形式 (dot あり)。
+import re as _re_ver
+_m_ver = _re_ver.search(r"v(\d+)\.(\d+)", _running_version or "")
+if _m_ver:
+    _major = int(_m_ver.group(1))
+    _minor = int(_m_ver.group(2))
+    _is_v58_plus = _major > 5 or (_major == 5 and _minor >= 8)
+else:
+    _is_v58_plus = False
+
 _version_color = "#1b5e20" if _is_v58_plus else "#b71c1c"  # green / dark red
 _version_status = "✓" if _is_v58_plus else "⚠ OLD"
 with st.sidebar:
