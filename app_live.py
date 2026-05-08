@@ -78,7 +78,7 @@ from tools._autolog_utils import last_weekend
 
 
 st.set_page_config(
-    page_title="理論予想 Live — G1/G2/G3 自動分析",
+    page_title="理論予想 Live — G1/G2 専用分析",
     page_icon="🎯",
     layout="wide",
 )
@@ -137,10 +137,10 @@ with st.sidebar:
 _filter = scraper.LIVE_GRADE_FILTER
 _filter_label = "ALL races" if _filter is None else " + ".join(_filter)
 
-st.title(f"🎯 理論予想 Live — {_filter_label}")
+st.title("🎯 理論予想 Live — G1/G2 専用")
 st.caption(
     f"対象: **{_filter_label} のみ** (scraper.LIVE_GRADE_FILTER). "
-    f"G3 / 非グレードレースは現在処理対象外。"
+    f"G3 / 非グレードレースは除外。G1はプレミアム監視、G2は600円買い方の主戦場です。"
 )
 st.caption(
     "JRA + netkeiba + KeibaLab + Hochi + Sanspo + Daily (live) + oikiri "
@@ -308,11 +308,11 @@ st.markdown("")
 
 # THE button
 run = st.button(
-    f"🚀 本日の {_filter_label} を自動分析",
+    "🚀 本日の G1/G2 を自動分析",
     type="primary",
     use_container_width=True,
-    help=f"レース一覧の取得から {_filter_label} の理論予想まで自動で実行します。"
-         f"G3 / 非グレードレースはスキップされます。",
+    help="レース一覧の取得からG1/G2の理論予想まで自動で実行します。"
+         "G3 / 非グレードレースはスキップされます。",
 )
 
 # Keep analysis results in session state so the page stays responsive
@@ -390,8 +390,8 @@ if batch and batch.get("error"):
     st.warning(batch["error"])
 elif batch and batch["races_found"] == 0:
     st.info(
-        f"{_filter_label} レースが見つかりませんでした。"
-        f"G3 や平場レースは `scraper.LIVE_GRADE_FILTER` で意図的に除外しています。"
+        "G1/G2 レースが見つかりませんでした。"
+        "G3 や平場レースは `scraper.LIVE_GRADE_FILTER` で意図的に除外しています。"
     )
 elif batch and batch["results"]:
     results = batch["results"]
@@ -711,12 +711,11 @@ elif batch and batch["results"]:
             # 日本語で示し、買い方の目安を併記する。
             # LOOSE bets (ROI 検証用ルール) とは独立した「見やすい提示」。
             #
-            # v5.9: G1/G2 は市場分散戦略を適用。馬連 BOX 3点での収益を
+            # v5.10: G1/G2 専用サイト。馬連 BOX 3点での収益を
             # 主眼に置く。analyze_g2_misses / 2026-05-08 馬連レビューの結果、
             # G2 勝ち馬の 48% が市場 4-10 番人気のため、現行 win_prob TOP3
             # では構造的に取れない。過去 63 G2 レースの backtest で
-            # 600円/R ROI -48.2% → +20.8% へ改善。馬連3点のみでも
-            # G1 は win_prob -11.3% → diversified +22.0%。
+            # 600円/R ROI -48.2% → +20.8% へ改善。G3 は画面から除外。
             if r.get("ranked"):
                 import grade_strategy as _gs
                 ranked = r["ranked"]
@@ -733,8 +732,7 @@ elif batch and batch["results"]:
                               h.get("bucket_label", "本命") for h in top3]
                     # Strategy description for UI
                     _strategy_desc = {
-                        "diversified_1-3_4-7_8+": "馬連 市場分散戦略 (1-3/4-7/8+)",
-                        "loose_1-4_5-9_10+":      "G3 広域戦略 (1-4/5-9/10+)",
+                        "diversified_1-3_4-7_8+": "G1/G2 馬連 市場分散戦略 (1-3/4-7/8+)",
                         "tight_1-2_3-5_6+":       "厳選戦略 (1-2/3-5/6+)",
                         "mid_heavy_1-2_3-6_7+":   "中位重視戦略 (1-2/3-6/7+)",
                         "wide_穴_1-3_4-8_9+":     "穴寄り戦略 (1-3/4-8/9+)",
@@ -747,14 +745,8 @@ elif batch and batch["results"]:
                         st.caption(
                             "馬連 BOX 3点向けに、本命を市場 1-3、対抗を 4-7、"
                             "単穴を 8 番以下から選びます。"
-                            "G1 馬連3点 backtest: ROI -11% → +22%。"
+                            "G1はプレミアム監視、G2は600円買い方の主戦場。"
                             "G2 600円/R backtest: ROI -48% → +21%。"
-                        )
-                    elif "loose_1-4" in _strategy_name:
-                        st.caption(
-                            "G3 は分散を広げつつ中上位を残す設計。"
-                            "本命を市場 1-4、対抗を 5-9、単穴を 10 番以下から。"
-                            "119 R backtest: ROI -37% → -3%。"
                         )
                 else:
                     top3 = ranked[:3]

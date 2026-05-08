@@ -575,7 +575,10 @@ def fetch_horse_detail(horse_id: str) -> dict:
         return {}
 
     result = {"horse_id": horse_id, "recent_races": [], "sire": "", "dam": "",
-              "damsire": "", "breeder": "", "owner": "", "weight_trend": []}
+              "damsire": "", "breeder": "", "owner": "", "weight_trend": [],
+              # v5.2 additions (used by horse_facts_enricher):
+              "career_prize": "", "birth_date": "", "coat_color": "",
+              "sex_age": "", "trainer_name": ""}
 
     # Profile fields from db_prof_table (uses <th> for labels, <td> for values)
     prof_table = soup.select_one("table.db_prof_table")
@@ -590,6 +593,16 @@ def fetch_horse_detail(horse_id: str) -> dict:
                     result["breeder"] = val
                 elif label == "馬主":
                     result["owner"] = val
+                # ── v5.2 additional profile extraction ──
+                elif label == "生年月日":
+                    result["birth_date"] = val
+                elif label == "毛色":
+                    result["coat_color"] = val
+                elif label in ("獲得賞金", "総賞金", "獲得賞金(中央)"):
+                    # 例: "12,345万円 (中央)" / "1,234.5万円" を数値に
+                    result["career_prize"] = val
+                elif label == "調教師":
+                    result["trainer_name"] = val
 
     # Bloodline from pedigree page (/horse/ped/{id}/)
     # The blood_table is only on the ped subpage, not the main profile.
@@ -2225,22 +2238,22 @@ def _scrape_keibago_paddock(race_id: str, horse_names: list, reports: dict):
 # ─────────────────────────────────────────────────────────────
 # LIVE_GRADE_FILTER — operational knob for the weekend batch.
 #
-# Current policy (2026-04-12): G1 + G2 only. Rationale:
-#   - The full card (36 races) takes ≈55 min to process with the
-#     current fact-collector stack, which exceeds the cron budget and
-#     leaves no headroom for retries.
-#   - G3 was the worst-performing grade in the 121-race audit
-#     (win% 20.0, ROI -38.8%) so deferring it costs no known value.
-#   - G1 was the only profitable tier (+19.6% ROI), G2 sits between.
+# Current policy (2026-05-08): G1 + G2 only. Rationale:
+#   - The live site is now a premium-race surface, not an all-graded
+#     dashboard.
+#   - The user's 600円 buying style has positive evidence in G2, while
+#     G3 recent drawdown is materially worse.
+#   - G1 remains visible for premium preview / watchlist use, but the
+#     buying-style panel can still recommend WATCH rather than BET.
 #
 # To include more grades later, widen the tuple. To process every race
 # (regardless of grade), set the constant to None.
 #
 #   ("G1",)              → G1 only (1-2 races/day)
-#   ("G1", "G2")         → CURRENT (2-5 races/day)
-#   ("G1", "G2", "G3")   → all graded races (5-10/day)
+#   ("G1", "G2")         → CURRENT (premium G1/G2 site)
+#   ("G1", "G2", "G3")   → all graded races
 #   None                 → all JRA races on the card (30-36/day)
-LIVE_GRADE_FILTER: tuple | None = ("G1", "G2")
+LIVE_GRADE_FILTER: Optional[tuple] = ("G1", "G2")
 
 
 def fetch_race_list(race_date: date) -> list[dict]:
