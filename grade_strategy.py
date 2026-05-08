@@ -77,6 +77,53 @@ RECENT_UMAREN_GUARD: dict = {
 }
 
 
+# User's actual purchase style:
+#   単勝 3点 + 馬連BOX 3点 = 600円 / race
+#
+# Current 221R backtest with G1/G2 diversified and G3 loose:
+#   ALL +4.2% ROI, but the edge is concentrated in G2.
+#   G1 +0.1% (flat, small n) / G2 +20.8% / G3 -3.2%.
+#
+# This is intentionally a betting-action layer. It does not change ranking,
+# loose trigger rules, or model probabilities. Predictions remain visible for
+# every grade; stake discipline decides whether the 600円 ticket is warranted.
+BUYING_STYLE_VERSION = "buying-style-v1-2026-05-08"
+BUYING_STYLE_STAKE_PLAN: dict = {
+    "G1": {
+        "action": "WATCH",
+        "stake_yen": 0,
+        "label": "予想のみ",
+        "historical_roi": 0.001,
+        "recent_roi": -0.667,
+        "reason": (
+            "G1は長期でほぼ損益ゼロ、直近3ヶ月は不調。"
+            "馬券は強い追加根拠がある時だけ。"
+        ),
+    },
+    "G2": {
+        "action": "BET",
+        "stake_yen": 600,
+        "label": "単勝3点 + 馬連BOX3点",
+        "historical_roi": 0.208,
+        "recent_roi": 0.193,
+        "reason": (
+            "この買い方の収益源。221R検証でも直近3ヶ月でもG2だけはプラス。"
+        ),
+    },
+    "G3": {
+        "action": "WATCH",
+        "stake_yen": 0,
+        "label": "見送り優先",
+        "historical_roi": -0.032,
+        "recent_roi": -0.708,
+        "reason": (
+            "G3は波が大きく直近ドローダウンも深い。"
+            "公開情報の上積みが薄い日は見送り。"
+        ),
+    },
+}
+
+
 # ─── Named strategies ───
 # Each strategy is a list of (label, mark, (market_rank_lo, market_rank_hi))
 #
@@ -162,6 +209,31 @@ def recent_umaren_guard_for_grade(grade: str) -> dict:
         if key in g:
             return RECENT_UMAREN_GUARD.get(key, {})
     return {}
+
+
+def buying_style_plan_for_grade(grade: str) -> dict:
+    """Return the user's 600円 buying-style stake plan for a race grade."""
+    if not grade:
+        return {
+            "action": "WATCH",
+            "stake_yen": 0,
+            "label": "予想のみ",
+            "historical_roi": 0.0,
+            "recent_roi": 0.0,
+            "reason": "グレード不明のため投入判断を保留。",
+        }
+    g = grade.upper()
+    for key in ("G1", "G2", "G3"):
+        if key in g:
+            return BUYING_STYLE_STAKE_PLAN.get(key, {})
+    return {
+        "action": "WATCH",
+        "stake_yen": 0,
+        "label": "予想のみ",
+        "historical_roi": 0.0,
+        "recent_roi": 0.0,
+        "reason": "G1/G2/G3以外は現行検証対象外。",
+    }
 
 
 def pick_diversified_top3(ranked: list[dict],

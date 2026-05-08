@@ -811,6 +811,25 @@ elif batch and batch["results"]:
                         f"{box_names[0]} - {box_names[2]} / "
                         f"{box_names[1]} - {box_names[2]}"
                     )
+                    _stake_plan = _gs.buying_style_plan_for_grade(_grade)
+                    _stake_line = (
+                        f"{_stake_plan.get('label', '予想のみ')} / "
+                        f"{int(_stake_plan.get('stake_yen', 0) or 0)}円"
+                    )
+                    if _stake_plan.get("action") == "BET":
+                        st.success(
+                            "買い方優先ロジック: "
+                            f"{_stake_line}。{_stake_plan.get('reason', '')} "
+                            f"(長期ROI={float(_stake_plan.get('historical_roi', 0))*100:+.1f}%, "
+                            f"直近ROI={float(_stake_plan.get('recent_roi', 0))*100:+.1f}%)"
+                        )
+                    else:
+                        st.warning(
+                            "買い方優先ロジック: "
+                            f"{_stake_line}。{_stake_plan.get('reason', '')} "
+                            f"(長期ROI={float(_stake_plan.get('historical_roi', 0))*100:+.1f}%, "
+                            f"直近ROI={float(_stake_plan.get('recent_roi', 0))*100:+.1f}%)"
+                        )
                     _guard = _gs.recent_umaren_guard_for_grade(_grade)
                     if _guard:
                         st.info(

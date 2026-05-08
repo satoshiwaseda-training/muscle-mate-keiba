@@ -21,6 +21,17 @@ def test_recent_umaren_guard_returns_grade_warning():
     assert "馬連" in guard["message"]
 
 
+def test_buying_style_plan_prioritizes_profitable_g2():
+    g2 = gs.buying_style_plan_for_grade("G2")
+    g3 = gs.buying_style_plan_for_grade("G3")
+
+    assert g2["action"] == "BET"
+    assert g2["stake_yen"] == 600
+    assert g2["historical_roi"] > 0
+    assert g3["action"] == "WATCH"
+    assert g3["stake_yen"] == 0
+
+
 def test_diversified_top3_picks_one_from_each_market_bucket():
     ranked = [
         {"name": "A", "odds": 2.0, "win_prob": 0.30},
