@@ -38,6 +38,10 @@ import feature_store as fs
 # v5.0 (2026-04-19 scratch rewrite): new dedicated modules.
 import odds_fetcher
 import entries_fetcher
+# v5.7 (2026-04-19): grade-specific strategies (G2 diversified).
+import grade_strategy
+# v5.9 (2026-04-29): Gist persistence (Streamlit Cloud ephemeral fs 対策).
+import github_sync
 
 # Force-reload all project modules on every Streamlit rerun so that
 # code changes on disk take effect immediately without restarting
@@ -47,17 +51,87 @@ import entries_fetcher
 # to persist even after the JSON API fix was deployed.
 for _mod in [scraper, fs, bridge, train, dm, pe,
              odds_fetcher, entries_fetcher,   # v5.0 scratch modules
+             grade_strategy,                    # v5.7
+             github_sync,                       # v5.9
              lp, plog]:
     importlib.reload(_mod)
+
+# ── v5.9: Streamlit Cloud で live_predictions.json が無ければ Gist から pull ──
+# Streamlit Cloud は filesystem ephemeral なので、リブート後は予測ログが
+# 消える。アプリ起動時に Gist に保存された前回ログを自動復元する。
+import json as _json
+from pathlib import Path as _Path
+_LIVE_LOG_FILE = _Path("data/live_predictions.json")
+if not _LIVE_LOG_FILE.exists() and github_sync._available():
+    try:
+        _gist_data = github_sync.pull_file("live_predictions.json")
+        if isinstance(_gist_data, dict) and _gist_data:
+            _LIVE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _LIVE_LOG_FILE.write_text(
+                _json.dumps(_gist_data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+    except Exception:
+        pass  # Fallback to empty log; no startup blocker
 
 from tools._autolog_utils import last_weekend
 
 
 st.set_page_config(
-    page_title="理論予想 Live — G1/G2 自動分析",
+    page_title="理論予想 Live — G1/G2/G3 自動分析",
     page_icon="🎯",
     layout="wide",
 )
+
+# ── 🏷️ DEPLOY VERSION BANNER (TOP) ─────────────────────────────
+# 4/26 週末: v5.8 push 済だがユーザ UI で version 確認できず、
+# Streamlit Cloud が古いコードのまま動いていた可能性 (deploy 漏れ事件)。
+# 以後、deploy 状態を一目で確認できるようサイドバー先頭に
+# DATA_SOURCE_VERSION を **大きく** 常時表示する。
+try:
+    _running_version = lp.DATA_SOURCE_VERSION
+except Exception:
+    _running_version = "UNKNOWN"
+
+# Parse "live-v5.9-..." as (major, minor) and check >= (5, 8).
+# 旧ロジックは "v58" を探していたが正しくは "v5.8" 形式 (dot あり)。
+import re as _re_ver
+_m_ver = _re_ver.search(r"v(\d+)\.(\d+)", _running_version or "")
+if _m_ver:
+    _major = int(_m_ver.group(1))
+    _minor = int(_m_ver.group(2))
+    _is_v58_plus = _major > 5 or (_major == 5 and _minor >= 8)
+else:
+    _is_v58_plus = False
+
+_version_color = "#1b5e20" if _is_v58_plus else "#b71c1c"  # green / dark red
+_version_status = "✓" if _is_v58_plus else "⚠ OLD"
+with st.sidebar:
+    st.markdown(
+        f"""
+        <div style="
+            background-color:{_version_color};
+            color:white;
+            padding:10px 14px;
+            border-radius:6px;
+            font-weight:bold;
+            font-size:0.95rem;
+            margin-bottom:8px;
+            line-height:1.4;
+        ">
+            {_version_status} Pipeline<br>
+            <span style="font-family:monospace; font-size:0.85rem;">
+            {_running_version}
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if not _is_v58_plus:
+        st.warning(
+            "古いコードが動いている可能性があります。"
+            "Streamlit Cloud → Manage app → Reboot app で再起動してください。"
+        )
 
 # Keep this source-of-truth display in sync with scraper.LIVE_GRADE_FILTER.
 _filter = scraper.LIVE_GRADE_FILTER
@@ -337,6 +411,22 @@ elif batch and batch["results"]:
     b4.metric("🔥 Strict trigger", total_strict)
     b5.metric("所要時間", f"{batch['elapsed_s']:.0f}s")
 
+    if ok_results:
+        archive_bytes = plog.build_prediction_archive_zip(ok_results)
+        archive_date = race_date.isoformat()
+        st.download_button(
+            "💾 本日の予想アーカイブをローカルに保存",
+            data=archive_bytes,
+            file_name=f"prediction_archive_{archive_date}.zip",
+            mime="application/zip",
+            use_container_width=True,
+            help=(
+                "Streamlit Cloud 版はPCのフォルダへ直接書き込めないため、"
+                "予想結果をZIPで保存します。ローカル実行時は data/prediction_archive "
+                "にも自動保存されます。"
+            ),
+        )
+
     # ── Odds-status health warning ──
     # We now distinguish THREE states:
     #   1. not-published-yet  — netkeiba has no odds yet (>3h before post).
@@ -615,9 +705,157 @@ elif batch and batch["results"]:
             if src_badges:
                 st.caption("ソース: " + " / ".join(src_badges))
 
+            # ── 🎯 本日のベスト 3 頭予測 (本命 / 対抗 / 単穴) ──
+            # 憲法 §1.3「勝てるのは条件付き」を踏まえ、「必ず勝てる」とは
+            # 言わない。model の win_prob を本命/対抗/単穴という馴染みの
+            # 日本語で示し、買い方の目安を併記する。
+            # LOOSE bets (ROI 検証用ルール) とは独立した「見やすい提示」。
+            #
+            # v5.9: G1/G2 は市場分散戦略を適用。馬連 BOX 3点での収益を
+            # 主眼に置く。analyze_g2_misses / 2026-05-08 馬連レビューの結果、
+            # G2 勝ち馬の 48% が市場 4-10 番人気のため、現行 win_prob TOP3
+            # では構造的に取れない。過去 63 G2 レースの backtest で
+            # 600円/R ROI -48.2% → +20.8% へ改善。馬連3点のみでも
+            # G1 は win_prob -11.3% → diversified +22.0%。
+            if r.get("ranked"):
+                import grade_strategy as _gs
+                ranked = r["ranked"]
+                _grade = (r.get("grade", "") or "")
+                _apply_diversified = _gs.should_apply_diversified(_grade)
+
+                if _apply_diversified:
+                    # Use the specific strategy selected for this grade.
+                    _strategy_name = _gs.get_strategy_for_grade(_grade)
+                    _mk_map = _gs.build_market_rank_map(ranked)
+                    top3 = _gs.pick_diversified_top3(ranked, _mk_map,
+                                                      strategy=_strategy_name)
+                    labels = [h.get("bucket_mark", "◎") + " " +
+                              h.get("bucket_label", "本命") for h in top3]
+                    # Strategy description for UI
+                    _strategy_desc = {
+                        "diversified_1-3_4-7_8+": "馬連 市場分散戦略 (1-3/4-7/8+)",
+                        "loose_1-4_5-9_10+":      "G3 広域戦略 (1-4/5-9/10+)",
+                        "tight_1-2_3-5_6+":       "厳選戦略 (1-2/3-5/6+)",
+                        "mid_heavy_1-2_3-6_7+":   "中位重視戦略 (1-2/3-6/7+)",
+                        "wide_穴_1-3_4-8_9+":     "穴寄り戦略 (1-3/4-8/9+)",
+                    }.get(_strategy_name, _strategy_name)
+                    st.markdown(
+                        f"### 🎯 本日のベスト 3 頭予測（{_strategy_desc}）"
+                    )
+                    # Per-grade caption
+                    if "diversified_1-3" in _strategy_name:
+                        st.caption(
+                            "馬連 BOX 3点向けに、本命を市場 1-3、対抗を 4-7、"
+                            "単穴を 8 番以下から選びます。"
+                            "G1 馬連3点 backtest: ROI -11% → +22%。"
+                            "G2 600円/R backtest: ROI -48% → +21%。"
+                        )
+                    elif "loose_1-4" in _strategy_name:
+                        st.caption(
+                            "G3 は分散を広げつつ中上位を残す設計。"
+                            "本命を市場 1-4、対抗を 5-9、単穴を 10 番以下から。"
+                            "119 R backtest: ROI -37% → -3%。"
+                        )
+                else:
+                    top3 = ranked[:3]
+                    labels = ["◎ 本命", "○ 対抗", "▲ 単穴"]
+                    st.markdown(
+                        "### 🎯 本日のベスト 3 頭予測（本命 / 対抗 / 単穴）"
+                    )
+
+                bet_suggestions = [
+                    "馬連BOX 3点",
+                    "馬連BOX 3点",
+                    "馬連BOX 3点",
+                ]
+
+                # 期待値計算: win_prob × odds。1.0 を超えれば理論的プラス
+                def _ev(h):
+                    odds = float(h.get("odds", 0) or 0)
+                    wp = float(h.get("win_prob", 0) or 0)
+                    if odds <= 1.0 or wp <= 0:
+                        return None
+                    return wp * odds
+
+                top3_rows = []
+                for i, h in enumerate(top3):
+                    odds = float(h.get("odds", 0) or 0)
+                    wp = float(h.get("win_prob", 0) or 0) * 100
+                    ev = _ev(h)
+                    odds_str = (
+                        "---" if odds <= 1.0 else
+                        f"⚠{odds:.1f}(要確認)" if odds > 500.0 else
+                        f"{odds:.1f}倍"
+                    )
+                    ev_str = f"{ev:.2f}" if ev is not None else "—"
+                    row = {
+                        "印": labels[i],
+                        "馬名": h.get("name", "?"),
+                        "モデル勝率": f"{wp:.1f}%",
+                        "単勝オッズ": odds_str,
+                        "単勝期待値 (勝率×オッズ)": ev_str,
+                        "推奨買い目": bet_suggestions[i],
+                    }
+                    # Diversified mode: add market rank column for transparency
+                    if _apply_diversified and "market_rank" in h:
+                        row["市場人気"] = f"{h['market_rank']}番人気"
+                    top3_rows.append(row)
+                top3_df = pd.DataFrame(top3_rows)
+                st.dataframe(top3_df, use_container_width=True, hide_index=True)
+
+                if len(top3) >= 3:
+                    box_names = [h.get("name", "?") for h in top3[:3]]
+                    st.caption(
+                        "馬連BOX: "
+                        f"{box_names[0]} - {box_names[1]} / "
+                        f"{box_names[0]} - {box_names[2]} / "
+                        f"{box_names[1]} - {box_names[2]}"
+                    )
+
+                # 平易な補足 — 本命の根拠 (composite が取れていれば 1 行)
+                best = top3[0]
+                best_name = best.get("name", "この馬")
+                best_wp = float(best.get("win_prob", 0) or 0) * 100
+                best_comp = float(best.get("composite_condition", 0.5) or 0.5)
+                best_edge = float(best.get("structured_edge", 0) or 0)
+                reason_bits = []
+                if best_comp >= 0.65:
+                    reason_bits.append(f"composite {best_comp:.2f} (強ポジティブ)")
+                if best_edge >= 0.05:
+                    reason_bits.append(f"構造edge +{best_edge:.2f} (市場超過)")
+                if best_edge <= -0.05:
+                    reason_bits.append(f"構造edge {best_edge:.2f} (市場割安)")
+                if float(best.get("odds", 0) or 0) <= 15.0:
+                    reason_bits.append(
+                        f"単勝 {float(best.get('odds', 0)):.1f}倍 (LOOSE 許容帯)"
+                    )
+                reason_text = (" · ".join(reason_bits)
+                                if reason_bits else "特筆すべき edge なし")
+                st.caption(
+                    f"**本命 {best_name}**: モデル勝率 {best_wp:.1f}% · {reason_text}"
+                )
+
+                # 期待値警告: 本命の EV < 0.85 なら「本命でも妙味なし」を示唆
+                ev_best = _ev(best)
+                if ev_best is not None and ev_best < 0.85:
+                    st.info(
+                        f"⚠️ 本命の単勝期待値が **{ev_best:.2f}** と低め "
+                        f"(市場 takeout 0.80 水準)。この画面は馬連BOXを主軸にし、"
+                        f"単勝は補助判断に留めます。"
+                    )
+
+                # 憲法由来のスタンス
+                st.caption(
+                    "※ 競馬に「必ず勝てる」はありません（憲法 §1.3）。"
+                    "表示は **モデルの確信度** であり、保証ではありません。"
+                    "LOOSE 自動ベットは下の別パネルで引き続き運用中。"
+                )
+
+                st.divider()
+
             # Loose bets for this race
             if r.get("loose_bets"):
-                st.markdown("**🧪 Loose bets**")
+                st.markdown("**🧪 Loose bets (ROI 検証中の自動ルール)**")
                 ldf = pd.DataFrame([
                     {
                         "馬名": lb["name"],
@@ -776,6 +1014,24 @@ elif batch and batch["results"]:
 # ── Footer: history tables ───────────────────────────
 
 st.divider()
+st.markdown("### 🗂️ 予想アーカイブ")
+archive_rows = plog.recent_prediction_archive_table(limit=30)
+if archive_rows:
+    adf = pd.DataFrame(archive_rows)
+    preferred = [
+        "race_date", "race_name", "prediction_stage", "loose_bet_count",
+        "top1", "top2", "top3", "has_result", "archive_markdown",
+    ]
+    cols = [c for c in preferred if c in adf.columns] + \
+           [c for c in adf.columns if c not in preferred]
+    st.dataframe(adf[cols], use_container_width=True, hide_index=True)
+    st.caption(f"保存先: `{plog.ARCHIVE_DIR}`")
+else:
+    st.caption(
+        f"まだ保存済みアーカイブがありません。次回の予想から `{plog.ARCHIVE_DIR}` "
+        "に日付別フォルダで保存されます。"
+    )
+
 st.markdown("### 📜 最近の Loose Bet 履歴 (実験的)")
 loose_history = plog.recent_loose_bets_table(limit=20)
 if loose_history:
