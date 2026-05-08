@@ -811,6 +811,14 @@ elif batch and batch["results"]:
                         f"{box_names[0]} - {box_names[2]} / "
                         f"{box_names[1]} - {box_names[2]}"
                     )
+                    _guard = _gs.recent_umaren_guard_for_grade(_grade)
+                    if _guard:
+                        st.info(
+                            f"直近実績ガード: {_guard.get('message', '')} "
+                            f"(n={_guard.get('sample', 0)}, "
+                            f"馬連ROI={float(_guard.get('umaren_roi', 0))*100:+.1f}%, "
+                            f"馬連+ワイドROI={float(_guard.get('umaren_wide_roi', 0))*100:+.1f}%)"
+                        )
 
                 # 平易な補足 — 本命の根拠 (composite が取れていれば 1 行)
                 best = top3[0]

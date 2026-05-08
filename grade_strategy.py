@@ -37,6 +37,46 @@ from typing import Optional
 STRATEGY_VERSION = "grade-strategy-v5.9-2026-05-08-umaren"
 
 
+# Recent 90-day review (2026-02-08..2026-05-08, local result data through
+# 2026-04-05). This is not used to change the frozen loose trigger or model
+# score. It only annotates the human-facing TOP-3 betting panel.
+#
+# The main lesson is that 馬連 alone is extremely volatile in small windows:
+#   - ALL grades, 馬連3点 best ROI was still -52.4%
+#   - 馬連+ワイド reduced the drawdown to -25.5% on the same 26 races
+# Therefore the operational improvement is a stake discipline warning, not
+# a threshold chase.
+RECENT_UMAREN_GUARD: dict = {
+    "G1": {
+        "sample": 3,
+        "umaren_roi": -0.011,
+        "umaren_wide_roi": -0.111,
+        "message": (
+            "直近3ヶ月のG1はサンプル3Rで馬連ROI -1%。"
+            "過信せず、馬連BOXは通常額まで。"
+        ),
+    },
+    "G2": {
+        "sample": 9,
+        "umaren_roi": -0.607,
+        "umaren_wide_roi": 0.163,
+        "message": (
+            "直近3ヶ月のG2は馬連単独が不安定。"
+            "馬連BOXにワイド保険を併用すると同期間ROIは改善。"
+        ),
+    },
+    "G3": {
+        "sample": 14,
+        "umaren_roi": -0.581,
+        "umaren_wide_roi": -0.088,
+        "message": (
+            "直近3ヶ月のG3は高配当決着が多く、馬連単独はドローダウン大。"
+            "見送りまたはワイド保険を検討。"
+        ),
+    },
+}
+
+
 # ─── Named strategies ───
 # Each strategy is a list of (label, mark, (market_rank_lo, market_rank_hi))
 #
@@ -111,6 +151,17 @@ def get_strategy_for_grade(grade: str) -> str:
             lookup = {"JPNI": "JpnI", "JPNII": "JpnII", "JPNIII": "JpnIII"}.get(key, key)
             return GRADE_STRATEGY.get(lookup, "win_prob")
     return "win_prob"
+
+
+def recent_umaren_guard_for_grade(grade: str) -> dict:
+    """Return recent-performance warning metadata for the display layer."""
+    if not grade:
+        return {}
+    g = grade.upper()
+    for key in ("G1", "G2", "G3"):
+        if key in g:
+            return RECENT_UMAREN_GUARD.get(key, {})
+    return {}
 
 
 def pick_diversified_top3(ranked: list[dict],

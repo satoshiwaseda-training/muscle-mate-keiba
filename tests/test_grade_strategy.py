@@ -13,6 +13,14 @@ def test_g1_g2_use_umaren_diversified_strategy():
     assert gs.get_strategy_for_grade("JpnII") == "diversified_1-3_4-7_8+"
 
 
+def test_recent_umaren_guard_returns_grade_warning():
+    guard = gs.recent_umaren_guard_for_grade("G2")
+
+    assert guard["sample"] == 9
+    assert guard["umaren_roi"] < 0
+    assert "馬連" in guard["message"]
+
+
 def test_diversified_top3_picks_one_from_each_market_bucket():
     ranked = [
         {"name": "A", "odds": 2.0, "win_prob": 0.30},
