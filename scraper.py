@@ -2065,12 +2065,13 @@ def fetch_keibalab_horse_weights(race_id: str, horse_names: list) -> dict:
 
 def fetch_paddock_reports(race_id: str, horse_names: list, race_name: str = "") -> dict:
     """
-    当日のパドック情報を複数の公開ソースから取得。
+    当日のパドック情報を正確性優先で取得。
     Sources (priority order):
-      1. netkeiba パドックページ
-      2. Yahoo!ニュース検索 (当日記事)
-      3. uma-jo.jp
-      4. keibago.com
+      1. netkeiba パドックページの馬別構造化コメント
+
+    Search/news snippets and full-page horse-name extraction are not used
+    as paddock observations because race previews and betting opinions can
+    be mixed into the surrounding text.
 
     Returns:
       {horse_name: {"text": str, "source": str, "scores": dict}}
@@ -2080,10 +2081,10 @@ def fetch_paddock_reports(race_id: str, horse_names: list, race_name: str = "") 
     # 1. netkeiba paddock
     _scrape_netkeiba_paddock(race_id, horse_names, reports)
 
-    # 2. Yahoo!ニュース (SNS的な当日速報)
-    missing = [n for n in horse_names if not reports.get(n, {}).get("text")]
-    if missing:
-        _scrape_yahoo_news_paddock(race_name or race_id, missing, reports)
+    # Yahoo!ニュース検索 fallback was intentionally disabled on
+    # 2026-05-08. It returns article/search snippets rather than stable
+    # horse-level observations, so it can inflate consensus with
+    # speculative text.
 
     # 3. uma-jo.jp — DISABLED 2026-04: domain is dead (DNS failure).
     #    Keeping the function defined for future re-enable; skipping the call
@@ -2096,6 +2097,12 @@ def fetch_paddock_reports(race_id: str, horse_names: list, race_name: str = "") 
     # missing = [n for n in horse_names if not reports.get(n, {}).get("text")]
     # if missing:
     #     _scrape_keibago_paddock(race_id, missing, reports)
+
+    try:
+        import paddock_quality as pq
+        reports = pq.filter_paddock_reports(reports)
+    except Exception:
+        pass
 
     # 未取得馬は空エントリ
     for name in horse_names:
@@ -2115,8 +2122,6 @@ def _scrape_netkeiba_paddock(race_id: str, horse_names: list, reports: dict):
     if not soup:
         return
 
-    full_text = soup.get_text(" ", strip=True)
-
     # horse-by-horse structured comments
     for sel in [".PaddockComment", ".Paddock_Comment", ".HorsePaddock",
                 ".PaddockData_Item", ".paddock_comment"]:
@@ -2135,18 +2140,8 @@ def _scrape_netkeiba_paddock(race_id: str, horse_names: list, reports: dict):
                         "scores": parse_paddock_comment(text),
                     }
 
-    # フォールバック: ページ全体テキストから馬名周辺の文を抽出
-    if not any(reports.get(n, {}).get("text") for n in horse_names):
-        for name in horse_names:
-            sentences = [_clean_text(s) for s in re.split(r'[。．\n]', full_text)
-                         if name in s and len(s) > 10]
-            if sentences:
-                combined = "。".join(sentences[:3])
-                reports[name] = {
-                    "text": combined,
-                    "source": "netkeiba(全文抽出)",
-                    "scores": parse_paddock_comment(combined),
-                }
+    # Do not fall back to page-wide extraction. It can mix previews,
+    # betting marks, and unrelated page chrome into a horse's observation.
 
 
 def _scrape_yahoo_news_paddock(race_name: str, horse_names: list, reports: dict):
