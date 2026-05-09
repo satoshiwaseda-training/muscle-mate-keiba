@@ -153,7 +153,7 @@ def _prediction_markdown(entry: dict) -> str:
         f"- data_source_version: `{entry.get('data_source_version', '')}`",
         f"- odds_status_at_prediction: `{entry.get('odds_status_at_prediction', entry.get('odds_status', ''))}`",
         "",
-        "## Selected Top 3",
+        "## Primary Candidate Top 3",
         "",
         "| Mark | Horse | Odds | Win Prob |",
         "|---|---:|---:|---:|",
@@ -168,6 +168,31 @@ def _prediction_markdown(entry: dict) -> str:
                 prob=_fmt_pct(horse.get("win_prob")),
             )
         )
+
+    variants = entry.get("prediction_variants") or {}
+    experimental = (variants.get("experimental") or {}).get("top3") or []
+    if experimental:
+        lines.extend([
+            "",
+            "## Experimental Candidate Top 3",
+            "",
+            f"- strategy: `{(variants.get('experimental') or {}).get('strategy', '')}`",
+            f"- strategy_version: `{(variants.get('experimental') or {}).get('strategy_version', '')}`",
+            "",
+            "| Mark | Horse | Odds | Win Prob | Market Rank | Experimental Score |",
+            "|---|---:|---:|---:|---:|---:|",
+        ])
+        for i, horse in enumerate(experimental):
+            lines.append(
+                "| {mark} | {name} | {odds} | {prob} | {market} | {score} |".format(
+                    mark=horse.get("bucket_mark") or (marks[i] if i < len(marks) else str(i + 1)),
+                    name=horse.get("name", ""),
+                    odds=_fmt_odds(horse.get("odds")),
+                    prob=_fmt_pct(horse.get("win_prob")),
+                    market=horse.get("market_rank", ""),
+                    score=f"{float(horse.get('experimental_score', 0) or 0):.4f}",
+                )
+            )
 
     lines.extend([
         "",
@@ -231,6 +256,8 @@ def _archive_summary_row(entry: dict, md_path: Path) -> dict:
     ranked = entry.get("ranked") or []
     selected = entry.get("selected_top3") or []
     top_source = selected or ranked
+    variants = entry.get("prediction_variants") or {}
+    exp_top3 = (variants.get("experimental") or {}).get("top3") or []
     return {
         "race_date": entry.get("race_date", ""),
         "race_id": entry.get("race_id", ""),
@@ -244,6 +271,9 @@ def _archive_summary_row(entry: dict, md_path: Path) -> dict:
         "top1": (top_source[0].get("name", "") if len(top_source) > 0 else ""),
         "top2": (top_source[1].get("name", "") if len(top_source) > 1 else ""),
         "top3": (top_source[2].get("name", "") if len(top_source) > 2 else ""),
+        "experimental_top1": (exp_top3[0].get("name", "") if len(exp_top3) > 0 else ""),
+        "experimental_top2": (exp_top3[1].get("name", "") if len(exp_top3) > 1 else ""),
+        "experimental_top3": (exp_top3[2].get("name", "") if len(exp_top3) > 2 else ""),
         "has_result": bool((entry.get("result") or {}).get("finishing_order")),
         "archive_markdown": str(md_path),
     }
@@ -253,7 +283,9 @@ def _write_index(path: Path, rows: list[dict]) -> None:
     columns = [
         "race_date", "race_id", "race_name", "venue", "grade",
         "prediction_stage", "prediction_created_at", "snapshot_at",
-        "loose_bet_count", "top1", "top2", "top3", "has_result",
+        "loose_bet_count", "top1", "top2", "top3",
+        "experimental_top1", "experimental_top2", "experimental_top3",
+        "has_result",
         "archive_markdown",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -380,7 +412,9 @@ def build_prediction_archive_zip(predictions: list[dict]) -> bytes:
         columns = [
             "race_date", "race_id", "race_name", "venue", "grade",
             "prediction_stage", "prediction_created_at", "snapshot_at",
-            "loose_bet_count", "top1", "top2", "top3", "has_result",
+            "loose_bet_count", "top1", "top2", "top3",
+            "experimental_top1", "experimental_top2", "experimental_top3",
+            "has_result",
             "archive_markdown",
         ]
         csv_buf = io.StringIO()
@@ -438,6 +472,17 @@ def _snapshot_of(entry: dict) -> dict:
             }
             for r in ranked[:5]
         ],
+        "prediction_variants": {
+            key: {
+                "candidate_id": (value or {}).get("candidate_id"),
+                "strategy": (value or {}).get("strategy"),
+                "strategy_version": (value or {}).get("strategy_version"),
+                "top3_names": [
+                    h.get("name") for h in ((value or {}).get("top3") or [])[:3]
+                ],
+            }
+            for key, value in (entry.get("prediction_variants") or {}).items()
+        },
         "loose_bet_names": [b.get("name") for b in loose],
         "loose_bet_count": len(loose),
         "triggers_count":  len(entry.get("triggers") or []),

@@ -138,6 +138,10 @@ _filter = scraper.LIVE_GRADE_FILTER
 _filter_label = "ALL races" if _filter is None else " + ".join(_filter)
 
 st.title("🎯 理論予想 Live — G1/G2 専用")
+st.success(
+    "予想は **第一候補（現行ロジック）** と "
+    "**実験候補（騎手/調教師優先）** の2通りを表示・保存します。"
+)
 st.caption(
     f"対象: **{_filter_label} のみ** (scraper.LIVE_GRADE_FILTER). "
     f"対象外グレード・非グレードレースは現在処理対象外。"
@@ -720,25 +724,30 @@ elif batch and batch["results"]:
                 ranked = r["ranked"]
                 _grade = (r.get("grade", "") or "")
                 _apply_diversified = _gs.should_apply_diversified(_grade)
+                _variants = r.get("prediction_variants") or _gs.build_prediction_variants(
+                    ranked, _grade
+                )
+                _primary_variant = _variants.get("primary", {})
+                _experimental_variant = _variants.get("experimental", {})
 
                 if _apply_diversified:
                     # Use the specific strategy selected for this grade.
-                    _strategy_name = _gs.get_strategy_for_grade(_grade)
-                    _mk_map = _gs.build_market_rank_map(ranked)
-                    top3 = _gs.pick_diversified_top3(ranked, _mk_map,
-                                                      strategy=_strategy_name)
+                    _strategy_name = (
+                        _primary_variant.get("strategy")
+                        or _gs.get_strategy_for_grade(_grade)
+                    )
+                    top3 = _primary_variant.get("top3") or []
                     labels = [h.get("bucket_mark", "◎") + " " +
                               h.get("bucket_label", "本命") for h in top3]
                     # Strategy description for UI
                     _strategy_desc = {
                         "diversified_1-3_4-7_8+": "G2 市場分散戦略 (1-3/4-7/8+)",
-                        "loose_1-4_5-9_10+":      "広域分散戦略 (1-4/5-9/10+)",
                         "tight_1-2_3-5_6+":       "厳選戦略 (1-2/3-5/6+)",
                         "mid_heavy_1-2_3-6_7+":   "中位重視戦略 (1-2/3-6/7+)",
                         "wide_穴_1-3_4-8_9+":     "穴寄り戦略 (1-3/4-8/9+)",
                     }.get(_strategy_name, _strategy_name)
                     st.markdown(
-                        f"### 🎯 本日のベスト 3 頭予測（{_strategy_desc}）"
+                        f"### 🎯 第一候補: 本日のベスト3頭（{_strategy_desc}）"
                     )
                     # Per-grade caption
                     if "diversified_1-3" in _strategy_name:
@@ -748,23 +757,17 @@ elif batch and batch["results"]:
                             "バランスよく選ぶ設計（63 R backtest: "
                             "ROI -48% → +21%）"
                         )
-                    elif "loose_1-4" in _strategy_name:
-                        st.caption(
-                            "分散を広げつつ中上位を残す設計。"
-                            "本命を市場 1-4、対抗を 5-9、単穴を 10 番以下から。"
-                            "119 R backtest: ROI -37% → -3%。"
-                        )
                 else:
-                    top3 = ranked[:3]
+                    top3 = _primary_variant.get("top3") or ranked[:3]
                     labels = ["◎ 本命", "○ 対抗", "▲ 単穴"]
                     st.markdown(
-                        "### 🎯 本日のベスト 3 頭予測（本命 / 対抗 / 単穴）"
+                        "### 🎯 第一候補: 本日のベスト3頭（本命 / 対抗 / 単穴）"
                     )
 
                 bet_suggestions = [
-                    "単勝 / 複勝",          # 本命: 勝ち狙いと保険
-                    "複勝 / ワイド (本命絡み)",  # 対抗: 複勝圏狙い
-                    "ワイド / 馬連 (本命絡み)",  # 単穴: 穴押さえ
+                    "馬連BOX 3点",
+                    "馬連BOX 3点",
+                    "馬連BOX 3点",
                 ]
 
                 # 期待値計算: win_prob × odds。1.0 を超えれば理論的プラス
@@ -800,6 +803,62 @@ elif batch and batch["results"]:
                     top3_rows.append(row)
                 top3_df = pd.DataFrame(top3_rows)
                 st.dataframe(top3_df, use_container_width=True, hide_index=True)
+
+                exp_top3 = _experimental_variant.get("top3") or []
+                if exp_top3:
+                    exp_labels = [
+                        h.get("bucket_mark", "◎") + " " + h.get("bucket_label", "本命")
+                        for h in exp_top3
+                    ]
+                    st.markdown("### 🧪 実験候補: 騎手/調教師優先トップ3")
+                    st.caption(
+                        "第一候補とは分離して保存します。あとで結果分析するときに、"
+                        "どちらが馬連向きだったか比較できます。"
+                    )
+                    exp_rows = []
+                    for i, h in enumerate(exp_top3):
+                        odds = float(h.get("odds", 0) or 0)
+                        wp = float(h.get("win_prob", 0) or 0) * 100
+                        odds_str = (
+                            "---" if odds <= 1.0 else
+                            f"⚠{odds:.1f}(要確認)" if odds > 500.0 else
+                            f"{odds:.1f}倍"
+                        )
+                        exp_rows.append({
+                            "印": exp_labels[i] if i < len(exp_labels) else str(i + 1),
+                            "馬名": h.get("name", "?"),
+                            "モデル勝率": f"{wp:.1f}%",
+                            "単勝オッズ": odds_str,
+                            "市場人気": (
+                                f"{h['market_rank']}番人気"
+                                if "market_rank" in h else "—"
+                            ),
+                            "騎手勝率": f"{float(h.get('jockey_win_rate', 0) or 0)*100:.1f}%",
+                            "調教師勝率": f"{float(h.get('trainer_win_rate', 0) or 0)*100:.1f}%",
+                            "実験score": f"{float(h.get('experimental_score', 0) or 0):.4f}",
+                        })
+                    st.dataframe(
+                        pd.DataFrame(exp_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    if len(exp_top3) >= 3:
+                        exp_names = [h.get("name", "?") for h in exp_top3[:3]]
+                        st.caption(
+                            "実験候補 馬連BOX: "
+                            f"{exp_names[0]} - {exp_names[1]} / "
+                            f"{exp_names[0]} - {exp_names[2]} / "
+                            f"{exp_names[1]} - {exp_names[2]}"
+                        )
+
+                if len(top3) >= 3:
+                    box_names = [h.get("name", "?") for h in top3[:3]]
+                    st.caption(
+                        "第一候補 馬連BOX: "
+                        f"{box_names[0]} - {box_names[1]} / "
+                        f"{box_names[0]} - {box_names[2]} / "
+                        f"{box_names[1]} - {box_names[2]}"
+                    )
 
                 # 平易な補足 — 本命の根拠 (composite が取れていれば 1 行)
                 best = top3[0]
@@ -1009,7 +1068,9 @@ if archive_rows:
     adf = pd.DataFrame(archive_rows)
     preferred = [
         "race_date", "race_name", "prediction_stage", "loose_bet_count",
-        "top1", "top2", "top3", "has_result", "archive_markdown",
+        "top1", "top2", "top3",
+        "experimental_top1", "experimental_top2", "experimental_top3",
+        "has_result", "archive_markdown",
     ]
     cols = [c for c in preferred if c in adf.columns] + \
            [c for c in adf.columns if c not in preferred]

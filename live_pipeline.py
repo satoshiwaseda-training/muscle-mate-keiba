@@ -31,6 +31,7 @@ import fact_validator as fv
 import dual_mode_scoring as dm
 import core_model_bridge as bridge
 import odds_sources as osrc
+import grade_strategy as gs
 from train import score_runner
 from data_store import load_weights
 
@@ -44,7 +45,9 @@ import prediction_log
 #   - the loose-rule definition in dual_mode_scoring.py
 # Persisted with every prediction so a later audit can diff predictions
 # that were produced under different model states.
-DATA_SOURCE_VERSION = "live-v5.10-g1g2-only-2026-05-09"
+DATA_SOURCE_VERSION = "live-v5.11-g1g2-dual-candidates-2026-05-09"
+# v5.11 (2026-05-09): 第一候補と実験候補を `prediction_variants`
+#   として同時保存。LOOSE 4 条件の数値は不変更。
 # v5.10 (2026-05-09): live scope を G1/G2 専用に戻す
 #   - scraper.LIVE_GRADE_FILTER = ("G1","G2")
 #   - app_live の自動分析対象から G3 を除外し、処理時間を短縮
@@ -961,6 +964,11 @@ def predict_live(
     ranked = pe.assign_calibrated_probs(scored, k=pe.DEFAULT_CALIBRATION_K)
     calibration_issues = pe.calibration_warnings(ranked)
     sel = pe.select_top3(ranked, alpha=pe.DEFAULT_ALPHA, beta=pe.DEFAULT_BETA)
+    prediction_variants = gs.build_prediction_variants(ranked, grade_str)
+    primary_top3 = (
+        prediction_variants.get("primary", {}).get("top3")
+        or sel["selected"]
+    )
 
     triggers = [t for t in trigger_info if t["trigger_flag"]]
     # LOOSE bets — independent projection of trigger_info.
@@ -996,7 +1004,8 @@ def predict_live(
         "race_date": race_date or date.today().isoformat(),
         "is_live": is_live,
         "ranked": ranked,
-        "selected_top3": sel["selected"],
+        "selected_top3": primary_top3,
+        "prediction_variants": prediction_variants,
         "p1": sel["p1"],
         "p2": sel["p2"],
         # STRICT trigger block (unchanged)

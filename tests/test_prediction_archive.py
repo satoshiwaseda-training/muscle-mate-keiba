@@ -39,6 +39,46 @@ def _sample_prediction(race_id: str = "202604250101") -> dict:
             {"name": "Bravo", "odds": 5.1, "win_prob": 0.18},
             {"name": "Charlie", "odds": 8.0, "win_prob": 0.12},
         ],
+        "prediction_variants": {
+            "primary": {
+                "candidate_id": "primary_current",
+                "strategy": "win_prob",
+                "strategy_version": "test-primary",
+                "top3": [
+                    {"name": "Alpha", "odds": 2.5, "win_prob": 0.32},
+                    {"name": "Bravo", "odds": 5.1, "win_prob": 0.18},
+                    {"name": "Charlie", "odds": 8.0, "win_prob": 0.12},
+                ],
+            },
+            "experimental": {
+                "candidate_id": "experimental_jockey_trainer",
+                "strategy": "feature_only_jockey_trainer_combo",
+                "strategy_version": "test-experimental",
+                "top3": [
+                    {
+                        "name": "Delta",
+                        "odds": 6.0,
+                        "win_prob": 0.16,
+                        "market_rank": 2,
+                        "experimental_score": 0.0702,
+                    },
+                    {
+                        "name": "Echo",
+                        "odds": 9.0,
+                        "win_prob": 0.10,
+                        "market_rank": 5,
+                        "experimental_score": 0.0401,
+                    },
+                    {
+                        "name": "Foxtrot",
+                        "odds": 12.0,
+                        "win_prob": 0.08,
+                        "market_rank": 8,
+                        "experimental_score": 0.0301,
+                    },
+                ],
+            },
+        },
         "loose_bets": [
             {
                 "name": "Alpha",
@@ -72,11 +112,14 @@ def test_store_prediction_exports_review_archive():
         md = (race_dir / "latest.md").read_text(encoding="utf-8")
         assert "Codex Stakes" in md
         assert "Alpha" in md
+        assert "Experimental Candidate Top 3" in md
+        assert "Delta" in md
         assert "Loose Bets" in md
 
         rows = plog.recent_prediction_archive_table(limit=10)
         assert rows[0]["race_id"] == "202604250101"
         assert rows[0]["top1"] == "Alpha"
+        assert rows[0]["experimental_top1"] == "Delta"
     finally:
         plog.LIVE_FILE = old_live
         plog.ARCHIVE_DIR = old_archive
@@ -128,4 +171,5 @@ def test_build_prediction_archive_zip_contains_review_files():
             "202604250101_Codex_Stakes/latest.md"
         ).decode("utf-8")
         assert "Codex Stakes" in md
+        assert "Experimental Candidate Top 3" in md
         assert "Loose Bets" in md
