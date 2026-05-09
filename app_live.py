@@ -138,6 +138,10 @@ _filter = scraper.LIVE_GRADE_FILTER
 _filter_label = "ALL races" if _filter is None else " + ".join(_filter)
 
 st.title("🎯 理論予想 Live — G1/G2 専用")
+st.success(
+    "v5.10: 予想は **第一候補（現行）** と "
+    "**実験候補（騎手/調教師優先）** の2通りを表示・保存します。"
+)
 st.caption(
     f"対象: **{_filter_label} のみ** (scraper.LIVE_GRADE_FILTER). "
     f"G3 / 非グレードレースは除外。G1はプレミアム監視、G2は600円買い方の主戦場です。"
