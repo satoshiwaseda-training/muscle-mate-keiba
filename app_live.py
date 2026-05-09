@@ -78,7 +78,7 @@ from tools._autolog_utils import last_weekend
 
 
 st.set_page_config(
-    page_title="理論予想 Live — G1/G2/G3 自動分析",
+    page_title="理論予想 Live — G1/G2 専用分析",
     page_icon="🎯",
     layout="wide",
 )
@@ -137,10 +137,10 @@ with st.sidebar:
 _filter = scraper.LIVE_GRADE_FILTER
 _filter_label = "ALL races" if _filter is None else " + ".join(_filter)
 
-st.title(f"🎯 理論予想 Live — {_filter_label}")
+st.title("🎯 理論予想 Live — G1/G2 専用")
 st.caption(
     f"対象: **{_filter_label} のみ** (scraper.LIVE_GRADE_FILTER). "
-    f"G3 / 非グレードレースは現在処理対象外。"
+    f"対象外グレード・非グレードレースは現在処理対象外。"
 )
 st.caption(
     "JRA + netkeiba + KeibaLab + Hochi + Sanspo + Daily (live) + oikiri "
@@ -312,7 +312,7 @@ run = st.button(
     type="primary",
     use_container_width=True,
     help=f"レース一覧の取得から {_filter_label} の理論予想まで自動で実行します。"
-         f"G3 / 非グレードレースはスキップされます。",
+         f"対象外グレード・非グレードレースはスキップされます。",
 )
 
 # Keep analysis results in session state so the page stays responsive
@@ -391,7 +391,7 @@ if batch and batch.get("error"):
 elif batch and batch["races_found"] == 0:
     st.info(
         f"{_filter_label} レースが見つかりませんでした。"
-        f"G3 や平場レースは `scraper.LIVE_GRADE_FILTER` で意図的に除外しています。"
+        f"対象外グレードや平場レースは `scraper.LIVE_GRADE_FILTER` で意図的に除外しています。"
     )
 elif batch and batch["results"]:
     results = batch["results"]
@@ -732,7 +732,7 @@ elif batch and batch["results"]:
                     # Strategy description for UI
                     _strategy_desc = {
                         "diversified_1-3_4-7_8+": "G2 市場分散戦略 (1-3/4-7/8+)",
-                        "loose_1-4_5-9_10+":      "G3 広域戦略 (1-4/5-9/10+)",
+                        "loose_1-4_5-9_10+":      "広域分散戦略 (1-4/5-9/10+)",
                         "tight_1-2_3-5_6+":       "厳選戦略 (1-2/3-5/6+)",
                         "mid_heavy_1-2_3-6_7+":   "中位重視戦略 (1-2/3-6/7+)",
                         "wide_穴_1-3_4-8_9+":     "穴寄り戦略 (1-3/4-8/9+)",
@@ -750,7 +750,7 @@ elif batch and batch["results"]:
                         )
                     elif "loose_1-4" in _strategy_name:
                         st.caption(
-                            "G3 は分散を広げつつ中上位を残す設計。"
+                            "分散を広げつつ中上位を残す設計。"
                             "本命を市場 1-4、対抗を 5-9、単穴を 10 番以下から。"
                             "119 R backtest: ROI -37% → -3%。"
                         )
