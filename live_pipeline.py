@@ -31,6 +31,7 @@ import fact_validator as fv
 import dual_mode_scoring as dm
 import core_model_bridge as bridge
 import odds_sources as osrc
+import grade_strategy as gs
 from train import score_runner
 from data_store import load_weights
 
@@ -44,7 +45,46 @@ import prediction_log
 #   - the loose-rule definition in dual_mode_scoring.py
 # Persisted with every prediction so a later audit can diff predictions
 # that were produced under different model states.
-DATA_SOURCE_VERSION = "live-v5.0-scratch-rewrite-2026-04-19"
+DATA_SOURCE_VERSION = "live-v5.10-dual-candidates-2026-05-08"
+# v5.10 (2026-05-08): 現行の第一候補と、騎手/調教師優先の実験候補を
+#   `prediction_variants` として同時保存。LOOSE 条件は不変更。
+# v5.9 (2026-04-29): deploy 可視化 + Gist 永続化
+#   - app_live サイドバー先頭に DATA_SOURCE_VERSION バナー (色付き)
+#   - github_sync._FILES に live_predictions.json 追加
+#   - prediction_log.store_prediction / attach_result が Gist push を呼ぶ
+#   - app_live 起動時に Gist から live_predictions.json を pull 復元
+#   背景: 4/26 週末予測ログ消失 (Streamlit Cloud ephemeral fs + Gist 対象外)
+# v5.8 (2026-04-19): grid search により各 grade で最適戦略を選定:
+#   G1: win_prob (現行維持 — 小サンプル 39R ゆえ robustness 優先)
+#   G2: diversified_1-3_4-7_8+ (n=63, ROI -48% → +21%, robust)
+#   G3: loose_1-4_5-9_10+      (n=119, ROI -37% → -3%, robust)
+#   合計 221R: ROI -34.5% → +3.2% (+38pp 改善見込み、実運用で劣化余地)
+#   詳細: tools/grid_search_strategy.py
+# v5.7 (2026-04-19): G2 のみ TOP 3 を市場分散戦略に切り替え。
+#   - 本命: 市場 1-3 番人気から win_prob 最大
+#   - 対抗: 市場 4-7 番人気から win_prob 最大
+#   - 単穴: 市場 8 番人気以下から win_prob 最大
+#   - backtest (63 G2 レース): ROI -48.2% → +20.8% (+69 pp)
+#   - UI layer のみ変更。推論・LOOSE 4 条件は不変更。
+# v5.6 (2026-04-19): scope 拡大 G1/G2 → G1/G2/G3。
+#   - scraper.LIVE_GRADE_FILTER = ("G1","G2","G3")
+#   - paddock_sources.GRADE_TRIGGERS に G3 / JpnIII を追加
+#   - live_pipeline の grade_guess 検出に G3 追加
+# ユーザ買い方 (単勝×3 + 馬連×3 = 600円/R) を G3 までの全重賞に適用可能に。
+# LOOSE 4 条件の数値は不変更。
+#
+# v5.4 (2026-04-19): TOP 3 本命/対抗/単穴 UI パネル追加。
+# v5.3 (2026-04-19): paddock_sources 導入。G1/G2 限定で
+# 東スポ + ラジオ NIKKEI + 日刊スポの 3 追加ソースからパドックテキスト
+# を収集し、既存 netkeiba パドックに merge。consensus 向上狙い。
+# LOOSE 4 条件の数値は不変更。
+#
+# v5.2 (2026-04-19): horse_facts_enricher 導入。累計獲得賞金 / 馬体重
+# トレンド / 直近成績 (会場・複勝圏) / 休養期間 / 馬主・生産者・外厩
+# tier を既取得データから fact として抽出 (追加 fetch 無し)。
+# source tier `horse_deep` (conf 0.85) として composite に参加。
+#
+# 旧版履歴:
 # v5.0 (2026-04-19 第5波): ユーザ直訴を受け、**データ取得側を完全に
 # scratch-rewrite**。推論 (score_runner, dual_mode_scoring,
 # probability_engine, trigger_loose_capped, 憲法) は一切変更しない。
@@ -521,8 +561,64 @@ def predict_live(
                 "error": "non-live race date — newspaper sources publish only current articles",
             })
 
-    # ── Step 3: cached paddock text + training_eval ──
+    # ── Step 3a (v5.3): multi-source paddock for G1/G2 only ──
+    # 東スポ + ラジオ NIKKEI + 日刊スポ から追加のパドック情報を取得
+    # (grade フィルタ内蔵 — G1/G2 以外では no-op)。
+    # 得られたテキストは cached_race の paddock_comment に merge され、
+    # 直後の collect_paddock_observation_facts の入力として使われる。
     cached_race = scraper._cache_load("enrich_race", race_id)
+    try:
+        import paddock_sources as _psrc
+        grade_guess = ""
+        # Try to read grade from race context (not yet fetched, but hints exist)
+        # v5.6: G3 も追加 (ユーザ買い方は G3 まで)
+        if race_name:
+            for g_tag in ("G1", "G2", "G3", "JpnI", "JpnII", "JpnIII"):
+                if f"({g_tag})" in race_name or f"({g_tag.lower()})" in race_name:
+                    grade_guess = g_tag
+                    break
+        multi_result = _psrc.fetch_paddock_multi_sources(
+            race_id=race_id, race_name=race_name,
+            horse_names=list(running), grade=grade_guess,
+        )
+        _meta = multi_result.get("_meta", {}) if isinstance(multi_result, dict) else {}
+        if _meta.get("enabled"):
+            _log(progress_cb,
+                 f"Tier 3 (v5.3): multi-paddock {_meta.get('n_sources_with_hits', 0)} "
+                 f"sources, {_meta.get('total_horses_covered', 0)} horses")
+            if cached_race:
+                # Build a reports dict from cached_race so we can merge into it
+                existing_reports = {
+                    (h.get("name") or "").strip(): {
+                        "text":   h.get("paddock_comment", "") or "",
+                        "source": "netkeiba-cached",
+                        "scores": h.get("paddock_scores", {}) or {},
+                    }
+                    for h in cached_race if h.get("name")
+                }
+                existing_reports = _psrc.merge_paddock_into_reports(
+                    existing_reports, multi_result, list(running),
+                )
+                # Propagate merged text back onto cached_race horses so
+                # downstream paddock fact collector sees the expanded text.
+                for h in cached_race:
+                    name = (h.get("name") or "").strip()
+                    rep = existing_reports.get(name) or {}
+                    if rep.get("text"):
+                        h["paddock_comment"] = rep["text"]
+                    if rep.get("scores"):
+                        h["paddock_scores"] = rep["scores"]
+        collection_log.append({
+            "source": "paddock_multi_v5.3",
+            "status": "ok" if _meta.get("enabled") else "skipped",
+            "facts": [],  # facts are produced by downstream collector
+            "items_seen": _meta.get("total_horses_covered", 0),
+            "error": _meta.get("reason") if not _meta.get("enabled") else None,
+        })
+    except Exception as e:
+        _log(progress_cb, f"paddock_sources multi skipped: {e}")
+
+    # ── Step 3: cached paddock text + training_eval ──
     if cached_race:
         _log(progress_cb, "Tier 3: キャッシュ済みパドック観察")
         pd = fc.collect_paddock_observation_facts(race_id, running, cached_race)
@@ -547,6 +643,41 @@ def predict_live(
             "error": None,
         })
         article_facts.extend(oikiri_facts)
+
+    # ── Step 3d: horse_deep facts (v5.2 deep enrichment) ──
+    # 既に `enrich_entries` で取得済みの horse detail / recent_races /
+    # weight_trend / owner / breeder / ritto から **追加 fetch 無しで**
+    # fact を抽出する。憲法 §7.1 の「ファクト抽出辞書の拡張」枠内。
+    _log(progress_cb, "Tier 3 (deep): 累計賞金/体重トレンド/直近成績/休養/馬主 由来 fact")
+    deep_facts: list = []
+    try:
+        import horse_facts_enricher as _hfe
+        horses_for_deep = cached_race if cached_race else entries
+        # race_info は後段 (Step 5) で fetch されるが、enricher に
+        # 必要なのは race_date / venue だけなので predict_live 引数から
+        # 直接構築する (Step 3 時点では race_info はまだ未定義)。
+        _race_ctx_for_deep = {
+            "race_date": race_date or "",
+            "venue":     venue or "",
+            "grade":     "",
+        }
+        deep_facts = _hfe.compute_deep_horse_facts(
+            horses=horses_for_deep or [],
+            race_info=_race_ctx_for_deep,
+            venue=venue or "",
+        )
+        _log(progress_cb, f"horse_deep: {len(deep_facts)} facts generated "
+                          f"({_hfe.ENRICHER_VERSION})")
+    except Exception as e:
+        _log(progress_cb, f"horse_deep enrichment skipped: {e}")
+    collection_log.append({
+        "source": "horse_deep",
+        "status": "ok" if deep_facts else "skipped",
+        "facts": deep_facts,
+        "items_seen": len(cached_race) if cached_race else len(entries),
+        "error": None,
+    })
+    article_facts.extend(deep_facts)
 
     # ── Step 4a: validate + contradiction-detect (fact_validator) ──
     _log(progress_cb, "ファクト検証 + 矛盾検出")
@@ -757,6 +888,14 @@ def predict_live(
             "sire_name": h_sf.get("sire_name", ""),
             "damsire_name": h_sf.get("damsire_name", ""),
             "breeder_name": h_sf.get("breeder_name", ""),
+            # Candidate-variant audit fields. These are used only by
+            # grade_strategy's presentation layer and later analysis.
+            "jockey_win_rate": h_sf.get("jockey_win_rate", 0),
+            "trainer_win_rate": h_sf.get("trainer_win_rate", 0),
+            "carried_weight": h_sf.get("carried_weight", 0),
+            "horse_weight_delta": h_sf.get("horse_weight_delta", 0),
+            "training_cardio_index": h_sf.get("training_cardio_index", 0),
+            "training_acceleration": h_sf.get("training_acceleration", 0),
         })
 
         # Track triggers explicitly
@@ -827,6 +966,8 @@ def predict_live(
     ranked = pe.assign_calibrated_probs(scored, k=pe.DEFAULT_CALIBRATION_K)
     calibration_issues = pe.calibration_warnings(ranked)
     sel = pe.select_top3(ranked, alpha=pe.DEFAULT_ALPHA, beta=pe.DEFAULT_BETA)
+    prediction_variants = gs.build_prediction_variants(ranked, grade_str)
+    primary_top3 = prediction_variants.get("primary", {}).get("top3") or sel["selected"]
 
     triggers = [t for t in trigger_info if t["trigger_flag"]]
     # LOOSE bets — independent projection of trigger_info.
@@ -862,7 +1003,8 @@ def predict_live(
         "race_date": race_date or date.today().isoformat(),
         "is_live": is_live,
         "ranked": ranked,
-        "selected_top3": sel["selected"],
+        "selected_top3": primary_top3,
+        "prediction_variants": prediction_variants,
         "p1": sel["p1"],
         "p2": sel["p2"],
         # STRICT trigger block (unchanged)

@@ -1,4 +1,4 @@
-"""Grade-specific TOP-3 selection strategies (v5.9 — 2026-05-08).
+"""Grade-specific TOP-3 selection strategies (v5.10 — 2026-05-08).
 
 馬連 BOX 3点を主眼に、グレードごとに TOP-3 の提示方法を切り替える。
 この module は推論ロジックではなく **買い方の提示層**。
@@ -34,7 +34,8 @@ from __future__ import annotations
 from typing import Optional
 
 
-STRATEGY_VERSION = "grade-strategy-v5.9-2026-05-08-umaren"
+STRATEGY_VERSION = "grade-strategy-v5.10-2026-05-08-dual-candidates"
+EXPERIMENTAL_STRATEGY_VERSION = "experimental-jockey-trainer-v1-2026-05-08"
 
 
 # Recent 90-day review (2026-02-08..2026-05-08, local result data through
@@ -303,6 +304,172 @@ def pick_diversified_top3(ranked: list[dict],
             break
 
     return picked
+
+
+def _median_positive(values: list[float]) -> float:
+    vals = sorted(v for v in values if isinstance(v, (int, float)) and v > 0)
+    if not vals:
+        return 0.0
+    mid = len(vals) // 2
+    if len(vals) % 2:
+        return vals[mid]
+    return (vals[mid - 1] + vals[mid]) / 2
+
+
+def jockey_trainer_experiment_score(horse: dict,
+                                    jockey_median: float = 0.0,
+                                    trainer_median: float = 0.0) -> float:
+    """Score used by the experimental jockey/trainer candidate.
+
+    This mirrors the offline `feature_only_jockey_trainer_combo` diagnostic:
+    prioritize horses whose jockey/trainer win rates are above the field
+    median, using win_prob only as a tiny tie-breaker. It is a display and
+    paper-trading candidate, not a replacement for model probabilities.
+    """
+    try:
+        jwr = float(horse.get("jockey_win_rate", 0) or 0)
+    except (TypeError, ValueError):
+        jwr = 0.0
+    try:
+        twr = float(horse.get("trainer_win_rate", 0) or 0)
+    except (TypeError, ValueError):
+        twr = 0.0
+    try:
+        wp = float(horse.get("win_prob", 0) or 0)
+    except (TypeError, ValueError):
+        wp = 0.0
+
+    score = 0.0
+    if jockey_median > 0 and jwr >= jockey_median:
+        score += 0.04
+    if trainer_median > 0 and twr >= trainer_median:
+        score += 0.03
+    return round(score + wp * 0.001, 6)
+
+
+def pick_jockey_trainer_experimental_top3(
+    ranked: list[dict],
+    market_rank_map: dict[str, int],
+    strategy: str = "diversified_1-3_4-7_8+",
+) -> list[dict]:
+    """Pick top3 by market buckets, but choose within each bucket using
+    jockey/trainer strength instead of model win_prob.
+
+    This is intentionally separate from `pick_diversified_top3` so the
+    current first candidate remains stable while the experimental panel
+    can be logged and evaluated independently.
+    """
+    if strategy == "diversified":
+        strategy = "diversified_1-3_4-7_8+"
+    elif strategy == "balanced":
+        strategy = "tight_1-2_3-5_6+"
+
+    buckets = STRATEGIES.get(strategy, DIVERSIFIED_BUCKETS)
+    jockey_med = _median_positive([
+        float(h.get("jockey_win_rate", 0) or 0)
+        for h in ranked or []
+        if isinstance(h.get("jockey_win_rate", 0), (int, float))
+    ])
+    trainer_med = _median_positive([
+        float(h.get("trainer_win_rate", 0) or 0)
+        for h in ranked or []
+        if isinstance(h.get("trainer_win_rate", 0), (int, float))
+    ])
+
+    enriched = []
+    for h in ranked or []:
+        row = dict(h)
+        row["experimental_score"] = jockey_trainer_experiment_score(
+            row, jockey_med, trainer_med,
+        )
+        row["experimental_strategy_version"] = EXPERIMENTAL_STRATEGY_VERSION
+        enriched.append(row)
+    experimental_ranked = sorted(
+        enriched,
+        key=lambda h: (
+            float(h.get("experimental_score", 0) or 0),
+            float(h.get("win_prob", 0) or 0),
+        ),
+        reverse=True,
+    )
+
+    picked: list[dict] = []
+    picked_names: set[str] = set()
+    for label, mark, (lo, hi) in buckets:
+        chosen = None
+        for h in experimental_ranked:
+            nm = (h.get("name") or "").strip()
+            if not nm or nm in picked_names:
+                continue
+            mr = market_rank_map.get(nm)
+            if mr is None:
+                continue
+            if lo <= mr <= hi:
+                chosen = dict(h)
+                chosen["bucket_label"] = label
+                chosen["bucket_mark"] = mark
+                chosen["market_rank"] = mr
+                chosen["candidate_type"] = "experimental_jockey_trainer"
+                break
+        if chosen:
+            picked.append(chosen)
+            picked_names.add((chosen.get("name") or "").strip())
+
+    while len(picked) < 3:
+        filled = False
+        for h in experimental_ranked:
+            nm = (h.get("name") or "").strip()
+            if nm and nm not in picked_names:
+                fallback = dict(h)
+                fallback["bucket_label"] = f"補欠 ({len(picked)+1})"
+                fallback["bucket_mark"] = "△"
+                fallback["market_rank"] = market_rank_map.get(nm, 99)
+                fallback["candidate_type"] = "experimental_jockey_trainer"
+                picked.append(fallback)
+                picked_names.add(nm)
+                filled = True
+                break
+        if not filled:
+            break
+
+    return picked
+
+
+def build_prediction_variants(ranked: list[dict], grade: str) -> dict:
+    """Return current primary and experimental top3 candidates.
+
+    The shape is designed for persistence in live prediction logs so later
+    analysis can compare both candidates against attached results.
+    """
+    strategy = get_strategy_for_grade(grade)
+    market = build_market_rank_map(ranked)
+    if strategy == "win_prob":
+        primary = [dict(h) for h in (ranked or [])[:3]]
+    else:
+        primary = pick_diversified_top3(ranked, market, strategy=strategy)
+
+    experimental = pick_jockey_trainer_experimental_top3(
+        ranked, market, strategy=strategy if strategy != "win_prob" else "diversified_1-3_4-7_8+",
+    )
+
+    return {
+        "primary": {
+            "candidate_id": "primary_current",
+            "label": "第一候補",
+            "strategy": strategy,
+            "strategy_version": STRATEGY_VERSION,
+            "description": "現行の市場分散 top3",
+            "top3": primary,
+        },
+        "experimental": {
+            "candidate_id": "experimental_jockey_trainer",
+            "label": "実験候補",
+            "strategy": "feature_only_jockey_trainer_combo",
+            "strategy_version": EXPERIMENTAL_STRATEGY_VERSION,
+            "description": "各人気帯で騎手/調教師勝率を優先",
+            "top3": experimental,
+        },
+    }
 
 
 def should_apply_diversified(grade: str) -> bool:
