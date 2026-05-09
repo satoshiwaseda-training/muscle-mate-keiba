@@ -44,7 +44,7 @@ from data_store import (
 # ─────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="競馬AI予想 - 自律進化型",
+    page_title="理論予想 G1/G2 専用",
     page_icon="🏇",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -188,7 +188,7 @@ with st.sidebar:
     _grade_filter = scraper.LIVE_GRADE_FILTER
     _grade_label = "ALL races" if _grade_filter is None else " + ".join(_grade_filter)
 
-    st.title("🏇 競馬AI予想")
+    st.title("🏇 理論予想 G1/G2 専用")
     st.caption(f"自律進化型 **{_grade_label}** 予想システム")
     st.caption(
         f"対象: {_grade_label} のみ "
@@ -238,7 +238,7 @@ with st.sidebar:
         else:
             st.warning(
                 f"今週末の {_grade_label} レースが見つかりませんでした "
-                f"(G3/平場は LIVE_GRADE_FILTER で除外中)"
+                f"(対象外グレード/平場は LIVE_GRADE_FILTER で除外中)"
             )
 
     st.caption("または特定日を指定して取得")
@@ -264,7 +264,7 @@ with st.sidebar:
         else:
             st.warning(
                 f"{selected_date.strftime('%m/%d')} の {_grade_label} "
-                f"レースが見つかりませんでした (G3/平場は除外中)"
+                f"レースが見つかりませんでした (対象外グレード/平場は除外中)"
             )
 
     st.divider()
@@ -289,7 +289,7 @@ with st.sidebar:
 # Main content
 # ─────────────────────────────────────────────
 
-st.title(f"🏇 競馬AI予想システム — {_grade_label}")
+st.title(f"🏇 理論予想 G1/G2 専用 — {_grade_label}")
 st.caption(
     f"現在の対象グレード: **{_grade_label}** "
     f"(変更: `scraper.py` の `LIVE_GRADE_FILTER` を編集)"
@@ -1585,5 +1585,4 @@ with tab4:
 
                     # サイドバーの科学的黄金比を最新値に更新
                     st.rerun()
-
 

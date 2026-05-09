@@ -144,7 +144,8 @@ st.success(
 )
 st.caption(
     f"対象: **{_filter_label} のみ** (scraper.LIVE_GRADE_FILTER). "
-    f"G3 / 非グレードレースは除外。G1はプレミアム監視、G2は600円買い方の主戦場です。"
+    f"対象外グレード・非グレードレースは除外。"
+    f"G1はプレミアム監視、G2は600円買い方の主戦場です。"
 )
 st.caption(
     "JRA + netkeiba + KeibaLab + Hochi + Sanspo + Daily (live) + oikiri "
@@ -316,7 +317,7 @@ run = st.button(
     type="primary",
     use_container_width=True,
     help="レース一覧の取得からG1/G2の理論予想まで自動で実行します。"
-         "G3 / 非グレードレースはスキップされます。",
+         "対象外グレード・非グレードレースはスキップされます。",
 )
 
 # Keep analysis results in session state so the page stays responsive
@@ -395,7 +396,7 @@ if batch and batch.get("error"):
 elif batch and batch["races_found"] == 0:
     st.info(
         "G1/G2 レースが見つかりませんでした。"
-        "G3 や平場レースは `scraper.LIVE_GRADE_FILTER` で意図的に除外しています。"
+        "対象外グレードや平場レースは `scraper.LIVE_GRADE_FILTER` で意図的に除外しています。"
     )
 elif batch and batch["results"]:
     results = batch["results"]
