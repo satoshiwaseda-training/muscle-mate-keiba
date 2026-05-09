@@ -44,7 +44,12 @@ import prediction_log
 #   - the loose-rule definition in dual_mode_scoring.py
 # Persisted with every prediction so a later audit can diff predictions
 # that were produced under different model states.
-DATA_SOURCE_VERSION = "live-v5.9-deploy-visibility-2026-04-29"
+DATA_SOURCE_VERSION = "live-v5.10-g1g2-only-2026-05-09"
+# v5.10 (2026-05-09): live scope を G1/G2 専用に戻す
+#   - scraper.LIVE_GRADE_FILTER = ("G1","G2")
+#   - app_live の自動分析対象から G3 を除外し、処理時間を短縮
+#   - G3/JpnIII の追加パドックソース呼び出しを停止
+#   - LOOSE 4 条件の数値は不変更
 # v5.9 (2026-04-29): deploy 可視化 + Gist 永続化
 #   - app_live サイドバー先頭に DATA_SOURCE_VERSION バナー (色付き)
 #   - github_sync._FILES に live_predictions.json 追加
@@ -64,6 +69,7 @@ DATA_SOURCE_VERSION = "live-v5.9-deploy-visibility-2026-04-29"
 #   - backtest (63 G2 レース): ROI -48.2% → +20.8% (+69 pp)
 #   - UI layer のみ変更。推論・LOOSE 4 条件は不変更。
 # v5.6 (2026-04-19): scope 拡大 G1/G2 → G1/G2/G3。
+#   v5.10 で処理時間短縮のため live scope は G1/G2 専用へ戻した。
 #   - scraper.LIVE_GRADE_FILTER = ("G1","G2","G3")
 #   - paddock_sources.GRADE_TRIGGERS に G3 / JpnIII を追加
 #   - live_pipeline の grade_guess 検出に G3 追加
@@ -568,9 +574,9 @@ def predict_live(
         import paddock_sources as _psrc
         grade_guess = ""
         # Try to read grade from race context (not yet fetched, but hints exist)
-        # v5.6: G3 も追加 (ユーザ買い方は G3 まで)
+        # v5.10: live scope は G1/G2 専用。G3/JpnIII は対象外。
         if race_name:
-            for g_tag in ("G1", "G2", "G3", "JpnI", "JpnII", "JpnIII"):
+            for g_tag in ("G1", "G2", "JpnI", "JpnII"):
                 if f"({g_tag})" in race_name or f"({g_tag.lower()})" in race_name:
                     grade_guess = g_tag
                     break

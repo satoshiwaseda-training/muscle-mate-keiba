@@ -1,6 +1,7 @@
-"""Grade-specific TOP-3 selection strategies (v5.7 — 2026-04-19).
+"""Grade-specific TOP-3 selection strategies.
 
-G2 の買い方を「市場分散」に変更する機能。G1/G3 は従来の win_prob 基準。
+Live app is scoped to G1/G2 only. G2 uses a diversified market-rank
+presentation; G1 keeps the win_prob baseline.
 
 G2 診断結果 (tools/analyze_g2_misses.py):
   - G2 勝ち馬の 48% は市場 4-10 番人気
@@ -73,16 +74,13 @@ BALANCED_BUCKETS    = STRATEGIES["tight_1-2_3-5_6+"]
 #                diversified_1-3_4-7_8+   ROI +0.1%  (ex-big2 -48.3%, 過学習疑義)
 #                → 現行維持 (小サンプル、robustness 重視)
 #   G2  (n=63):  diversified_1-3_4-7_8+   ROI +20.8% (ex-big2 -36.3%) ← 採用
-#   G3  (n=119): loose_1-4_5-9_10+        ROI -3.2%  (ex-big2 -36.2%) ← 採用
 #
-# 期待される改善: 221R 累積 ROI -34.5% → +3.2% (+38pp)
+# 期待される改善: G1/G2 専用の live 運用で検証を継続
 GRADE_STRATEGY: dict = {
     "G1":     "win_prob",
     "JpnI":   "win_prob",
     "G2":     "diversified_1-3_4-7_8+",
     "JpnII":  "diversified_1-3_4-7_8+",
-    "G3":     "loose_1-4_5-9_10+",
-    "JpnIII": "loose_1-4_5-9_10+",
 }
 
 
@@ -91,7 +89,7 @@ def get_strategy_for_grade(grade: str) -> str:
     if not grade:
         return "win_prob"
     g = grade.upper()
-    for key in ("G1", "G2", "G3", "JPNI", "JPNII", "JPNIII"):
+    for key in ("G1", "G2", "JPNI", "JPNII"):
         if key in g:
             # Normalize lookup key to our mapping (JPNII -> JpnII)
             lookup = {"JPNI": "JpnI", "JPNII": "JpnII", "JPNIII": "JpnIII"}.get(key, key)
@@ -171,9 +169,8 @@ def pick_diversified_top3(ranked: list[dict],
 def should_apply_diversified(grade: str) -> bool:
     """Return True if this race's grade calls for any strategy != win_prob.
 
-    v5.8 以降、G2 だけでなく G3 も diversified 系 (loose_1-4_5-9_10+) を
-    使うので、単なる「diversified か否か」フラグではなく、
-    「strategy != win_prob か」を返す設計。
+    Live scope is G1/G2 only; this returns True only for configured
+    non-baseline strategies such as G2's market-diversified presentation.
     """
     return get_strategy_for_grade(grade) != "win_prob"
 
