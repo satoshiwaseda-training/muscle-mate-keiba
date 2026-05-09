@@ -43,8 +43,12 @@ def test_build_prediction_variants_returns_primary_and_experimental():
     assert variants["experimental"]["top3"][0]["candidate_type"] == "experimental_jockey_trainer"
 
 
-def test_g2_primary_uses_market_buckets():
+def test_g2_primary_uses_baseline_and_experiment_uses_market_buckets():
     variants = gs.build_prediction_variants(_ranked(), "G2")
 
-    assert variants["primary"]["strategy"] == "diversified_1-3_4-7_8+"
-    assert [h["market_rank"] for h in variants["primary"]["top3"]] == [1, 4, 2]
+    assert variants["primary"]["strategy"] == "win_prob"
+    assert [h["name"] for h in variants["primary"]["top3"]] == [
+        "Alpha", "Bravo", "Charlie"
+    ]
+    assert variants["experimental"]["strategy"] == "feature_only_jockey_trainer_combo"
+    assert [h["market_rank"] for h in variants["experimental"]["top3"]] == [2, 4, 3]

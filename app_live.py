@@ -38,7 +38,7 @@ import feature_store as fs
 # v5.0 (2026-04-19 scratch rewrite): new dedicated modules.
 import odds_fetcher
 import entries_fetcher
-# v5.7 (2026-04-19): grade-specific strategies (G2 diversified).
+# v5.7+ grade-specific strategy helpers.
 import grade_strategy
 # v5.9 (2026-04-29): Gist persistence (Streamlit Cloud ephemeral fs 対策).
 import github_sync
@@ -715,10 +715,9 @@ elif batch and batch["results"]:
             # 日本語で示し、買い方の目安を併記する。
             # LOOSE bets (ROI 検証用ルール) とは独立した「見やすい提示」。
             #
-            # v5.7: G2 は市場分散戦略を適用 (analyze_g2_misses の結果、
-            # G2 勝ち馬の 48% が市場 4-10 番人気のため、現行 win_prob TOP3
-            # では構造的に取れない。過去 63 G2 レースの backtest で
-            # ROI -48.2% → +20.8% へ改善)
+            # v5.12: G2 の市場分散は馬連単体では非頑健だったため、
+            # 第一候補は現行確率 top3 に戻し、市場分散は実験候補として
+            # 保存・比較する。
             if r.get("ranked"):
                 import grade_strategy as _gs
                 ranked = r["ranked"]
@@ -741,7 +740,7 @@ elif batch and batch["results"]:
                               h.get("bucket_label", "本命") for h in top3]
                     # Strategy description for UI
                     _strategy_desc = {
-                        "diversified_1-3_4-7_8+": "G2 市場分散戦略 (1-3/4-7/8+)",
+                        "diversified_1-3_4-7_8+": "市場分散実験 (1-3/4-7/8+)",
                         "tight_1-2_3-5_6+":       "厳選戦略 (1-2/3-5/6+)",
                         "mid_heavy_1-2_3-6_7+":   "中位重視戦略 (1-2/3-6/7+)",
                         "wide_穴_1-3_4-8_9+":     "穴寄り戦略 (1-3/4-8/9+)",
@@ -752,10 +751,8 @@ elif batch and batch["results"]:
                     # Per-grade caption
                     if "diversified_1-3" in _strategy_name:
                         st.caption(
-                            "G2 は市場 4-10 番人気の勝利が 48% を占めるため、"
-                            "本命を市場 1-3、対抗を 4-7、単穴を 8 番以下から"
-                            "バランスよく選ぶ設計（63 R backtest: "
-                            "ROI -48% → +21%）"
+                            "市場分散は馬連単体では非頑健だったため、"
+                            "第一候補ではなく実験候補として比較保存します。"
                         )
                 else:
                     top3 = _primary_variant.get("top3") or ranked[:3]

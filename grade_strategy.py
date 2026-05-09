@@ -1,12 +1,16 @@
 """Grade-specific TOP-3 selection strategies.
 
-Live app is scoped to G1/G2 only. G2 uses a diversified market-rank
-presentation; G1 keeps the win_prob baseline.
+Live app is scoped to G1/G2 only. The primary candidate keeps the
+win_prob baseline; market-bucket diversification is kept as an
+experimental candidate for continued paper-trading review.
 
-G2 診断結果 (tools/analyze_g2_misses.py):
+G2 診断結果 (tools/analyze_g2_misses.py / 2026-05-09 recheck):
   - G2 勝ち馬の 48% は市場 4-10 番人気
   - 現行モデルは本命 100% を市場 1-3 番人気に集中
   ⇒ 構造的に G2 の半分の勝利を取れない
+  - ただし馬連単体では diversified_1-3_4-7_8+ は 4/63 的中、
+    ROI +3.0% だが top2 big wins 除外で -84.2%。第一候補にするには
+    非頑健なので、実験候補として保存・比較する。
 
 対策 (pick_diversified_top3):
   本命 (◎): 市場 1-3 番人気の中で win_prob 最大の馬
@@ -25,7 +29,7 @@ from __future__ import annotations
 from typing import Optional
 
 
-STRATEGY_VERSION = "grade-strategy-v5.11-2026-05-09-dual-candidates"
+STRATEGY_VERSION = "grade-strategy-v5.12-2026-05-09-g2-primary-baseline"
 EXPERIMENTAL_STRATEGY_VERSION = "experimental-jockey-trainer-v1-2026-05-09"
 
 
@@ -74,14 +78,16 @@ BALANCED_BUCKETS    = STRATEGIES["tight_1-2_3-5_6+"]
 #   G1  (n=39):  win_prob                 ROI -5.7%  (ex-big2 -19.8%, 最頑健)
 #                diversified_1-3_4-7_8+   ROI +0.1%  (ex-big2 -48.3%, 過学習疑義)
 #                → 現行維持 (小サンプル、robustness 重視)
-#   G2  (n=63):  diversified_1-3_4-7_8+   ROI +20.8% (ex-big2 -36.3%) ← 採用
+#   G2  (n=63):  diversified_1-3_4-7_8+   600円/R ROI +20.8%
+#                ただし馬連単体 4/63 的中、ex-big2 -84.2%。
+#                第一候補ではなく実験候補で継続検証。
 #
 # 期待される改善: G1/G2 専用の live 運用で検証を継続
 GRADE_STRATEGY: dict = {
     "G1":     "win_prob",
     "JpnI":   "win_prob",
-    "G2":     "diversified_1-3_4-7_8+",
-    "JpnII":  "diversified_1-3_4-7_8+",
+    "G2":     "win_prob",
+    "JpnII":  "win_prob",
 }
 
 
@@ -317,7 +323,7 @@ def build_prediction_variants(ranked: list[dict], grade: str) -> dict:
             "label": "第一候補",
             "strategy": strategy,
             "strategy_version": STRATEGY_VERSION,
-            "description": "現行ロジックのtop3",
+            "description": "現行確率ロジックのtop3",
             "top3": primary,
         },
         "experimental": {
@@ -334,8 +340,9 @@ def build_prediction_variants(ranked: list[dict], grade: str) -> dict:
 def should_apply_diversified(grade: str) -> bool:
     """Return True if this race's grade calls for any strategy != win_prob.
 
-    Live scope is G1/G2 only; this returns True only for configured
-    non-baseline strategies such as G2's market-diversified presentation.
+    Live scope is G1/G2 only. Primary candidates currently use the baseline
+    for both grades; diversified buckets are evaluated as experimental
+    variants rather than promoted to first candidate.
     """
     return get_strategy_for_grade(grade) != "win_prob"
 
