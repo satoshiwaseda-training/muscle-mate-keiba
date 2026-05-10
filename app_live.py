@@ -236,6 +236,44 @@ elif _ws["n_with_result"] == 0 and _ws["n_preds"] > 0:
 st.divider()
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _target_races_for_date(race_date_iso: str) -> dict:
+    """Return the G1/G2 race catalog used for prediction-log coverage.
+
+    Cached briefly because netkeiba race-list fetches are network-bound, but
+    prediction-log reads remain uncached so the save audit updates immediately
+    after a run.
+    """
+    try:
+        races = scraper.fetch_race_list(dt.date.fromisoformat(race_date_iso)) or []
+        return {"races": races, "error": ""}
+    except Exception as exc:
+        return {"races": [], "error": str(exc)}
+
+
+def _prediction_coverage_for_date(race_date_iso: str) -> dict:
+    catalog = _target_races_for_date(race_date_iso)
+    races = catalog.get("races") or []
+    race_ids = [r.get("race_id", "") for r in races if r.get("race_id")]
+    logged = {
+        e.get("race_id"): e
+        for e in plog.list_predictions(only_live=True)
+        if e.get("race_date") == race_date_iso and e.get("race_id")
+    }
+    missing = [r for r in races if r.get("race_id") not in logged]
+    with_result = [
+        e for rid, e in logged.items()
+        if rid in race_ids and (e.get("result") or {}).get("finishing_order")
+    ]
+    return {
+        "races": races,
+        "logged": logged,
+        "missing": missing,
+        "with_result": with_result,
+        "error": catalog.get("error", ""),
+    }
+
+
 # ── Sidebar: KPI dashboards ──────────────────────────
 
 with st.sidebar:
@@ -309,6 +347,34 @@ with col_mode:
     )
 
 st.markdown("")
+
+# ── Prediction-log coverage audit ─────────────────────
+
+race_date_iso = race_date.isoformat()
+coverage = _prediction_coverage_for_date(race_date_iso)
+coverage_races = coverage["races"]
+coverage_logged = coverage["logged"]
+coverage_missing = coverage["missing"]
+
+if coverage.get("error"):
+    st.warning(f"対象レースの保存監査を取得できませんでした: {coverage['error']}")
+elif coverage_races:
+    c1, c2, c3 = st.columns(3)
+    c1.metric("対象G1/G2", len(coverage_races))
+    c2.metric("予想ログ保存済み", len(coverage_logged))
+    c3.metric("結果付与済み", len(coverage["with_result"]))
+    if coverage_missing:
+        missing_names = " / ".join(
+            f"{r.get('race_name', '?')} `{r.get('race_id', '')}`"
+            for r in coverage_missing
+        )
+        st.error(
+            "保存監査: 対象レースの予想ログが不足しています。"
+            "この状態では結果比較・ROI分析ができません。"
+            f"未保存: {missing_names}"
+        )
+    else:
+        st.success("保存監査: 対象G1/G2の予想ログは保存済みです。")
 
 # THE button
 run = st.button(

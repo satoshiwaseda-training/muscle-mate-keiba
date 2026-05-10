@@ -15,6 +15,8 @@ Secrets に以下を設定してください:
   GIST_ID      = "abcdef..."  # 上記ファイルを含む Gist の ID
 """
 
+from __future__ import annotations
+
 import json
 import os
 
