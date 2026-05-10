@@ -45,7 +45,7 @@ import prediction_log
 #   - the loose-rule definition in dual_mode_scoring.py
 # Persisted with every prediction so a later audit can diff predictions
 # that were produced under different model states.
-DATA_SOURCE_VERSION = "live-v5.11-g1g2-dual-candidates-2026-05-09"
+DATA_SOURCE_VERSION = "live-v5.12-coverage-audit-2026-05-10"
 # v5.11 (2026-05-09): 第一候補と実験候補を `prediction_variants`
 #   として同時保存。LOOSE 4 条件の数値は不変更。
 # v5.10 (2026-05-09): live scope を G1/G2 専用に戻す
