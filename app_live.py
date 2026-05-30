@@ -806,6 +806,17 @@ elif batch and batch["results"]:
                 top3_df = pd.DataFrame(top3_rows)
                 st.dataframe(top3_df, use_container_width=True, hide_index=True)
 
+                # ── 券種別 買い目レコメンド (bet_recommender, v1 2026-05-30) ──
+                # 最も勝率の良い買い方を特定し、券種ごとに馬・馬番を提案する表示層。
+                # 推論/LOOSE 4 条件/モデル係数には一切触れない (憲法 §7.1 表示層)。
+                try:
+                    import bet_recommender as _br
+                    import bet_recommender_ui as _bru
+                    _bet_rec = _br.recommend_bets(ranked, r.get('grade', ''))
+                    _bru.render(_bet_rec)
+                except Exception as _bre:
+                    st.caption(f'買い目レコメンド生成スキップ: {_bre}')
+
                 exp_top3 = _experimental_variant.get("top3") or []
                 if exp_top3:
                     exp_labels = [

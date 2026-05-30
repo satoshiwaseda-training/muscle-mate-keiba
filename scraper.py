@@ -1628,22 +1628,45 @@ def fetch_result_netkeiba(race_id: str) -> Optional[dict]:
         return None
 
     finishing_order = []
+    _seen_finishers: set = set()   # dedup: netkeiba renders sticky-column
+    #                                clone rows for horizontal scroll, so the
+    #                                same finisher's <tr class="HorseList">
+    #                                can appear more than once. Without dedup
+    #                                the winner shows up 2-3×, corrupting
+    #                                finishing_order and any 複勝/ワイド join.
     for row in soup.select("tr.HorseList"):
         cells = row.find_all("td")
         if len(cells) < 6:
             continue
         try:
-            rank_text = cells[0].get_text(strip=True)
+            # 着順: td.Result_Num を優先 (netkeiba がレイアウト変更で先頭に
+            # Horse_Check 列を足し、cells[0] が着順では無くなったため)。
+            rank_cell = row.select_one("td.Result_Num")
+            rank_text = (rank_cell.get_text(strip=True) if rank_cell
+                         else cells[0].get_text(strip=True))
             if not rank_text.isdigit():
                 continue  # 除外・取消・中止などをスキップ
 
-            # 馬名: Horse_Info セルの <a> タグ、なければセルテキスト
+            # 馬名 + horse_id: 実データ行は馬名アンカーを持つ。clone 行や
+            # 集計行は持たないことが多いので、これを「本物の行」判定に使う。
             horse_info = row.select_one("td.Horse_Info a") or row.select_one(".HorseName a")
-            name = horse_info.get_text(strip=True) if horse_info else cells[3].get_text(strip=True)
-            horse_id = ""
-            if horse_info:
-                m = re.search(r"/horse/(\d+)", horse_info.get("href", ""))
-                horse_id = m.group(1) if m else ""
+            if not horse_info:
+                continue
+            name = horse_info.get_text(strip=True)
+            m = re.search(r"/horse/(\d+)", horse_info.get("href", ""))
+            horse_id = m.group(1) if m else ""
+
+            # Dedup on horse_id (fallback name) — first real occurrence wins.
+            dedup_key = horse_id or f"{rank_text}:{name}"
+            if dedup_key in _seen_finishers:
+                continue
+            _seen_finishers.add(dedup_key)
+
+            # NOTE (RC-5): 馬番(umaban)の抽出は現行 netkeiba レイアウトでは
+            # td.Num が枠番セルや横スクロール用 clone 列と紛らわしく、確実に
+            # 取れないため一旦保留。複勝/ワイドの per-horse 突合は
+            # payouts_detail の馬番 combo と finishing_order の着順スロット
+            # (着順順に整合) で行うこと。安易な umaban 格納は誤値の温床。
 
             # タイム: Time クラスの最初のセル
             time_cell = row.select_one("td.Time")
@@ -1681,31 +1704,152 @@ def fetch_result_netkeiba(race_id: str) -> Optional[dict]:
             continue
 
     # 払い戻し: ResultPaybackLeftWrap / ResultPaybackRightWrap
-    payouts = _parse_netkeiba_payouts(soup)
+    payouts, payouts_detail = _parse_netkeiba_payouts(soup)
 
-    return {"finishing_order": finishing_order, "payouts": payouts} if finishing_order else None
+    return {
+        "finishing_order": finishing_order,
+        "payouts": payouts,
+        # NEW (2026-05): per-combo payouts so 複勝(3頭)/ワイド(3組) can be
+        # scored for ANY selected horse/pair, not just the winner. The flat
+        # `payouts` dict above is unchanged for backward compatibility.
+        "payouts_detail": payouts_detail,
+    } if finishing_order else None
 
 
-def _parse_netkeiba_payouts(soup: BeautifulSoup) -> dict:
+def _parse_netkeiba_payouts(soup: BeautifulSoup):
+    """払い戻しセクションを抽出する。
+
+    Returns a tuple ``(payouts, payouts_detail)``:
+
+    * ``payouts`` — backward-compatible scalar dict ``{券種: int}`` where the
+      value is the FIRST (winner's) payout. Every existing caller reads this
+      shape via ``payouts.get("単勝")`` etc., so it is preserved exactly.
+    * ``payouts_detail`` — NEW per-combo mapping ``{券種: [{"combo": [馬番...],
+      "yen": int}, ...]}``. For 複勝 each entry is one placed horse; for
+      ワイド/馬連/馬単/3連系 each entry is one combination. This is what makes
+      複勝/ワイド investment-grade backtesting possible (per-horse payouts).
+
+    The real netkeiba result page uses ``table.Payout_Detail_Table`` rows of
+    the form::
+
+        <tr class="Fukusho"><th>複勝</th>
+          <td class="Result"><div><span>4</span></div>...<span>8</span>...<span>9</span></td>
+          <td class="Payout"><span>110円<br/>140円<br/>180円</span></td>
+
+    so the N payouts in the Payout cell align 1:1 with the N horses/combos in
+    the Result cell. A defensive text fallback keeps the old behaviour if the
+    structured table is ever absent.
     """
-    払い戻しセクションから単勝・複勝・馬連などを抽出する。
-    各 <li> または行テキストが「馬券種 馬番 金額円 人気」の形式になっている。
-    """
-    payouts = {}
     bet_types = ["単勝", "複勝", "枠連", "馬連", "ワイド", "馬単", "3連複", "3連単"]
-    for wrap in soup.select("div.ResultPaybackLeftWrap, div.ResultPaybackRightWrap, div.Payout"):
-        for item in wrap.select("tr"):  # 払い戻しはtr要素に入っている
-            text = item.get_text(" ", strip=True)
-            for bt in bet_types:
-                if text.startswith(bt) and bt not in payouts:
-                    m = re.search(r"([\d,]+)円", text)
-                    if m:
-                        try:
-                            payouts[bt] = int(m.group(1).replace(",", ""))
-                        except ValueError:
-                            pass
-                    break
-    return payouts
+    payouts: dict = {}
+    detail: dict = {}
+
+    # ── Primary path: structured Payout_Detail_Table ──
+    for table in soup.select("table.Payout_Detail_Table"):
+        for row in table.select("tr"):
+            th = row.find("th")
+            if not th:
+                continue
+            bt = th.get_text(strip=True)
+            if bt not in bet_types:
+                continue
+            pay_cell = row.select_one("td.Payout")
+            if not pay_cell:
+                continue
+            # Split the Payout cell on <br> -> one yen value per horse/combo.
+            ptxt = pay_cell.get_text("\n", strip=True)
+            yens = []
+            for tok in re.findall(r"([\d,]+)円", ptxt):
+                try:
+                    yens.append(int(tok.replace(",", "")))
+                except ValueError:
+                    pass
+            if not yens:
+                continue
+            # Horse numbers / combos from the Result cell.
+            res_cell = row.select_one("td.Result")
+            combos = []
+            if res_cell:
+                uls = res_cell.select("ul")
+                if uls:  # 連系: each <ul> is one combination
+                    for ul in uls:
+                        nums = [li.get_text(strip=True)
+                                for li in ul.select("li") if li.get_text(strip=True)]
+                        if nums:
+                            combos.append(nums)
+                else:    # 単勝/複勝: each non-empty <span> is one horse
+                    nums = [s.get_text(strip=True)
+                            for s in res_cell.select("span") if s.get_text(strip=True)]
+                    combos = [[n] for n in nums]
+            if bt not in payouts:
+                payouts[bt] = yens[0]
+            if combos and len(combos) == len(yens):
+                detail[bt] = [{"combo": c, "yen": y} for c, y in zip(combos, yens)]
+            else:
+                detail[bt] = [{"combo": None, "yen": y} for y in yens]
+
+    # ── Defensive fallback: old text-based scan (only for missing types) ──
+    if not payouts:
+        for wrap in soup.select(
+            "div.ResultPaybackLeftWrap, div.ResultPaybackRightWrap, div.Payout"
+        ):
+            for item in wrap.select("tr"):
+                text = item.get_text(" ", strip=True)
+                for bt in bet_types:
+                    if text.startswith(bt) and bt not in payouts:
+                        m = re.search(r"([\d,]+)円", text)
+                        if m:
+                            try:
+                                payouts[bt] = int(m.group(1).replace(",", ""))
+                            except ValueError:
+                                pass
+                        break
+
+    return payouts, payouts_detail_normalize(detail)
+
+
+def payouts_payout_for(payouts_detail: dict, bet_type: str, horse_numbers) -> int:
+    """Return the yen payout for a specific 馬番 / 馬番-combo, else 0.
+
+    ``horse_numbers`` may be a single 馬番 (str/int) for 複勝, or an iterable
+    of 馬番 for ワイド/馬連/馬単/3連系. Order is ignored for 複勝/ワイド/馬連/
+    3連複 and respected for 馬単/3連単 (caller passes them in finishing order).
+    """
+    entries = (payouts_detail or {}).get(bet_type) or []
+    if not entries:
+        return 0
+    if isinstance(horse_numbers, (str, int)):
+        want = [str(horse_numbers)]
+    else:
+        want = [str(x) for x in horse_numbers]
+    ordered = bet_type in ("馬単", "3連単")
+    for e in entries:
+        combo = e.get("combo")
+        if not combo:
+            continue
+        combo = [str(c) for c in combo]
+        if ordered:
+            if combo == want:
+                return int(e.get("yen") or 0)
+        else:
+            if sorted(combo) == sorted(want):
+                return int(e.get("yen") or 0)
+    return 0
+
+
+def payouts_detail_normalize(detail: dict) -> dict:
+    """Coerce combo numbers to strings for stable JSON round-tripping."""
+    out = {}
+    for bt, entries in (detail or {}).items():
+        norm = []
+        for e in entries or []:
+            combo = e.get("combo")
+            norm.append({
+                "combo": ([str(c) for c in combo] if combo else None),
+                "yen": int(e.get("yen") or 0),
+            })
+        out[bt] = norm
+    return out
 
 
 # ═══════════════════════════════════════════════════════════

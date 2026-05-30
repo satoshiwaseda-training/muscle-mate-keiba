@@ -964,6 +964,17 @@ def predict_live(
     # to winner-takes-all. The calibrated formula uses market_prob * exp(k*edge)
     # with bounded k=0.8.
     ranked = pe.assign_calibrated_probs(scored, k=pe.DEFAULT_CALIBRATION_K)
+
+    # [betrec] attach 馬番/枠番 to ranked so the presentation layer (bet_recommender)
+    # can propose 馬番. The score chain drops these; re-join by horse name
+    # from entry_by_name. Display-only — no effect on scoring/LOOSE/model.
+    for _rk in ranked:
+        _ent = entry_by_name.get((_rk.get('name') or '').strip()) or {}
+        if _ent:
+            if _rk.get('number') in (None, '', 0):
+                _rk['number'] = _ent.get('number')
+            if _rk.get('waku') in (None, '', 0):
+                _rk['waku'] = _ent.get('waku')
     calibration_issues = pe.calibration_warnings(ranked)
     sel = pe.select_top3(ranked, alpha=pe.DEFAULT_ALPHA, beta=pe.DEFAULT_BETA)
     prediction_variants = gs.build_prediction_variants(ranked, grade_str)
