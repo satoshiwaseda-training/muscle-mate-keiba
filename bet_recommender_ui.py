@@ -1,4 +1,4 @@
-"""単勝+ワイド 買い目レコメンドの Streamlit 描画 (v2.1, 2026-05-30).
+"""単勝+ワイド 買い目レコメンドの Streamlit 描画 (v3.0, 2026-07-04).
 
 app_live.py から `render(rec)` を 1 行呼ぶだけ。
 bet_recommender.recommend_bets() の戻り値をそのまま受け取る。
@@ -49,7 +49,7 @@ def render(rec: dict) -> None:
     st.markdown("#### 🛒 単勝 + ワイド 買い目レコメンド")
     st.caption(
         f"G1/G2 バックテスト実値（finishing_order重複除去・ワイド着順ペア順実証済）"
-        f" / G1 n=38 / G2 n=63　{rec.get('version','')}"
+        f" / G1 n=46（〜2026年6月） / G2 n=71　{rec.get('version','')}"
     )
 
     r = rec.get("recommendation") or {}
