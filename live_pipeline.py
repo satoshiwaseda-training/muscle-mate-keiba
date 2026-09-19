@@ -45,7 +45,16 @@ import prediction_log
 #   - the loose-rule definition in dual_mode_scoring.py
 # Persisted with every prediction so a later audit can diff predictions
 # that were produced under different model states.
-DATA_SOURCE_VERSION = "live-v5.10-dual-candidates-2026-05-08"
+DATA_SOURCE_VERSION = "live-v5.11-grade-from-race-name-2026-09-19"
+# v5.11 (2026-09-19): バグ修正 (憲法 §7.1)。scraper.fetch_race_info_netkeiba は
+#   `grade` キーを返さないため、ライブ経路では grade_str が常に "" だった。
+#   影響: (a) score_runner の n_grade=0 → 騎手×格 交互作用が無効 (backtest の
+#   snapshot 経路は grade を供給しており live と乖離)、(b) 出力 grade="" により
+#   app_live の grade_strategy (G2 分散戦略) と bet_recommender が本番で一度も
+#   発動せず、prediction_log の grade 別 KPI も空。live_predictions.json 3/3 件で
+#   grade="" を確認。修正: race_info に grade が無ければ race_name の "(G1)" 等
+#   のタグから補完 (_grade_from_race_name)。snapshot 経路は race_info.grade が
+#   優先されるので backtest 再現性は不変。LOOSE 4 条件・係数は不変更。
 # v5.10 (2026-05-08): 現行の第一候補と、騎手/調教師優先の実験候補を
 #   `prediction_variants` として同時保存。LOOSE 条件は不変更。
 # v5.9 (2026-04-29): deploy 可視化 + Gist 永続化
@@ -106,6 +115,24 @@ DATA_SOURCE_VERSION = "live-v5.10-dual-candidates-2026-05-08"
 def _log(cb: Optional[Callable[[str], None]], msg: str) -> None:
     if cb:
         cb(msg)
+
+
+_GRADE_TAGS = ("G1", "G2", "G3", "JpnI", "JpnII", "JpnIII")
+
+
+def _grade_from_race_name(race_name: Optional[str]) -> str:
+    """Return the grade tag embedded in a race name, e.g. "桜花賞 (G1)" -> "G1".
+
+    scraper.fetch_race_list_netkeiba names races as "<name> (<grade>)", and
+    fetch_race_info_netkeiba does not expose grade at all, so the name is the
+    only grade signal available on the live path. Returns "" when absent.
+    """
+    if not race_name:
+        return ""
+    for g_tag in _GRADE_TAGS:
+        if f"({g_tag})" in race_name or f"({g_tag.lower()})" in race_name:
+            return g_tag
+    return ""
 
 
 def _is_today_or_recent(race_date: Optional[str], window_days: int = 1) -> bool:
@@ -569,14 +596,8 @@ def predict_live(
     cached_race = scraper._cache_load("enrich_race", race_id)
     try:
         import paddock_sources as _psrc
-        grade_guess = ""
-        # Try to read grade from race context (not yet fetched, but hints exist)
         # v5.6: G3 も追加 (ユーザ買い方は G3 まで)
-        if race_name:
-            for g_tag in ("G1", "G2", "G3", "JpnI", "JpnII", "JpnIII"):
-                if f"({g_tag})" in race_name or f"({g_tag.lower()})" in race_name:
-                    grade_guess = g_tag
-                    break
+        grade_guess = _grade_from_race_name(race_name)
         multi_result = _psrc.fetch_paddock_multi_sources(
             race_id=race_id, race_name=race_name,
             horse_names=list(running), grade=grade_guess,
@@ -777,7 +798,8 @@ def predict_live(
                 h[key] = centered
 
     ctx = {"weights": load_weights()}
-    grade_str = race_info.get("grade", "")
+    # v5.11: race_info (snapshot 経路) を優先し、無ければ race_name のタグ。
+    grade_str = race_info.get("grade", "") or _grade_from_race_name(race_name)
     entry_names = list(sf_horses.keys())
 
     scored = []

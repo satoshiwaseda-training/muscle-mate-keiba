@@ -1,0 +1,369 @@
+# Corrosion Detector v6 — 実績まとめ & 精度向上 次期計画書
+
+**作成日**: 2026-04-25 (初版)
+**改訂**: 2026-04-25 — CODEX レビュー P0/P1/P2/P3 反映 (Step 0 を追加、CI 下限を本体に整合)
+**作成者**: サトシ (オーナー単独承認モード)
+**目的**:
+1. 計画 v1 → v6 の実装実績を 1 ファイルに集約
+2. 「critical_recall ≥ 0.95」を狙う次期アクションを優先順位付きで提示
+3. **Step 0 (評価ロジック修正 / 機密整理 / タイムアウト整合) を Phase 5 着手前に完了させる**
+
+**重要 (2026-04-25)**:
+本ドキュメント初版は CODEX レビューで 8 件の指摘を受け、全採用済。特に評価ロジック
+(`metrics.py`) に IoU 一致を経由しない TP 判定 bypass が存在し、
+`critical_recall=0.800` は **暫定値** として扱う。Step 0 完了後に再評価し
+`docs/baseline.md` に「評価規則修正後 baseline」として追記する。
+
+**関連ドキュメント (深掘り用)**:
+- `docs/accuracy_improvement_plan.md` — 計画書 v6 (1023 行、戦略全文)
+- `docs/baseline.md` — 数値の公式記録 (append-only)
+- `docs/deployment_guide.md` — デプロイ手順
+- `tests/eval/scoring_rule.md` — 凍結された評価規則
+
+---
+
+## 1. エグゼクティブサマリー
+
+| 観点 | v4 (Gemini 単独) | **v5/v6 (SAM2 + Gemini Hybrid)** | 改善 |
+|------|----------------|-------------------------------|------|
+| critical_recall (画像単位) | 0.400 | **0.800** [0.600, 0.950] | **+2.0倍** |
+| per_gt_recall (領域単位) | 0.032 | **0.154** [0.108, 0.204] | **+4.8倍** |
+| F1 @ IoU=0.3 | 0.039 | **0.116** | **+3.0倍** |
+| 推論時間 (CPU) | 約 8 秒 | 約 60〜90 秒 | (許容範囲) |
+| デプロイ状態 | ローカルのみ | **HF Space 公開 + ローカル並行運用** | ✅ |
+
+**現時点の到達度**: 「画像に腐食があるかないか」の検出は実用レベル (recall=0.800)。
+ただし**領域の細かさ** (per_gt_recall) は 0.154 で、「集合体をまとめて 1 つのマスクとして取る」傾向あり。
+**次期目標は critical_recall ≥ 0.95、CI 下限 > 0.90**。
+
+---
+
+## 2. これまでの実績 (v1 → v6)
+
+### 2.1 戦略・計画書 (6 リビジョン)
+
+| Ver. | 日付 | 主な決定事項 |
+|------|------|------------|
+| v1 | 2026-04-21 | 初版。F1 主導、Self-Consistency × タイル × Few-shot 提案 |
+| v2 | 2026-04-21 | 主指標を critical_recall に変更、test 汚染防止、カスケード化 |
+| v3 | 2026-04-21 | GT / 運用フラグ / critical 根拠の分離、3 系統セット、CI ベース早期ゲート |
+| v4 | 2026-04-21 | 単独承認モード、公開データセット移行、モック予測器導入 |
+| **v5** | 2026-04-22 | **戦略転換**: Gemini を「検出」から「分類・レポート」に。検出は SAM2 へ委譲 |
+| **v6** | 2026-04-22 | デプロイ即時リリース + 95% ロードマップ (Phase 5.1-5.5) |
+
+### 2.2 データセット整備
+
+- **Corrosion Condition State Dataset** (Bianchi & Hebdon 2021, CC0) を採用
+- 440 枚の LabelMe JSON → 本プロジェクト GT スキーマに変換 (`scripts/convert_ccs_to_gt.py`)
+- 4-way 分割 (train 212 / val 80 / release_test 44 / monitoring_set 104)
+- `tests/eval/datasets/labels_v0.json` に 440 GT 記録、`split.json` に分割定義
+- `gt_is_critical` 判定基準: `4_Severe_Steel_Corrosion` 領域 1 個以上 → critical 画像
+
+### 2.3 評価ハーネス (再現性のある測定基盤)
+
+- `tests/eval/run_eval.py` — CLI 評価ツール、mock predictor 対応
+- `tests/eval/metrics.py` — critical_recall / per_gt_recall / precision@K + Bootstrap 95% CI
+- `tests/eval/agreement.py` — Cohen's κ + ポリゴン IoU + boundary F1
+- `tests/eval/mock_predictor.py` — oracle / empty / perturbed / noisy の 4 モード (理論上下限の固定)
+- `scripts/visualize_predictions.py` — 予測可視化、`scripts/inspect_*.py` — キャッシュ検査
+
+### 2.4 v5 アーキテクチャ実装 (Hybrid Pipeline)
+
+```
+[入力画像]
+   ↓
+[Stage 1: SAM2 Automatic Mask Generation]   ← Meta SAM2 (Apache-2.0、Small ckpt 185 MB)
+   ↓
+[Stage 2: 色 + 面積フィルタ]                 ← 赤茶 4 色 + BYPASS_COLOR=true で安全側
+   ↓
+[Stage 3: Gemini 2.5 Flash クロップ分類]     ← 構造化出力 + thinkingBudget=0
+   ↓
+[出力: ポリゴン + confidence + visual_label + severity]
+```
+
+**実装ファイル**:
+- `api/detectors/__init__.py` — `get_detector(kind)` ファクトリ
+- `api/detectors/base.py` — `BaseDetector` + `Detection` dataclass
+- `api/detectors/sam2_detector.py` — SAM2 ラッパー (CPU / GPU 両対応)
+- `api/detectors/hybrid_detector.py` — 3-stage パイプライン
+- `api/gemini_classifier.py` — クロップ分類 (responseSchema, thinkingBudget=0, maxOutputTokens=2048)
+- `api/index.py` — FastAPI、`_run_v5_detector_pipeline`、.env 自動ロード診断
+- `api/preprocess.py` / `api/postprocess.py` / `api/tiling.py` / `api/schemas.py` / `api/thresholds.py`
+
+### 2.5 デプロイ (2 系統並行運用)
+
+| 環境 | URL / パス | 用途 | 状態 |
+|------|----------|------|------|
+| ローカル PC | `http://127.0.0.1:5000` | 開発・実験・実画像検証 | ✅ 稼働中 |
+| Hugging Face Space | `https://musclemate-corrosion-detector.hf.space` | 公開デモ・遠隔検査支援 | ✅ 稼働中 |
+
+**デプロイ周辺の整備**:
+- `Dockerfile.hfspace` — HF Space 用 (CPU Free Tier、SAM2 ckpt 自動 DL)
+- `requirements.hfspace.txt` — torch CPU 版を別レイヤーで先に install
+- `scripts/deploy_to_hfspace.ps1` — PS 5.1 互換、ファイル同期 + commit + push
+- `start_server.ps1` — ローカル起動ランチャー
+- `README_hfspace.md` — HF Space front-matter (sdk: docker, app_port: 7860)
+
+### 2.6 解決した重大な技術的問題
+
+1. **Gemini が confidence=0.500 で帰ってくる** → スキーマ不整合 (`score` vs `confidence`) を修正
+2. **CPU 90 秒タイムアウト** → SAM2 points_per_side 32→24、max_side 1024→768、フロントエンド timeout 240s
+3. **零検出** → 4 色対応の color_score 拡張 + `HYBRID_BYPASS_COLOR=true` フォールバック
+4. **HF Space で gemini_call_count=0 の沈黙失敗** → 診断 print 投入で `MAX_TOKENS` 不足を特定
+5. **Gemini 2.5 Flash の thinking モードがトークン全消費** → `thinkingBudget=0` + `maxOutputTokens=2048` で解決 ⭐
+6. **HF Space 404** → サブドメインは小文字配信 (`musclemate-corrosion-detector.hf.space`)
+7. **PS 5.1 の here-string エスケープ不可** → 単独 .py スクリプト方式に統一
+8. **メモリ OOM (440 LabelMe JSON)** → PIL 廃止、imageHeight/Width フィールド利用
+
+### 2.7 凍結された運用ルール
+
+- **scoring_rule.md**: 評価指標の計算規則を凍結 (今後の改善は規則を変えずに測る)
+- **release_test 44 枚は本番直前まで触らない** (汚染防止)
+- **改善 1 つにつき val 差分 95% CI 下限 > 0** を採用基準とする (アブレーション原理)
+- 数値はすべて `docs/baseline.md` に append-only で記録
+
+---
+
+## 3. 現時点の限界と原因分析
+
+### 3.1 数値で見る現状
+
+| 指標 | 現状 | 95% 目標 | ギャップ |
+|------|------|---------|---------|
+| critical_recall | 0.800 | **≥ 0.95** | -0.15 |
+| critical_recall CI 下限 | 0.600 | **> 0.90** | -0.30 |
+| per_gt_recall | 0.154 | ≥ 0.50 | -0.35 |
+| precision@K=30 | 0.333 | ≥ 0.50 | -0.17 |
+
+### 3.2 観察された 3 つの主要失敗パターン
+
+**A. 集合体まとめ取り (per_gt_recall 0.154 の主因)**
+SAM2 の Automatic mask generation が「点食痕の群れ」を 1 つの大マスクとして抽出。
+GT は個別領域なので、N 個の GT のうち 1 つしかマッチしない (recall = 1/N)。
+
+**B. 粒度不足**
+points_per_side=24 (576 サンプリング点) は CPU 速度のために絞っているが、
+細かい腐食 (< 50 px²) を取りこぼす。
+
+**C. ドメインミスマッチ**
+SAM2 は汎用セグメンタ、腐食特化ではないため「コンクリート割れ目」「影」「シール跡」を腐食候補として上げる FP が混入。
+Gemini 分類で多くは弾けるが、信頼度の閾値が未校正。
+
+---
+
+## 4. 次期計画書 — 95% 到達ロードマップ
+
+### 4.0 Step 0 — Phase 5 着手前の地盤固め (1〜2 日、必須)
+
+**目的**: Phase 5.X 以降のすべての改善判定が「正しい指標」と「整合した実行環境」で行われることを保証する。
+
+| ID | 内容 | 状態 (2026-04-25) | 影響 |
+|----|------|------------|------|
+| **S0-1** | `metrics.py` の TP 判定を scoring_rule §4.1 (AND 構造) 準拠に修正 (IoU 一致なし bypass を削除) | ✅ 実装済 (`tests/eval/metrics.py:106-131`) | critical_recall が下振れする可能性あり、再評価必須 |
+| **S0-2** | `val` 80 枚を再評価し `docs/baseline.md` に「評価規則修正後 baseline」として追記 | ✅ **完了 (cache 再評価)** — 結果は **0.800 (変化なし)**、bypass は実は trigger していなかった (`baseline.md` 参照) | 全 Phase 5.X の比較基準点を確定 → **0.800 で確定** |
+| **S0-3** | `.env.example` のプレースホルダ化 + Google AI Studio で旧キー revoke + 新規発行 | ✅ ファイル修正済 / ⏳ ローテーションはオーナー作業 | 公開リスク除去 |
+| **S0-4** | `run_eval.py` の API timeout を 60s → 240s | ✅ 実装済 (`tests/eval/run_eval.py:255-257`) | Phase 5.1 の 100-120s 想定に対応 |
+| **S0-5** | `run_eval.py` の出力 JSON に実効環境変数 (`SAM2_*`, `HYBRID_*`, `GEMINI_*`) を embed | ✅ 実装済 (`_capture_effective_env`) | variant 名だけでない実効パラメータの追跡可能化 |
+| **S0-6** | 本ドキュメントの release_test ゲートを計画書本体 (`accuracy_improvement_plan.md` Phase 5 完了宣言節) に整合させる: **release_test CI 下限 > 0.85**、monitoring_set 100+ で CI 下限 > 0.90 | ✅ 本ドキュメント修正済 | n=44 で達成不能な閾値の設定ミスを修正 |
+
+**Step 0 ゲート**:
+- ✅ **S0-1, S0-2, S0-3 (ファイル), S0-4, S0-5, S0-6 すべて完了**
+- ⏳ 残作業 (オーナー手動): GEMINI_API_KEY を Google AI Studio で revoke + 再発行、`.env` と HF Space secret を更新
+
+**Step 0 でついでに準備したもの (前倒しで Phase 5.2 / 5.3 の地盤を作成)**:
+- `api/postprocess.py` に **集合体分離 4 手法** (color_kmeans / watershed / connected_components + dispatcher) を実装、`SPLIT_METHOD` で切替、デフォルト off。Phase 5.2 のアブレーション基盤完成
+- `tests/eval/calibrate_thresholds.py` を新規実装、**画像単位 PR カーブ** で target_recall 制約付き閾値選択。v5 cache スモーク済 (target_recall=0.95 で threshold=0.959, precision=0.264)。Phase 5.3 即実行可
+
+### 4.1 戦略
+
+> **「SAM2 が見落とすか、まとめて取るか」が現在のボトルネック。
+>  これを段階的に解消し、最終的に少量データで SAM2 を腐食特化 fine-tune する。」**
+
+4 段階で積み上げ、各段階で `val` 80 枚評価 → 95% CI 下限の前進を確認してから次へ。
+
+### 4.2 優先順位付き実行計画
+
+| 段階 | 工数 | コスト | 期待 critical_recall | 期待 per_gt_recall | 採否ゲート |
+|------|------|--------|---------------------|-------------------|----------|
+| **5.1** SAM2 高粒度化 | **1 日** | $0 | 0.85〜0.90 | 0.20〜0.30 | val Δ95% CI 下限 > 0 |
+| **5.2** 集合体分離後処理 | **3〜5 日** | $0 | (-) | +0.05〜0.10 | val Δ95% CI 下限 > 0 |
+| **5.3** 300 枚ラベル + 閾値校正 | **2〜3 週** | データ作業 | +0.03〜0.05 | (-) | precision@K +0.10 以上 |
+| **5.4** SAM2 LoRA fine-tune | **1〜2 週** | GPU $10 程度 | **0.95〜0.98** | **0.50〜0.70** | release_test で達成宣言 |
+| 5.5 マルチスケール推論 | 1 週 | $0 | +0.01〜0.03 | +0.02〜0.05 | 5.4 で 95% 未達のみ実施 |
+
+⭐ **5.4 が 95% 到達の最有力候補**。5.1〜5.3 はその前段の地盤固め。
+
+### 4.3 各段階の即実行内容
+
+#### Phase 5.1 — SAM2 高粒度化 (今週内)
+
+**作業**: `.env` の編集のみ
+```
+SAM2_POINTS_PER_SIDE=32      # 24 → 32 (576点 → 1024点)
+SAM2_MAX_MASKS=40            # 25 → 40
+SAM2_MIN_AREA_PX=500         # 維持
+```
+
+**評価コマンド**:
+```powershell
+python -m tests.eval.run_eval --split val --variant v5.1_sam2_points32 `
+    --api-url http://127.0.0.1:5000/api/analyze `
+    --cache tests/eval/reports/cache_v5_1.json
+```
+
+**判定**: `baseline.md` に追記、95% CI 下限が v5 (0.600) を上回れば採用。
+
+#### Phase 5.2 — 集合体分離後処理 (来週、CODEX レビュー P2-1 反映)
+
+**4 手法の同条件アブレーション** で per_gt_recall と precision の両面評価:
+
+| 手法 | 実装 | 想定強み | 想定弱み |
+|------|------|---------|----------|
+| **A: 色 k-means** | RGB クラスタリング (k=3〜5) → 連結成分分離 | 異色腐食の分離 | 影・塗装・シール跡を分割しがち (FP 増) |
+| **B: Watershed** | 距離変換 → marker → watershed (OpenCV) | 形状ベースで物体境界に強い | パラメータ感度高 |
+| **C: Connected Components** | mask の thin region で自然分離 | シンプル、副作用少 | 真にくっついた集合体は分離不可 |
+| **D: SAM2 内部小領域再抽出** | 大マスクの bbox 内で point prompt 再呼び | SAM2 の本来の精度を活用 | 推論時間 +30% |
+
+**実装場所**: `api/postprocess.py` に `split_large_mask_*()` を 4 手法ぶん追加し、
+HybridDetector の Stage 1 と Stage 2 の間に挟む。
+
+**評価**: 各手法を val 80 枚で `critical_recall`, `per_gt_recall`, **`precision@K=30`**, `manual_review_rate`, `latency_p95` の 5 軸で記録。
+採否は「per_gt_recall +Δ かつ precision@K の悪化が CI 上限内」を条件とする (per_gt_recall 単独最大化を避ける)。
+
+#### Phase 5.3 — 300 枚ラベル + 閾値校正 (今後 2〜3 週)
+
+**3 ソースから 300 枚を確保**:
+1. デプロイ後の運用画像から 100〜200 枚 (実フィールド)
+2. Roboflow `subsea_pipeline` + `in_pipe_corrosion` (CC BY 4.0、計 846 枚から抽出)
+3. CCS train 余り (212 枚) からの追加サンプリング
+
+**Label Studio で 2 名合議 (Cohen's κ ≥ 0.7 確認)** → `tests/eval/datasets/labels_v1.json` に追記。
+
+**閾値校正 (CODEX レビュー P2-2 反映、画像単位 PR)**: 新規 `tests/eval/calibrate_thresholds.py`
+
+scoring_rule §3 で予算単位は **画像** と凍結されているため、領域単位の PR ではなく
+**画像ごとの最大 confidence (または review_flag) を入力**として PR カーブを引く:
+
+```python
+from sklearn.metrics import precision_recall_curve
+
+# 各画像 i について:
+#   y_true[i]  = 1 if gt_is_critical else 0
+#   y_score[i] = max(detection.confidence for detection in pred[i].regions) or 0.0
+# (review_flag を予測に使う場合は indicator も併用)
+precision, recall, thresholds = precision_recall_curve(y_true, y_score)
+# critical_recall >= 0.95 制約下で precision 最大の閾値を採用
+```
+→ `api/thresholds.py` の `THRESHOLDS_V2` を差し替え。
+→ 主指標 (画像単位 critical_recall) と整合した校正になる。
+
+#### Phase 5.4 — SAM2 LoRA Fine-tune (95% 到達の本命、1〜2 週)
+
+**前提条件 (CODEX レビュー P3 反映、Phase 5.3 と並行で揃える必須)**:
+
+データの「数」だけでなく「内訳」を管理する:
+
+| 指標 | 目標 | 理由 |
+|------|------|------|
+| 画像枚数 | 300 枚以上 | LoRA train の最低ライン |
+| critical 領域数 | 600 以上 (1 画像あたり平均 2 個) | 学習信号の量 |
+| Hard negative 画像 | 60 枚以上 (画像の 20%) | 影・塗装・シール跡など FP 源を含む non-critical 画像 |
+| 照明スライス | normal / low_light / backlight それぞれ 30+ 枚 | 暗所 critical_recall の保証 |
+| 角度スライス | frontal / oblique それぞれ 30+ 枚 | 斜め撮影への robustness |
+| 材質スライス (可能なら) | sus / carbon_steel それぞれ 30+ 枚 | ドメイン拡張 |
+
+**Fine-tune モード選定 (重要)**:
+- **Automatic mode 改善 (= mask decoder の prior 強化)**: 推論時の `points_per_side` ベース呼び出しを腐食に偏らせる。本プロジェクトは automatic mode を使うのでこちら。
+- **Box / Point prompt 改善**: 推論時にユーザが prompt を渡す前提。本プロジェクトでは使わない (UI に prompt UI なし)。
+- 学習スクリプトは「automatic mode の prior 強化」モードで書く。検証は `SAM2_MODE=automatic` の現行パイプラインそのままで実施。
+
+**手順**:
+1. Runpod / Colab Pro で A100 1 時間借りる ($2)
+2. SAM2 公式 fine-tune notebook ベースに LoRA train (300 枚、エポック 5〜10、約 2〜4 時間)
+3. ckpt → `checkpoints/sam2_corrosion_lora.pt` に保存
+4. `.env` 切替: `SAM2_CHECKPOINT=checkpoints/sam2_corrosion_lora.pt`
+5. val 評価 → release_test 評価 → 95% 達成宣言
+
+**95% 達成基準** (本体計画書 §Phase 5 完了宣言と整合、CODEX レビュー P1-3 反映):
+- release_test (n=44) で `critical_recall ≥ 0.95`、**95% CI 下限 > 0.85**
+  (n=44 で CI 下限 > 0.90 を要求すると 44/44 完全達成必須となり過剰、本体計画書の閾値を採用)
+- monitoring_set 累積 100+ 枚で 3 ヶ月継続して **CI 下限 > 0.90** を維持
+- `docs/baseline.md` に最終値を記録
+
+#### Phase 5.5 — マルチスケール推論 (任意、5.4 で未達なら)
+
+512 / 768 / 1024 の 3 スケールで推論 → 結果アンサンブル。
+GPU なら並列化可能で総時間 ~1.5 倍。
+
+### 4.4 タイムライン (4 週ロードマップ)
+
+```
+Week 1 (今週)         : Phase 5.1 (1 日) → ローカル & HF 反映
+Week 2 (来週)         : Phase 5.2 集合体分離実装・評価
+Week 2-3              : Phase 5.3 ラベリング作業並行 (運用画像収集 + Roboflow)
+Week 3-4              : Phase 5.3 校正 → Phase 5.4 GPU fine-tune
+Week 4 終了時         : release_test で 95% 評価、達成宣言 or 5.5 へ
+```
+
+### 4.5 失敗時の判断基準
+
+- **Phase 5.4 完了後も release_test で 95% CI 下限 < 0.90** の場合:
+  - 計画書 v7 で根本的設計見直し (U-Net 専用モデル、YOLOv8-seg、Mask R-CNN 検討)
+  - or 「画像単位検出 + 検査員レビュー UI」のハイブリッド運用に妥協
+
+- **Phase 5.X で前 variant 比 95% CI 下限が上がらない** → revert、次フェーズへ
+
+---
+
+## 5. 並行運用計画 (Phase 5 実装中も継続)
+
+### 5.1 週次サイクル
+
+- **月**: 運用画像 5〜10 枚の目視スポットチェック + 失敗事例アーカイブ
+- **火-木**: Phase 5.X 実装
+- **金**: val 評価 → `tests/eval/ablation_log.md` 追記
+- **土**: 採否判定、採用なら `.env` を本番反映 + HF Space に再デプロイ
+
+### 5.2 監視指標
+
+- `gemini_call_count` (HF Space ログ): 0 が連続 → API key 失効
+- `latency_ms`: 90 秒超は調整を検討
+- `manual_review_rate`: 0.95 超は閾値校正タイミング
+
+### 5.3 Cloud Run / GPU 移行検討タイミング
+
+- HF Space CPU 80 秒/画像 → 業務利用で限界感
+- Phase 5.1 採用で 100〜120 秒に伸びる → このタイミングで Cloud Run T4 ($0.40/h) 移行を検討
+- GPU なら 5〜10 秒/画像、Phase 5.4 fine-tune 後の運用も同環境で実施
+
+---
+
+## 6. 判断記録 (なぜこの計画か)
+
+1. **「Gemini をもっと頑張らせる」を捨てた**: per_gt_recall=0.032 が天井。Vision LLM は領域認識は得意でもピクセル精度は構造的限界。
+2. **「SAM2 fine-tune を最後の砦に」**: 汎用セグメンタ + 少量教師で大幅向上は実証済 (Medium / GitHub 多数)。300 枚で十分。
+3. **「ラベリングが律速」**: 5.4 を本命にしても 5.3 のデータが無いと進まない → ラベリングを 5.2 と並行スタートさせるのが要点。
+4. **「画像単位の recall を先に守る」**: 業務インパクトは "重大腐食を見逃さない" が最優先。per_gt_recall は二次目標。
+5. **「単独承認モード」維持**: 1 人運用なので軽量サイクル (週次レビュー、CI 下限ベースの採否)。
+
+---
+
+## 7. 完了の定義
+
+- [x] v6 デプロイ完了 (HF Space + ローカル並行)
+- [ ] Phase 5.1 採用判定
+- [ ] Phase 5.2 集合体分離実装 + 採用判定
+- [ ] Phase 5.3 ラベル 300 枚到達 + 閾値校正完了
+- [ ] Phase 5.4 SAM2 LoRA fine-tune 完了
+- [ ] **release_test (44 枚) で critical_recall ≥ 0.95、95% CI 下限 > 0.90** ← ゴール
+- [ ] monitoring_set 3 ヶ月継続観察で CI 下限 > 0.90 維持
+- [ ] `docs/baseline.md` に「v6 Phase 5 完了、95% 到達」追記
+
+---
+
+**次のアクション (今すぐ)**:
+1. ローカル `.env` で `SAM2_POINTS_PER_SIDE=32` に変更
+2. `python -m tests.eval.run_eval --split val --variant v5.1_sam2_points32 ...` 実行
+3. `docs/baseline.md` に Phase 5.1 結果を追記
+
+**1 行で言うと**: **「集合体分離 → ラベル 300 → SAM2 fine-tune」の 3 段ロケットで 95% を狙う。最終兵器は LoRA fine-tune ($10 程度の GPU 代で本命到達)。**

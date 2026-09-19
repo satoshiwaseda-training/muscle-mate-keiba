@@ -242,7 +242,11 @@ def _blocked_collector(name):
 
 @contextlib.contextmanager
 def patch_scraper(snapshot: dict):
-    """Monkey-patch scraper + fact_collectors to serve snapshot only.
+    """Monkey-patch scraper + fact_collectors + v5.x fetchers to serve snapshot only.
+
+    v5.0 以降の live_pipeline は `entries_fetcher.fetch_horse_entries` と
+    `odds_fetcher.fetch_win_odds` を直接呼び出す (scraper 経由ではない)。
+    snapshot モードではこれらも network を叩かないようスタブする。
 
     All network calls are blocked. All post-race fetches are blocked.
     Inside the context, live_pipeline.predict_live() reads purely from
@@ -275,6 +279,109 @@ def patch_scraper(snapshot: dict):
             fc_originals[name] = getattr(fc, name)
             setattr(fc, name, _blocked_collector(name.replace("collect_", "").replace("_facts", "")))
 
+    # ── v5.0+ scratch-rewrite fetchers: stub via snapshot ──
+    race_id_target = snapshot["race_id"]
+    snap_entries = snapshot.get("entries") or []
+
+    entries_orig = None
+    odds_orig = None
+    paddock_multi_orig = None
+    horse_deep_orig = None
+
+    try:
+        import entries_fetcher as _ef
+
+        def _stub_fetch_entries(race_id, venue=""):
+            if race_id != race_id_target:
+                return []
+            # Return snapshot entries with the schema expected by
+            # live_pipeline (same shape as HorseEntry.to_dict()).
+            out = []
+            for e in snap_entries:
+                out.append({
+                    "number": int(e.get("number", 0) or 0),
+                    "waku":   int(e.get("waku", 0) or 0),
+                    "name":   e.get("name", ""),
+                    "horse_id": e.get("horse_id", ""),
+                    "age":    e.get("age", ""),
+                    "weight": e.get("weight", ""),
+                    "jockey": e.get("jockey", ""),
+                    "jockey_id": e.get("jockey_id", ""),
+                    "trainer": e.get("trainer", ""),
+                    "trainer_id": e.get("trainer_id", ""),
+                    "horse_weight": e.get("horse_weight", ""),
+                    "owner": e.get("owner", ""),
+                    # Legacy compatibility
+                    "stable": e.get("stable", ""),
+                    "ritto":  e.get("ritto", ""),
+                    "transport_stress": e.get("transport_stress", ""),
+                    "recent_form": "", "bloodline": "", "weight_trend": "",
+                    "jockey_win_rate": "", "jockey_g1_wins": "",
+                    "trainer_win_rate": "",
+                    "training_eval": "",
+                    "training_physics": {"final_split": 0.0,
+                                          "acceleration_rate": 0.0,
+                                          "cardio_index": 0.0},
+                    "training_nlp": {}, "paddock_scores": {},
+                    "best_weight_analysis": {}, "transport_profile": {},
+                    "sire": "", "dam": "", "damsire": "", "breeder": "",
+                })
+            return out
+
+        entries_orig = _ef.fetch_horse_entries
+        _ef.fetch_horse_entries = _stub_fetch_entries
+    except ImportError:
+        pass
+
+    try:
+        import odds_fetcher as _of
+
+        def _stub_fetch_win_odds(race_id, **kwargs):
+            if race_id != race_id_target:
+                return _of.WinOddsResult(
+                    status="error", race_id=race_id, by_number={},
+                    raw_reason="race_id != snapshot target",
+                    pipeline_version=_of.FETCHER_VERSION,
+                )
+            by_number = {}
+            for e in snap_entries:
+                try:
+                    num = int(e.get("number", 0) or 0)
+                    od = float(str(e.get("odds", "0")).replace(",", "").strip() or 0)
+                except (TypeError, ValueError):
+                    continue
+                if num > 0 and _of.ODDS_MIN <= od <= _of.ODDS_MAX:
+                    by_number[num] = od
+            return _of.WinOddsResult(
+                status="result" if by_number else "not-published",
+                race_id=race_id,
+                by_number=by_number,
+                raw_reason="snapshot-backed (odds from snapshot.entries)",
+                http_status=200,
+                pipeline_version=_of.FETCHER_VERSION,
+            )
+
+        odds_orig = _of.fetch_win_odds
+        _of.fetch_win_odds = _stub_fetch_win_odds
+    except ImportError:
+        pass
+
+    # paddock_sources: disable multi-source paddock collection during backtest
+    try:
+        import paddock_sources as _ps
+
+        def _stub_paddock_multi(*args, **kwargs):
+            return {"_meta": {"enabled": False,
+                              "reason": "snapshot-backed backtest",
+                              "version": _ps.PADDOCK_MULTI_VERSION}}
+
+        paddock_multi_orig = _ps.fetch_paddock_multi_sources
+        _ps.fetch_paddock_multi_sources = _stub_paddock_multi
+    except ImportError:
+        pass
+
+    # horse_facts_enricher: pass through (no network) — it just reads cached data
+
     try:
         yield
     finally:
@@ -282,6 +389,24 @@ def patch_scraper(snapshot: dict):
             setattr(scraper, name, orig)
         for name, orig in fc_originals.items():
             setattr(fc, name, orig)
+        if entries_orig is not None:
+            try:
+                import entries_fetcher as _ef
+                _ef.fetch_horse_entries = entries_orig
+            except ImportError:
+                pass
+        if odds_orig is not None:
+            try:
+                import odds_fetcher as _of
+                _of.fetch_win_odds = odds_orig
+            except ImportError:
+                pass
+        if paddock_multi_orig is not None:
+            try:
+                import paddock_sources as _ps
+                _ps.fetch_paddock_multi_sources = paddock_multi_orig
+            except ImportError:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════

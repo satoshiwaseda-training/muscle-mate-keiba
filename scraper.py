@@ -2412,6 +2412,11 @@ def fetch_race_list(race_date: date) -> list[dict]:
         )
     if not races:
         races = fetch_race_list_jra(race_date)
+    # JRA フォールバック経路は grade で絞っていないので、ここで最終フィルタ
+    # (feat/fact-first-live 2026-05-09 "Limit live predictions to G1 and G2" 移植)。
+    if LIVE_GRADE_FILTER is not None:
+        allowed = set(LIVE_GRADE_FILTER)
+        races = [r for r in races if (r.get("grade") or "") in allowed]
     return races if races else []
 
 

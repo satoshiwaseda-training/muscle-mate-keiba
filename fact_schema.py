@@ -435,6 +435,8 @@ def sentence_is_opinion(sentence: str) -> bool:
 SOURCE_BASE_CONFIDENCE = {
     "jra":             1.00,   # JRA official
     "netkeiba":        0.90,   # netkeiba shutuba (near-official)
+    "horse_deep":      0.85,   # horse_facts_enricher (v5.2): structured facts
+                               # computed from netkeiba DB profile/recent_races
     "netkeiba_oikiri": 0.80,   # netkeiba oikiri training evaluation
     "keibalab":        0.70,   # KeibaLab 馬体FOCUS, structured obs
     "hochi":           0.55,   # Sports Hochi race article

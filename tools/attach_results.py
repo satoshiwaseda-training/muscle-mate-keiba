@@ -74,6 +74,19 @@ def main() -> int:
     candidates = [e for e in all_preds if e.get("race_date") == target.isoformat()]
 
     if not candidates:
+        try:
+            target_races = scraper.fetch_race_list(target) or []
+        except Exception:
+            target_races = []
+        if target_races:
+            missing = ", ".join(
+                f"{r.get('race_name', '?')}({r.get('race_id', '')})"
+                for r in target_races
+            )
+            log(
+                f"target G1/G2 races existed but had no saved predictions: {missing}",
+                level="ERROR",
+            )
         log(
             f"WARN: zero predictions found for race_date={target.isoformat()}. "
             f"Either weekend_autolog didn't run, or predictions were never "
